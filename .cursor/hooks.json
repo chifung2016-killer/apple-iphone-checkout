@@ -1,6 +1,12 @@
 {
   "version": 1,
   "hooks": {
+    "sessionStart": [
+      {
+        "command": "node .cursor/hooks/auto-pull.mjs",
+        "timeout": 90
+      }
+    ],
     "stop": [
       {
         "command": "node .cursor/hooks/auto-push.mjs",

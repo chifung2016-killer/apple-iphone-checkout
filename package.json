@@ -10,6 +10,7 @@
     "dashboard": "tsx src/server.ts",
     "watch": "tsx src/stock-monitor/monitor.ts",
     "sync": "node .cursor/hooks/auto-push.mjs",
+    "pull": "node .cursor/hooks/auto-pull.mjs",
     "postinstall": "playwright install chromium"
   },
   "engines": {
