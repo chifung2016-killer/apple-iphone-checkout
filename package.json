@@ -9,6 +9,7 @@
     "start": "tsx src/buy-iphone-17.ts",
     "dashboard": "tsx src/server.ts",
     "watch": "tsx src/stock-monitor/monitor.ts",
+    "sync": "node .cursor/hooks/auto-push.mjs",
     "postinstall": "playwright install chromium"
   },
   "engines": {
