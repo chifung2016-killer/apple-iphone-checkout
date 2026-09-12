@@ -1,0 +1,28 @@
+{
+  "name": "apple-iphone-checkout",
+  "version": "1.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Apple HK iPhone checkout helper + multi-SKU stock monitor",
+  "scripts": {
+    "setup": "npm install && playwright install chromium",
+    "start": "tsx src/buy-iphone-17.ts",
+    "dashboard": "tsx src/server.ts",
+    "watch": "tsx src/stock-monitor/monitor.ts",
+    "postinstall": "playwright install chromium"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "node-notifier": "^10.0.1",
+    "playwright": "^1.55.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "@types/node-notifier": "^8.0.5",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

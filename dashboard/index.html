@@ -1,0 +1,1227 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Apple Checkout Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg0: #0f1412;
+      --bg1: #171e1a;
+      --panel: #1c2621;
+      --line: #2d3b34;
+      --text: #e8efe9;
+      --muted: #9aada1;
+      --accent: #c4f04d;
+      --accent-ink: #14200a;
+      --warn: #f0b45a;
+      --danger: #ff7a6e;
+      --ok: #6ee7a8;
+      --field: #121916;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Manrope", system-ui, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(900px 500px at 10% -10%, #24352c 0%, transparent 55%),
+        radial-gradient(700px 400px at 100% 0%, #1a2830 0%, transparent 50%),
+        linear-gradient(180deg, var(--bg0), var(--bg1));
+    }
+    .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 48px; }
+    header {
+      display: flex; justify-content: space-between; align-items: end;
+      gap: 16px; margin-bottom: 28px;
+    }
+    h1 {
+      font-family: "Fraunces", Georgia, serif; font-weight: 700;
+      font-size: clamp(1.8rem, 3vw, 2.4rem); margin: 0 0 6px; letter-spacing: -0.02em;
+    }
+    .sub { color: var(--muted); font-size: 0.95rem; margin: 0; max-width: 48ch; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 8px 12px; border: 1px solid var(--line); background: var(--panel);
+      border-radius: 999px; font-size: 0.85rem; color: var(--muted); white-space: nowrap;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+    .dot.run { background: var(--accent); box-shadow: 0 0 0 3px rgba(196,240,77,.15); }
+    .dot.wait { background: var(--warn); }
+    .dot.err { background: var(--danger); }
+    .grid { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 18px; }
+    @media (max-width: 920px) {
+      .grid { grid-template-columns: 1fr; }
+      header { flex-direction: column; align-items: start; }
+    }
+    section {
+      background: color-mix(in srgb, var(--panel) 92%, black);
+      border: 1px solid var(--line); border-radius: 18px; padding: 18px;
+    }
+    section h2 {
+      margin: 0 0 14px; font-size: 0.78rem; text-transform: uppercase;
+      letter-spacing: 0.08em; color: var(--muted); font-weight: 600;
+    }
+    label { display: block; font-size: 0.8rem; color: var(--muted); margin: 0 0 6px; }
+    .field { margin-bottom: 12px; }
+    input, select {
+      width: 100%; border: 1px solid var(--line); background: var(--field);
+      color: var(--text); border-radius: 10px; padding: 10px 12px; font: inherit; outline: none;
+    }
+    input:focus, select:focus {
+      border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+    }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+    @media (max-width: 640px) { .row, .row3 { grid-template-columns: 1fr; } }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+    button {
+      font: inherit; font-weight: 600; border: 0; border-radius: 999px;
+      padding: 11px 18px; cursor: pointer;
+    }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .btn-primary { background: var(--accent); color: var(--accent-ink); }
+    .btn-ghost {
+      background: transparent; color: var(--text); border: 1px solid var(--line);
+    }
+    .btn-danger {
+      background: color-mix(in srgb, var(--danger) 22%, var(--panel));
+      color: #ffd4cf; border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--line));
+    }
+    .btn-warn {
+      background: color-mix(in srgb, var(--warn) 22%, var(--panel));
+      color: #ffe6c2; border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--line));
+    }
+    .btn-sm { padding: 7px 12px; font-size: 0.8rem; }
+    .log {
+      height: 220px; overflow: auto; background: #0b100e; border: 1px solid var(--line);
+      border-radius: 12px; padding: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px; line-height: 1.45; white-space: pre-wrap; word-break: break-word;
+    }
+    .log .dim { color: #6f8578; }
+    .meta {
+      display: flex; flex-wrap: wrap; gap: 8px 14px; color: var(--muted);
+      font-size: 0.82rem; margin-bottom: 10px;
+    }
+    .browsers {
+      display: flex;
+      flex-direction: row;
+      gap: 12px;
+      overflow-x: auto;
+      padding-bottom: 8px;
+      scroll-snap-type: x mandatory;
+    }
+    .browser-card {
+      flex: 0 0 min(320px, 85vw);
+      scroll-snap-align: start;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px 14px;
+      background: var(--field);
+      min-height: 220px;
+    }
+    .browsers-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    .browsers-head h2 { margin: 0 0 6px; }
+    .browsers-head .hint { margin: 0; }
+    .orders-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    .orders-head h2 { margin: 0 0 6px; }
+    .orders-head .hint { margin: 0; }
+    .orders-head .orders-actions {
+      display: flex;
+      flex-shrink: 0;
+      align-items: center;
+      gap: 8px;
+    }
+    .browser-head {
+      display: flex; justify-content: space-between; align-items: flex-start;
+      gap: 10px; margin-bottom: 10px;
+    }
+    .browser-head-pills {
+      display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end;
+    }
+    .browser-head strong {
+      font-family: "Fraunces", Georgia, serif; font-size: 1.05rem;
+    }
+    .phase-pill {
+      font-size: 0.72rem; padding: 4px 8px; border-radius: 999px;
+      border: 1px solid var(--line); color: var(--muted); white-space: nowrap;
+    }
+    .phase-pill.run { color: var(--accent-ink); background: var(--accent); border-color: transparent; }
+    .phase-pill.wait { color: #3a2a10; background: var(--warn); border-color: transparent; }
+    .phase-pill.err { color: #3a1512; background: var(--danger); border-color: transparent; }
+    .phase-pill.manual { color: #10222a; background: #7dd3fc; border-color: transparent; }
+    .phase-pill.hidden { color: #1a1a1a; background: #c5c9c6; border-color: transparent; }
+    .browser-card.is-hidden {
+      opacity: 0.72;
+      border-style: dashed;
+    }
+    .browser-card.is-paid {
+      background: color-mix(in srgb, #1f8f4e 22%, var(--field));
+      border-color: color-mix(in srgb, #2ecc71 55%, var(--line));
+      box-shadow: inset 0 0 0 1px color-mix(in srgb, #2ecc71 35%, transparent);
+    }
+    .phase-pill.paid {
+      color: #062816;
+      background: #7ddea8;
+      border-color: transparent;
+    }
+    .preset-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .preset-row button {
+      font-size: 0.78rem;
+      padding: 6px 10px;
+    }
+    .preset-row button.is-selected {
+      background: var(--accent);
+      color: var(--accent-ink);
+      border-color: transparent;
+    }
+    .browser-grid {
+      display: grid;
+      grid-template-columns: 88px 1fr;
+      gap: 4px 8px;
+      font-size: 0.78rem;
+      margin-bottom: 10px;
+    }
+    .browser-grid dt { color: var(--muted); }
+    .browser-grid dd { margin: 0; word-break: break-word; }
+    .browser-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .hint { color: var(--muted); font-size: 0.8rem; margin: -6px 0 12px; }
+    .orders { display: flex; flex-direction: column; gap: 10px; }
+    .card-limits-head {
+      display: flex; justify-content: space-between; align-items: end;
+      gap: 12px; flex-wrap: wrap; margin-bottom: 12px;
+    }
+    .card-limits-head h2 { margin: 0 0 6px; }
+    .card-limits-head .hint { margin: 0; color: var(--muted); font-size: 0.85rem; }
+    .card-limits-tools {
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    }
+    .card-limits-tools input[type="search"] {
+      width: min(220px, 100%); padding: 8px 10px; border-radius: 8px;
+    }
+    .card-limits-tools label.chk {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 0.8rem; color: var(--muted); margin: 0; cursor: pointer;
+    }
+    .card-limits-meta {
+      font-size: 0.8rem; color: var(--muted); margin: 0 0 10px;
+    }
+    .card-limits-wrap {
+      max-height: 420px; overflow: auto; border: 1px solid var(--line);
+      border-radius: 12px;
+    }
+    table.card-limits {
+      width: 100%; border-collapse: collapse; font-size: 0.82rem;
+    }
+    table.card-limits th, table.card-limits td {
+      padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--line);
+      white-space: nowrap;
+    }
+    table.card-limits th {
+      position: sticky; top: 0; background: #121916; color: var(--muted);
+      font-weight: 600; font-size: 0.72rem; text-transform: uppercase;
+      letter-spacing: 0.04em; z-index: 1;
+    }
+    table.card-limits tr.touched td { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+    table.card-limits tr.low td.remaining { color: var(--danger); font-weight: 700; }
+    table.card-limits td.num { font-variant-numeric: tabular-nums; }
+    .live-dot {
+      display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+      background: var(--ok); box-shadow: 0 0 0 3px rgba(110,231,168,.15);
+      margin-right: 6px; vertical-align: middle;
+    }
+    .order-card {
+      border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; background: var(--field);
+    }
+    .order-card strong {
+      font-family: "Fraunces", Georgia, serif; font-size: 1.15rem; display: block; margin-bottom: 6px;
+    }
+    .order-card .order-money {
+      display: flex; flex-wrap: wrap; gap: 10px 18px;
+      margin: 0 0 10px; padding: 8px 10px;
+      border: 1px solid var(--line); border-radius: 8px; background: #0b100e;
+      font-size: 0.9rem;
+    }
+    .order-card .order-money span { color: var(--muted); margin-right: 6px; }
+    .order-card .order-money b { color: var(--text); font-weight: 650; }
+    .order-card dl {
+      margin: 0; display: grid; grid-template-columns: 90px 1fr; gap: 4px 10px; font-size: 0.86rem;
+    }
+    .order-card dt { color: var(--muted); }
+    .order-card dd { margin: 0; word-break: break-word; }
+    .empty { color: var(--muted); font-size: 0.9rem; }
+    footer { margin-top: 18px; color: var(--muted); font-size: 0.8rem; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>Checkout Dashboard</h1>
+        <p class="sub">控制開幾多個瀏覽器、睇每個狀態，隨時再加開新瀏覽器。</p>
+      </div>
+      <div class="badge" id="runBadge"><span class="dot" id="runDot"></span><span id="runLabel">Idle</span></div>
+    </header>
+
+    <div class="grid">
+      <section>
+        <h2>Run configuration</h2>
+        <form id="cfgForm">
+          <div class="field">
+            <label>Product</label>
+            <div class="preset-row" id="presetRow">
+              <button type="button" class="btn-ghost" data-preset="iphone17">iPhone 17 · 256GB · 薰衣草紫</button>
+              <button type="button" class="btn-ghost" data-preset="iphone18promax_128_burgundy">iPhone 18 Pro Max · 128GB · 布根地紅</button>
+              <button type="button" class="btn-ghost" data-preset="iphone18promax_burgundy">iPhone 18 Pro Max · 256GB · 布根地紅</button>
+              <button type="button" class="btn-ghost" data-preset="iphone18promax_glacier">iPhone 18 Pro Max · 256GB · 冰川色</button>
+              <button type="button" class="btn-ghost" data-preset="iphone18promax_silver">iPhone 18 Pro Max · 256GB · 銀色</button>
+              <button type="button" class="btn-ghost" data-preset="iphone18promax_black">iPhone 18 Pro Max · 256GB · 黑色</button>
+              <button type="button" class="btn-ghost" data-preset="iphone18pro_256_burgundy">iPhone 18 Pro · 256GB · 布根地紅</button>
+            </div>
+            <p class="hint" id="presetHint">請揀一個產品（會自動設定網址、型號、顏色、容量）。</p>
+          </div>
+          <div class="row3">
+            <div class="field">
+              <label for="quantity">Quantity</label>
+              <input id="quantity" name="quantity" type="number" min="1" max="10" placeholder="輸入數量" required />
+            </div>
+            <div class="field">
+              <label for="browserCount">Launch count</label>
+              <input id="browserCount" name="browserCount" type="number" min="1" max="8" placeholder="輸入開幾多個" required />
+            </div>
+            <div class="field">
+              <label for="fulfillmentPreference">Delivery method</label>
+              <select id="fulfillmentPreference" name="fulfillmentPreference" required>
+                <option value="" selected disabled>請選擇</option>
+                <option value="auto">Auto（先取貨，失敗改送貨）</option>
+                <option value="pickup">pickup credit card訪客模式</option>
+                <option value="delivery">delivery credit card訪客模式</option>
+                <option value="pickup_apple_pay">pickup apple pay</option>
+                <option value="delivery_apple_pay">delivery apple pay</option>
+                <option value="pickup_apple_ac_apple_pay">pickup apple ac apple pay</option>
+                <option value="delivery_apple_ac_apple_pay">delivery apple ac apple pay</option>
+              </select>
+            </div>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label for="pickupSearch">Pickup search</label>
+              <input id="pickupSearch" name="pickupSearch" value="中環" />
+            </div>
+            <div class="field">
+              <label for="saleStartIso">Sale start (ISO, HKT)</label>
+              <input id="saleStartIso" name="saleStartIso" />
+            </div>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label for="cardCompany">Credit card company（銀行，稍後填）</label>
+              <input id="cardCompany" name="cardCompany" placeholder="例如 HSBC / Hang Seng（可留空）" />
+            </div>
+            <div class="field">
+              <label for="cardLimit">Credit card limit（可選）</label>
+              <input id="cardLimit" name="cardLimit" placeholder="例如 HK$50,000" />
+            </div>
+          </div>
+          <div class="field">
+            <label for="proxy">Proxy / IP（可選，每個 task 可填唔同）</label>
+            <input
+              id="proxy"
+              name="proxy"
+              placeholder="例如 1.2.3.4:8080 或 http://user:pass@host:port 或 socks5://host:1080（留空＝本機 IP）"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <p class="hint" style="margin:6px 0 0">之後用嚟轉 IP。留空就唔用 proxy。</p>
+          </div>
+          <div class="field">
+            <label for="productPollIntervalMs">Refresh interval (ms)</label>
+            <input id="productPollIntervalMs" name="productPollIntervalMs" type="number" min="1000" step="500" value="5000" />
+          </div>
+          <div class="actions">
+            <button type="button" class="btn-primary" id="btnMonitorToggle">Start monitor</button>
+            <button type="button" class="btn-ghost" id="btnMonitorBuy">Start monitor+buying</button>
+            <button type="submit" class="btn-primary" id="btnStart">Launch browsers</button>
+            <button type="button" class="btn-ghost" id="btnAdd">Add 1 browser</button>
+            <button type="button" class="btn-danger" id="btnStop">Stop all</button>
+            <button type="button" class="btn-ghost" id="btnClearAll">Clear all</button>
+            <button type="button" class="btn-warn" id="btnContinue">Continue all</button>
+          </div>
+          <p class="hint" id="monitorHint" style="margin-top:10px">
+            <b>Start monitor</b>：Telegram 即時監察 iPhone 庫存／可買數量（撳一次變 Stop monitor）。
+            <b>Start monitor+buying</b>：有貨時再自動開瀏覽器落單。
+          </p>
+          <div class="meta" id="monitorMeta" style="margin-top:8px">
+            <span>Monitor: <b id="monitorState">off</b></span>
+            <span>合計可買: <b id="monitorStockTotal">—</b></span>
+            <span id="monitorSkuLine"></span>
+          </div>
+        </form>
+      </section>
+
+      <section>
+        <h2>Combined live log</h2>
+        <div class="meta">
+          <span>Running: <b id="runningCount">0</b></span>
+          <span>Total: <b id="totalBrowsers">0</b></span>
+        </div>
+        <div class="log" id="log"></div>
+      </section>
+    </div>
+
+    <section style="margin-top:18px">
+      <div class="browsers-head">
+        <div>
+          <h2>Opened browsers</h2>
+          <p class="hint">隱藏時右上角仍顯示 live status。Open browser 會還原視窗。Launch 4 = 四宮格最大。付款成功會變綠色。</p>
+        </div>
+      </div>
+      <div class="browsers" id="browsers"><p class="empty">未開瀏覽器。上面填好設定後撳 Launch / Add。</p></div>
+    </section>
+
+    <section style="margin-top:18px">
+      <div class="card-limits-head">
+        <div>
+          <h2><span class="live-dot" aria-hidden="true"></span>Live card limits</h2>
+          <p class="hint">落單成功即時扣減剩餘額度（本地即時更新，唔使等 Google Sheet）。卡號只顯示尾四位。</p>
+        </div>
+        <div class="card-limits-tools">
+          <input type="search" id="cardLimitSearch" placeholder="搜尋公司／類型／尾四位" />
+          <label class="chk"><input type="checkbox" id="cardLimitUsedOnly" />只顯示已用過</label>
+        </div>
+      </div>
+      <p class="card-limits-meta" id="cardLimitsMeta">載入中…</p>
+      <div class="card-limits-wrap">
+        <table class="card-limits">
+          <thead>
+            <tr>
+              <th>Card</th>
+              <th>Company</th>
+              <th>Type</th>
+              <th>Original</th>
+              <th>Used</th>
+              <th>Remaining</th>
+            </tr>
+          </thead>
+          <tbody id="cardLimitsBody">
+            <tr><td colspan="6" class="empty">載入卡額資料中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section style="margin-top:18px">
+      <div class="orders-head">
+        <div>
+          <h2>Order summary</h2>
+          <p class="hint">只顯示成功落單（有訂單編號）嘅摘要。右邊可直接開 Google 試算表並寫入資料（唔使下載 CSV）。</p>
+        </div>
+        <div class="orders-actions">
+          <button type="button" class="btn-ghost btn-sm" id="btnExportOrders" disabled title="有成功訂單先可以匯出">匯出 Google 試算表</button>
+        </div>
+      </div>
+      <div class="orders" id="orders"><p class="empty">未有成功落單。任務出現訂單編號後先會喺呢度顯示。</p></div>
+    </section>
+
+    <footer>
+      每個瀏覽器係獨立 process。可以隨時再加開；付款／落單仍要人手。
+    </footer>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const form = $("cfgForm");
+    const logEl = $("log");
+    const knownLogLenByKey = new Map();
+
+    const URL_IPHONE17 =
+      "https://www.apple.com/hk-zh/shop/buy-iphone/iphone-17/6.3-%E5%90%8B%E9%A1%AF%E7%A4%BA%E5%99%A8-256gb-%E8%96%B0%E8%A1%A3%E8%8D%89%E7%B4%AB%E8%89%B2";
+    const URL_PM_256_BURGUNDY =
+      "https://www.apple.com/hk-zh/shop/buy-iphone/iphone-18-pro/6.9-%E5%90%8B%E9%A1%AF%E7%A4%BA%E5%99%A8-256gb-%E5%B8%83%E6%A0%B9%E5%9C%B0%E7%B4%85%E8%89%B2";
+    const URL_PM_128_BURGUNDY =
+      "https://www.apple.com/hk-zh/shop/buy-iphone/iphone-18-pro/6.9-%E5%90%8B%E9%A1%AF%E7%A4%BA%E5%99%A8-128gb-%E5%B8%83%E6%A0%B9%E5%9C%B0%E7%B4%85%E8%89%B2";
+    const URL_PRO_256_BURGUNDY =
+      "https://www.apple.com/hk-zh/shop/buy-iphone/iphone-18-pro/6.3-%E5%90%8B%E9%A1%AF%E7%A4%BA%E5%99%A8-256gb-%E5%B8%83%E6%A0%B9%E5%9C%B0%E7%B4%85%E8%89%B2";
+
+    const SALE_START_IPHONE18 = "2026-09-12T20:00:00+08:00";
+
+    const PRODUCT_PRESETS = {
+      iphone17: {
+        buyUrl: URL_IPHONE17,
+        model: "iPhone 17",
+        color: "薰衣草紫色",
+        storage: "256GB",
+        label: "iPhone 17 · 256GB · 薰衣草紫",
+        saleStartIso: "2026-09-12T20:00:00+08:00",
+      },
+      iphone18promax_128_burgundy: {
+        buyUrl: URL_PM_128_BURGUNDY,
+        model: "iPhone 18 Pro Max",
+        color: "布根地紅色",
+        storage: "128GB",
+        label: "iPhone 18 Pro Max · 128GB · 布根地紅",
+        saleStartIso: SALE_START_IPHONE18,
+      },
+      iphone18promax_burgundy: {
+        buyUrl: URL_PM_256_BURGUNDY,
+        model: "iPhone 18 Pro Max",
+        color: "布根地紅色",
+        storage: "256GB",
+        label: "iPhone 18 Pro Max · 256GB · 布根地紅",
+        saleStartIso: SALE_START_IPHONE18,
+      },
+      iphone18promax_glacier: {
+        buyUrl: URL_PM_256_BURGUNDY.replace(
+          "%E5%B8%83%E6%A0%B9%E5%9C%B0%E7%B4%85%E8%89%B2",
+          "%E5%86%B0%E5%B7%9D%E8%89%B2"
+        ),
+        model: "iPhone 18 Pro Max",
+        color: "冰川色",
+        storage: "256GB",
+        label: "iPhone 18 Pro Max · 256GB · 冰川色",
+        saleStartIso: SALE_START_IPHONE18,
+      },
+      iphone18promax_silver: {
+        buyUrl: URL_PM_256_BURGUNDY.replace(
+          "%E5%B8%83%E6%A0%B9%E5%9C%B0%E7%B4%85%E8%89%B2",
+          "%E9%8A%80%E8%89%B2"
+        ),
+        model: "iPhone 18 Pro Max",
+        color: "銀色",
+        storage: "256GB",
+        label: "iPhone 18 Pro Max · 256GB · 銀色",
+        saleStartIso: SALE_START_IPHONE18,
+      },
+      iphone18promax_black: {
+        buyUrl: URL_PM_256_BURGUNDY.replace(
+          "%E5%B8%83%E6%A0%B9%E5%9C%B0%E7%B4%85%E8%89%B2",
+          "%E9%BB%91%E8%89%B2"
+        ),
+        model: "iPhone 18 Pro Max",
+        color: "黑色",
+        storage: "256GB",
+        label: "iPhone 18 Pro Max · 256GB · 黑色",
+        saleStartIso: SALE_START_IPHONE18,
+      },
+      iphone18pro_256_burgundy: {
+        buyUrl: URL_PRO_256_BURGUNDY,
+        model: "iPhone 18 Pro",
+        color: "布根地紅色",
+        storage: "256GB",
+        label: "iPhone 18 Pro · 256GB · 布根地紅",
+        saleStartIso: SALE_START_IPHONE18,
+      },
+    };
+
+    let selectedPresetKey = null;
+
+    function matchPresetKey(cfg) {
+      if (!cfg) return null;
+      if (cfg.presetKey && PRODUCT_PRESETS[cfg.presetKey]) return cfg.presetKey;
+      for (const [key, p] of Object.entries(PRODUCT_PRESETS)) {
+        if (
+          p.model === cfg.model &&
+          p.color === cfg.color &&
+          p.storage === cfg.storage &&
+          (!cfg.buyUrl || p.buyUrl === cfg.buyUrl)
+        ) {
+          return key;
+        }
+      }
+      return null;
+    }
+
+    function applyPreset(key) {
+      const p = PRODUCT_PRESETS[key];
+      if (!p) return;
+      selectedPresetKey = key;
+      for (const btn of document.querySelectorAll("#presetRow [data-preset]")) {
+        btn.classList.toggle("is-selected", btn.getAttribute("data-preset") === key);
+      }
+      $("presetHint").textContent = `已選：${p.label}`;
+      if (p.saleStartIso && $("saleStartIso")) {
+        $("saleStartIso").value = p.saleStartIso;
+      }
+    }
+
+    function clearPresetSelection() {
+      selectedPresetKey = null;
+      for (const btn of document.querySelectorAll("#presetRow [data-preset]")) {
+        btn.classList.remove("is-selected");
+      }
+      $("presetHint").textContent = "請揀一個產品（會自動設定網址、型號、顏色、容量）。";
+    }
+
+    function setRunningUI(runningCount) {
+      const dot = $("runDot");
+      const label = $("runLabel");
+      dot.className = "dot";
+      if (runningCount > 0) {
+        dot.classList.add("run");
+        label.textContent = `${runningCount} running`;
+      } else {
+        label.textContent = "Idle";
+      }
+    }
+
+    function fillForm(cfg) {
+      if (!cfg) return;
+      // 唔覆寫 quantity / browserCount / fulfillmentPreference，等你自己填
+      for (const key of ["pickupSearch","saleStartIso","productPollIntervalMs","cardCompany","cardLimit","proxy"]) {
+        if (cfg[key] != null && $(key)) $(key).value = cfg[key];
+      }
+    }
+
+    function formConfig() {
+      const fd = new FormData(form);
+      const preset = selectedPresetKey ? PRODUCT_PRESETS[selectedPresetKey] : null;
+      if (!preset) throw new Error("請先揀一個產品");
+      const quantityRaw = String(fd.get("quantity") || "").trim();
+      const browserCountRaw = String(fd.get("browserCount") || "").trim();
+      const fulfillmentPreference = String(fd.get("fulfillmentPreference") || "").trim();
+      if (!quantityRaw) throw new Error("請填 Quantity");
+      if (!browserCountRaw) throw new Error("請填 Launch count");
+      if (!fulfillmentPreference) throw new Error("請揀 Delivery method");
+      const quantity = Number(quantityRaw);
+      const browserCount = Number(browserCountRaw);
+      if (!Number.isFinite(quantity) || quantity < 1) throw new Error("Quantity 要係 ≥ 1 嘅數字");
+      if (!Number.isFinite(browserCount) || browserCount < 1) throw new Error("Launch count 要係 ≥ 1 嘅數字");
+      return {
+        presetKey: selectedPresetKey,
+        buyUrl: preset.buyUrl,
+        model: preset.model,
+        color: preset.color,
+        storage: preset.storage,
+        quantity,
+        browserCount,
+        fulfillmentPreference,
+        pickupSearch: String(fd.get("pickupSearch") || "中環"),
+        saleStartIso: String(fd.get("saleStartIso") || preset.saleStartIso || SALE_START_IPHONE18),
+        productPollIntervalMs: Number(fd.get("productPollIntervalMs") || 5000),
+        cardCompany: String(fd.get("cardCompany") || "").trim(),
+        cardLimit: String(fd.get("cardLimit") || "").trim(),
+        proxy: String(fd.get("proxy") || "").trim(),
+        skipTradeIn: true,
+        addAppleCare: false,
+      };
+    }
+
+    function appendLogs(lines) {
+      if (!lines?.length) return;
+      const atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 24;
+      for (const line of lines) {
+        const div = document.createElement("div");
+        div.textContent = line;
+        if (/^\[dashboard\]|輪詢|refresh|等待/.test(line)) div.className = "dim";
+        logEl.appendChild(div);
+      }
+      if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function phaseClass(phase) {
+      if (/payment_succeeded|orders_ready|paid/i.test(phase || "")) return "paid";
+      if (/manual/i.test(phase || "")) return "manual";
+      if (/wait|payment|awaiting/i.test(phase || "")) return "wait";
+      if (/error|fail/i.test(phase || "")) return "err";
+      if (/run|poll|start|config|fill|checkout|contact/i.test(phase || "")) return "run";
+      return "";
+    }
+
+    function phaseLabel(phase, live) {
+      const p = String(phase || "");
+      if (/polling_continue|adding_cart/i.test(p)) {
+        return `adding cart${live ? " · live" : ""}`;
+      }
+      if (/waiting_user|waiting_for_payment|awaiting_payment|contact_filled|stop_requested/i.test(p)) {
+        if (/stop_requested/i.test(p)) return `stopping…${live ? " · live" : ""}`;
+        return `waiting for payment${live ? " · live" : ""}`;
+      }
+      if (/manual_control/i.test(p)) {
+        return `manual control${live ? " · live" : ""}`;
+      }
+      if (/payment_succeeded/i.test(p)) {
+        return `payment succeeded${live ? " · live" : ""}`;
+      }
+      // checkout 流程中其他階段都當 waiting for payment（除咗 early product／cart poll）
+      if (/fulfill|shipping|guest|checkout|billing/i.test(p)) {
+        return `waiting for payment${live ? " · live" : ""}`;
+      }
+      return `${p || "—"}${live ? " · live" : ""}`;
+    }
+
+    function renderBrowsers(browsers) {
+      const box = $("browsers");
+      if (!browsers?.length) {
+        box.innerHTML = '<p class="empty">未開瀏覽器。上面填好設定後撳 Launch / Add。</p>';
+        return;
+      }
+      box.innerHTML = browsers.map((b) => {
+        const c = b.card || {};
+        const d = c.deliveryDetails || {};
+        const fulfillment = c.fulfillmentMode || b.config?.fulfillmentPreference || "—";
+        const isDelivery = /delivery/i.test(String(fulfillment));
+        const hidden = Boolean(b.windowHidden);
+        const paid = Boolean(c.paymentSucceeded) || /payment_succeeded|orders_ready/i.test(String(b.phase || ""));
+        const pc = paid ? "paid" : phaseClass(b.phase);
+        const live = Boolean(b.running);
+        const label = paid ? phaseLabel("payment_succeeded", live) : phaseLabel(b.phase, live);
+        return `<article class="browser-card${hidden ? " is-hidden" : ""}${paid ? " is-paid" : ""}" data-id="${esc(b.id)}">
+          <div class="browser-head">
+            <strong>${esc(b.id)}</strong>
+            <div class="browser-head-pills">
+              <span class="phase-pill ${pc}">${esc(label)}</span>
+              ${hidden ? '<span class="phase-pill hidden">window hidden</span>' : '<span class="phase-pill run">window open</span>'}
+            </div>
+          </div>
+          <dl class="browser-grid">
+            <dt>Status</dt><dd>${esc(label)}${hidden ? " · window hidden" : ""}</dd>
+            <dt>Window</dt><dd>${esc(hidden ? "minimized / hidden" : (b.windowState || "visible"))}</dd>
+            <dt>Type</dt><dd>${esc(c.productType || b.config?.model || "—")}</dd>
+            <dt>Colour</dt><dd>${esc(c.color || b.config?.color || "—")}</dd>
+            <dt>Storage</dt><dd>${esc(c.storage || b.config?.storage || "—")}</dd>
+            <dt>Qty</dt><dd>${esc(c.quantity ?? b.config?.quantity ?? "—")}</dd>
+            <dt>Amount spent</dt><dd>${esc(c.total || "—")}</dd>
+            <dt>Fulfill</dt><dd>${esc(fulfillment)}</dd>
+            <dt>Order #</dt><dd>${esc(c.orderNumber || "—")}</dd>
+            ${isDelivery ? `
+            <dt>姓氏</dt><dd>${esc(d.lastName || c.lastName || "—")}</dd>
+            <dt>名字</dt><dd>${esc(d.firstName || c.firstName || "—")}</dd>
+            <dt>區域/地區/街道</dt><dd>${esc(d.areaDistrictStreet || c.areaDistrictStreet || "—")}</dd>
+            <dt>屋苑/大廈/樓層/單位</dt><dd>${esc(d.buildingFloorUnit || c.buildingFloorUnit || "—")}</dd>
+            <dt>Name</dt><dd>${esc(d.name || c.name || "—")}</dd>
+            <dt>Email</dt><dd>${esc(d.email || c.email || "—")}</dd>
+            <dt>Phone</dt><dd>${esc(d.phone || c.phone || "—")}</dd>
+            <dt>Address</dt><dd>${esc(d.address || c.address || "—")}</dd>
+            <dt>Est. delivery</dt><dd>${esc(d.estimatedDelivery || c.estimatedDelivery || "—")}</dd>
+            <dt>Credit card</dt><dd>${esc(d.cardNumber || c.cardNumber || "（付款頁人手填）")}</dd>
+            <dt>Card type</dt><dd>${esc(d.cardType || c.cardType || "—")}</dd>
+            <dt>Card company</dt><dd>${esc(d.cardCompany || c.cardCompany || "—")}</dd>
+            <dt>Card limit</dt><dd>${esc(d.cardLimit || c.cardLimit || "—")}</dd>
+            <dt>Order placed at</dt><dd>${esc(d.orderPlacedAt || c.orderPlacedAt || "—")}</dd>
+            ` : `
+            <dt>Email</dt><dd>${esc(c.email || "—")}</dd>
+            <dt>Address</dt><dd>${esc(c.address || "—")}</dd>
+            <dt>Phone</dt><dd>${esc(c.phone || "—")}</dd>
+            <dt>Credit card</dt><dd>${esc(c.cardNumber || "—")}</dd>
+            <dt>Card type</dt><dd>${esc(c.cardType || "—")}</dd>
+            <dt>Card company</dt><dd>${esc(c.cardCompany || "—")}</dd>
+            <dt>Card limit</dt><dd>${esc(c.cardLimit || "—")}</dd>
+            <dt>Order placed at</dt><dd>${esc(c.orderPlacedAt || "—")}</dd>
+            `}
+          </dl>
+          <div class="browser-actions">
+            <button type="button" class="btn-primary btn-sm" data-act="show" data-id="${esc(b.id)}">Open browser</button>
+            <button type="button" class="btn-ghost btn-sm" data-act="hide" data-id="${esc(b.id)}">Hide</button>
+            <button type="button" class="btn-danger btn-sm" data-act="stop" data-id="${esc(b.id)}">Stop (take over)</button>
+            <button type="button" class="btn-ghost btn-sm" data-act="close" data-id="${esc(b.id)}">Close</button>
+            <button type="button" class="btn-warn btn-sm" data-act="continue" data-id="${esc(b.id)}">Continue</button>
+          </div>
+        </article>`;
+      }).join("");
+    }
+
+    function hasOrderNumber(o) {
+      const n = o?.orderNumber ?? o?.card?.orderNumber;
+      return Boolean(n && String(n).trim() && String(n).trim() !== "—");
+    }
+
+    function collectSuccessfulOrders(snap) {
+      const merged = [];
+      const seen = new Set();
+      const push = (o) => {
+        if (!hasOrderNumber(o)) return;
+        const key = String(o.orderNumber).trim();
+        if (seen.has(key)) return;
+        seen.add(key);
+        merged.push(o);
+      };
+      const list = Array.isArray(snap?.orders) ? snap.orders : snap?.orders ? [snap.orders] : [];
+      for (const o of list) push(o);
+      for (const b of snap?.browsers || []) {
+        const c = b.card || {};
+        if (!hasOrderNumber(c)) continue;
+        push({
+          browser: b.id,
+          orderNumber: c.orderNumber,
+          productType: c.productType,
+          productName: c.productType,
+          color: c.color,
+          storage: c.storage,
+          quantity: c.quantity,
+          total: c.total,
+          amountSpent: c.total,
+          cardNumber: c.cardNumber,
+          cardType: c.cardType,
+          cardCompany: c.cardCompany,
+          cardLimit: c.cardLimit,
+          orderPlacedAt: c.orderPlacedAt,
+          deliveryMethod: c.deliveryMethod || c.fulfillmentMode || b.config?.fulfillmentPreference,
+          fulfillmentMode: c.fulfillmentMode,
+          estimatedDelivery: c.estimatedDelivery || c.deliveryDetails?.estimatedDelivery,
+          deliveryShippingBoxes: {
+            lastName: c.lastName || c.deliveryDetails?.lastName,
+            firstName: c.firstName || c.deliveryDetails?.firstName,
+            areaDistrictStreet: c.areaDistrictStreet || c.deliveryDetails?.areaDistrictStreet,
+            buildingFloorUnit: c.buildingFloorUnit || c.deliveryDetails?.buildingFloorUnit,
+          },
+          shippingDetails: c.deliveryDetails || {
+            name: c.name,
+            phone: c.phone,
+            email: c.email,
+            address: c.address,
+            estimatedDelivery: c.estimatedDelivery,
+            lastName: c.lastName,
+            firstName: c.firstName,
+            areaDistrictStreet: c.areaDistrictStreet,
+            buildingFloorUnit: c.buildingFloorUnit,
+          },
+          checkoutContactUsed: {
+            lastName: c.lastName || (c.name || "").split(/\s+/)[0],
+            firstName: c.firstName || (c.name || "").split(/\s+/).slice(1).join(" "),
+            phone: c.phone,
+            email: c.email,
+            address: c.address,
+            areaDistrictStreet: c.areaDistrictStreet,
+            buildingFloorUnit: c.buildingFloorUnit,
+          },
+        });
+      }
+      return merged;
+    }
+
+    let lastSuccessfulOrders = [];
+
+    function renderOrders(orders) {
+      const box = $("orders");
+      const btn = $("btnExportOrders");
+      const list = (Array.isArray(orders) ? orders : orders ? [orders] : []).filter(hasOrderNumber);
+      lastSuccessfulOrders = list;
+      if (btn) btn.disabled = list.length === 0;
+      if (!list.length) {
+        box.innerHTML = '<p class="empty">未有成功落單。任務出現訂單編號後先會喺呢度顯示。</p>';
+        return;
+      }
+      box.innerHTML = list.map((o) => {
+        const contact = o.checkoutContactUsed || {};
+        const ship = o.confirmationPageShipping || {};
+        const sd = o.shippingDetails || {};
+        const boxes = o.deliveryShippingBoxes || {};
+        const identity = o.identity || {};
+        const amount = o.amountSpent || o.total || "—";
+        const card = o.cardNumber || ship.cardNumber || "—";
+        const cardType = o.cardType || "—";
+        const cardCompany = o.cardCompany || "—";
+        const cardLimit = o.cardLimit || "—";
+        const remainingLimit = o.remainingCreditCardLimit || o.remainingLimit || "—";
+        const orderPlacedAt = o.orderPlacedAt || "—";
+        const deliveryMethod = o.deliveryMethod || o.fulfillmentMode || contact.mode || "—";
+        const productType = o.productType || o.productName || "—";
+        const colour = o.color || "—";
+        const storage = o.storage || "—";
+        const qty = o.quantity ?? "—";
+        const lastName = boxes.lastName || sd.lastName || contact.lastName || identity.lastName || "";
+        const firstName = boxes.firstName || sd.firstName || contact.firstName || identity.firstName || "";
+        const areaDistrictStreet =
+          boxes.areaDistrictStreet ||
+          sd.areaDistrictStreet ||
+          contact.areaDistrictStreet ||
+          [identity.area, identity.district, identity.street].filter(Boolean).join(" ") ||
+          "";
+        const buildingFloorUnit =
+          boxes.buildingFloorUnit ||
+          sd.buildingFloorUnit ||
+          contact.buildingFloorUnit ||
+          identity.buildingLine ||
+          "";
+        const name = sd.name || [lastName, firstName].filter(Boolean).join(" ") || ship.name || "—";
+        const phone = sd.phone || contact.phone || ship.phone || "—";
+        const email = sd.email || contact.email || ship.email || "—";
+        const address = sd.address || contact.address || ship.address || ship.pickupStore || "—";
+        const eta = sd.estimatedDelivery || o.estimatedDelivery || "—";
+        const pickupStore = sd.pickupStore || ship.pickupStore || "";
+        const isDelivery = /delivery/i.test(String(deliveryMethod));
+        return `<article class="order-card">
+          <strong>${esc(o.orderNumber)}</strong>
+          <div class="order-money">
+            <div><span>Amount spent</span><b>${esc(amount)}</b></div>
+            <div><span>Credit card</span><b>${esc(card)}</b></div>
+          </div>
+          <dl>
+            <dt>Browser</dt><dd>${esc(o.browser || "—")}</dd>
+            <dt>Delivery method</dt><dd>${esc(deliveryMethod)}</dd>
+            <dt>Product type</dt><dd>${esc(productType)}</dd>
+            <dt>Colour</dt><dd>${esc(colour)}</dd>
+            <dt>Storage</dt><dd>${esc(storage)}</dd>
+            <dt>Qty</dt><dd>${esc(qty)}</dd>
+            <dt>Amount spent</dt><dd>${esc(amount)}</dd>
+            <dt>Credit card</dt><dd>${esc(card)}</dd>
+            <dt>Credit card type</dt><dd>${esc(cardType)}</dd>
+            <dt>Credit card company</dt><dd>${esc(cardCompany)}</dd>
+            <dt>Credit card limit</dt><dd>${esc(cardLimit)}</dd>
+            <dt>Remaining credit card limit</dt><dd>${esc(remainingLimit)}</dd>
+            <dt>Order placed at</dt><dd>${esc(orderPlacedAt)}</dd>
+            ${isDelivery ? `
+            <dt>姓氏</dt><dd>${esc(lastName || "—")}</dd>
+            <dt>名字</dt><dd>${esc(firstName || "—")}</dd>
+            <dt>區域/地區/街道名稱及號碼</dt><dd>${esc(areaDistrictStreet || "—")}</dd>
+            <dt>屋苑或大廈/座數/樓層/單位</dt><dd>${esc(buildingFloorUnit || "—")}</dd>
+            ` : ""}
+            <dt>Name</dt><dd>${esc(name)}</dd>
+            <dt>Phone</dt><dd>${esc(phone)}</dd>
+            <dt>Email</dt><dd>${esc(email)}</dd>
+            <dt>Address</dt><dd>${esc(address)}</dd>
+            ${pickupStore ? `<dt>Pickup store</dt><dd>${esc(pickupStore)}</dd>` : ""}
+            <dt>Est. delivery</dt><dd>${esc(eta)}</dd>
+          </dl>
+        </article>`;
+      }).join("");
+    }
+
+    function esc(s) {
+      return String(s ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+
+    let lastCardLimits = null;
+
+    function fmtLimit(n) {
+      if (n == null || n === "" || Number.isNaN(Number(n))) return "—";
+      return Number(n).toLocaleString("en-HK");
+    }
+
+    function renderCardLimits(payload) {
+      lastCardLimits = payload || null;
+      const body = $("cardLimitsBody");
+      const meta = $("cardLimitsMeta");
+      if (!body) return;
+      const cards = Array.isArray(payload?.cards) ? payload.cards : [];
+      const q = String($("cardLimitSearch")?.value || "").trim().toLowerCase();
+      const usedOnly = Boolean($("cardLimitUsedOnly")?.checked);
+      const filtered = cards.filter((c) => {
+        if (usedOnly && !c.touched) return false;
+        if (!q) return true;
+        const hay = `${c.masked} ${c.last4} ${c.company} ${c.type}`.toLowerCase();
+        return hay.includes(q);
+      });
+
+      if (meta) {
+        const touched = payload?.touchedCount ?? cards.filter((c) => c.touched).length;
+        const updated = payload?.updatedAt
+          ? new Date(payload.updatedAt).toLocaleTimeString("zh-HK", { hour12: false })
+          : "—";
+        meta.innerHTML = `Live · 已用過 <b>${touched}</b> / ${cards.length} 張 · 顯示 ${filtered.length} 張 · 更新 ${esc(updated)}`;
+      }
+
+      if (!filtered.length) {
+        body.innerHTML = `<tr><td colspan="6" class="empty">${
+          usedOnly ? "未有卡被扣過額度。成功落單後會即時出現。" : "未有卡額資料。"
+        }</td></tr>`;
+        return;
+      }
+
+      body.innerHTML = filtered
+        .map((c) => {
+          const rem = c.remainingLimit;
+          const low = rem != null && rem < 11500;
+          const cls = [c.touched ? "touched" : "", low ? "low" : ""].filter(Boolean).join(" ");
+          return `<tr class="${cls}">
+            <td>${esc(c.masked)}</td>
+            <td>${esc(c.company)}</td>
+            <td>${esc(c.type)}</td>
+            <td class="num">${esc(fmtLimit(c.originalLimit))}</td>
+            <td class="num">${esc(c.touched ? fmtLimit(c.usedAmount) : "—")}</td>
+            <td class="num remaining">${esc(fmtLimit(c.remainingLimit))}</td>
+          </tr>`;
+        })
+        .join("");
+    }
+
+    function applySnapshot(snap) {
+      if (!snap) return;
+      setRunningUI(snap.runningCount || 0);
+      $("runningCount").textContent = String(snap.runningCount ?? 0);
+      $("totalBrowsers").textContent = String(snap.totalBrowsers ?? 0);
+      if (snap.config) fillForm(snap.config);
+      renderBrowsers(snap.browsers || []);
+      renderOrders(collectSuccessfulOrders(snap));
+      renderCardLimits(snap.cardLimits);
+      applyMonitorUI(snap.monitor);
+
+      const key = "all";
+      const logs = snap.logs || [];
+      const prev = knownLogLenByKey.get(key) || 0;
+      if (logs.length >= prev) {
+        appendLogs(logs.slice(prev));
+        knownLogLenByKey.set(key, logs.length);
+      }
+    }
+
+    function applyMonitorUI(mon) {
+      if (!$("monitorState")) return;
+      const running = Boolean(mon?.running);
+      $("monitorState").textContent = running
+        ? `ON${mon?.autoBuy ? " +buying" : ""} (pid ${mon?.pid ?? "—"})`
+        : "off";
+      const st = mon?.status;
+      const total = st?.totalAvailableStock;
+      $("monitorStockTotal").textContent =
+        total == null ? "—" : String(total);
+      const skus = st?.skus || [];
+      $("monitorSkuLine").textContent = skus.length
+        ? skus
+            .map(
+              (s) =>
+                `${s.name}: ${s.label}｜庫存=${s.stockQty ?? "?"}｜落單=${s.buyQty}`
+            )
+            .join(" · ")
+        : "";
+
+      const toggle = $("btnMonitorToggle");
+      if (toggle) {
+        toggle.textContent = running ? "Stop monitor" : "Start monitor";
+        toggle.className = running ? "btn-danger" : "btn-primary";
+      }
+      if ($("btnMonitorBuy")) $("btnMonitorBuy").disabled = running;
+
+      const mlogs = mon?.logs || [];
+      const mkey = "monitor";
+      const mprev = knownLogLenByKey.get(mkey) || 0;
+      if (mlogs.length >= mprev) {
+        appendLogs(mlogs.slice(mprev));
+        knownLogLenByKey.set(mkey, mlogs.length);
+      }
+    }
+
+    async function refresh() {
+      const res = await fetch("/api/snapshot");
+      applySnapshot(await res.json());
+    }
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      let cfg;
+      try {
+        cfg = formConfig();
+      } catch (err) {
+        alert(err.message || "請先揀一個產品");
+        return;
+      }
+      const res = await fetch("/api/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(cfg),
+      });
+      const data = await res.json();
+      if (!data.ok) alert(data.error || "Launch failed");
+      applySnapshot(data.state);
+    });
+
+    $("btnAdd").addEventListener("click", async () => {
+      let cfg;
+      try {
+        cfg = formConfig();
+      } catch (err) {
+        alert(err.message || "請先揀一個產品");
+        return;
+      }
+      const res = await fetch("/api/browsers/add", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...cfg, count: 1 }),
+      });
+      const data = await res.json();
+      if (!data.ok) alert(data.error || "Add failed");
+      applySnapshot(data.state);
+    });
+
+    async function startMonitorFromUi(autoBuy) {
+      const fd = new FormData(form);
+      let quantity = Number(fd.get("quantity") || 2);
+      let fulfillmentPreference = String(fd.get("fulfillmentPreference") || "pickup");
+      let pickupSearch = String(fd.get("pickupSearch") || "中環");
+      try {
+        const cfg = formConfig();
+        quantity = cfg.quantity;
+        fulfillmentPreference = cfg.fulfillmentPreference;
+        pickupSearch = cfg.pickupSearch;
+      } catch {
+        /* monitor 可不揀產品；用表單／預設 */
+        if (!quantity || quantity < 1) quantity = 2;
+        if (!fulfillmentPreference) fulfillmentPreference = "pickup";
+      }
+      const res = await fetch("/api/monitor/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          quantity,
+          fulfillmentPreference,
+          pickupSearch,
+          autoBuy: Boolean(autoBuy),
+        }),
+      });
+      const data = await res.json();
+      if (!data.ok) alert(data.error || "Monitor start failed");
+      else applySnapshot(data.state);
+    }
+
+    $("btnMonitorToggle").addEventListener("click", async () => {
+      const running = ($("btnMonitorToggle").textContent || "").includes("Stop");
+      if (running) {
+        const res = await fetch("/api/monitor/stop", { method: "POST" });
+        const data = await res.json();
+        if (!data.ok) alert(data.error || "Monitor stop failed");
+        else applySnapshot(data.state);
+        return;
+      }
+      await startMonitorFromUi(false);
+    });
+
+    $("btnMonitorBuy").addEventListener("click", async () => {
+      await startMonitorFromUi(true);
+    });
+
+    $("btnStop").addEventListener("click", async () => {
+      const res = await fetch("/api/stop", { method: "POST" });
+      applySnapshot((await res.json()).state);
+    });
+
+    $("btnClearAll").addEventListener("click", async () => {
+      if (!confirm("Clear all opened tasks？會強制關晒所有瀏覽器。")) return;
+      const res = await fetch("/api/clear-all", { method: "POST" });
+      applySnapshot((await res.json()).state);
+    });
+
+    $("btnContinue").addEventListener("click", async () => {
+      await fetch("/api/continue", { method: "POST" });
+      setTimeout(refresh, 600);
+    });
+
+    $("btnExportOrders").addEventListener("click", async () => {
+      const btn = $("btnExportOrders");
+      if (!lastSuccessfulOrders.length) {
+        alert("未有成功訂單可以匯出。");
+        return;
+      }
+      const prev = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "匯出中…";
+      try {
+        const res = await fetch("/api/orders/export-google-sheet", { method: "POST" });
+        const data = await res.json().catch(() => ({}));
+        if (!data.ok) {
+          alert(data.error || "匯出 Google 試算表失敗");
+          return;
+        }
+        if (data.url) window.open(data.url, "_blank", "noopener,noreferrer");
+      } catch (err) {
+        alert(err instanceof Error ? err.message : String(err));
+      } finally {
+        btn.textContent = prev || "匯出 Google 試算表";
+        btn.disabled = lastSuccessfulOrders.length === 0;
+      }
+    });
+
+    $("browsers").addEventListener("click", async (e) => {
+      const btn = e.target.closest("button[data-act]");
+      if (!btn) return;
+      const id = btn.getAttribute("data-id");
+      const act = btn.getAttribute("data-act");
+      if (act === "show") {
+        const res = await fetch(`/api/browsers/${encodeURIComponent(id)}/show`, { method: "POST" });
+        const data = await res.json().catch(() => ({}));
+        if (data.state) applySnapshot(data.state);
+        setTimeout(refresh, 400);
+      }
+      if (act === "hide") {
+        await fetch(`/api/browsers/${encodeURIComponent(id)}/hide`, { method: "POST" });
+        setTimeout(refresh, 400);
+      }
+      if (act === "stop") {
+        btn.disabled = true;
+        btn.textContent = "Stopping…";
+        try {
+          const res = await fetch(`/api/browsers/${encodeURIComponent(id)}/stop`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ mode: "release" }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (data.state) applySnapshot(data.state);
+        } finally {
+          setTimeout(refresh, 400);
+          setTimeout(refresh, 1200);
+          setTimeout(refresh, 2500);
+        }
+      }
+      if (act === "close") {
+        btn.disabled = true;
+        btn.textContent = "Closing…";
+        try {
+          const res = await fetch(`/api/browsers/${encodeURIComponent(id)}/close`, {
+            method: "POST",
+          });
+          const data = await res.json().catch(() => ({}));
+          if (data.state) applySnapshot(data.state);
+        } finally {
+          setTimeout(refresh, 300);
+          setTimeout(refresh, 1000);
+        }
+      }
+      if (act === "continue") {
+        await fetch(`/api/browsers/${encodeURIComponent(id)}/continue`, { method: "POST" });
+        setTimeout(refresh, 500);
+      }
+    });
+
+    form.querySelector("#presetRow")?.addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-preset]");
+      if (!btn) return;
+      applyPreset(btn.getAttribute("data-preset"));
+    });
+
+    clearPresetSelection();
+
+    const es = new EventSource("/api/events");
+    es.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === "hello" || msg.type === "status") applySnapshot(msg.state);
+        if (msg.type === "log") appendLogs([msg.line]);
+      } catch { /* ignore */ }
+    };
+
+    $("cardLimitSearch")?.addEventListener("input", () => {
+      if (lastCardLimits) renderCardLimits(lastCardLimits);
+    });
+    $("cardLimitUsedOnly")?.addEventListener("change", () => {
+      if (lastCardLimits) renderCardLimits(lastCardLimits);
+    });
+
+    refresh();
+    setInterval(refresh, 3000);
+  </script>
+</body>
+</html>

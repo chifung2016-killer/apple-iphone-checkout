@@ -1,0 +1,16 @@
+node_modules/
+order-confirmation*.json
+order-summary.json
+used-emails.json
+card-remaining-limits.json
+runtime-config.json
+runtime-status.json
+runtime/
+dashboard-continue.flag
+playwright-report/
+test-results/
+.auth/
+*.log
+.env
+.env.local
+*.zip
