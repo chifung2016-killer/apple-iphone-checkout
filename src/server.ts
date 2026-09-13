@@ -348,9 +348,10 @@ async function stopSession(
             ...prev,
             phase: "stop_requested",
             message: opts?.silent
-              ? "Dashboard Stop all（保持隱藏）"
+              ? "Dashboard Stop all（保持原本視窗位置）"
               : "Dashboard 要求 Stop（take over）",
-            windowHidden: opts?.silent ? true : prev.windowHidden,
+            windowHidden: opts?.silent ? false : prev.windowHidden,
+            windowState: opts?.silent ? "normal" : prev.windowState,
             updatedAt: new Date().toISOString(),
           },
           null,
@@ -364,7 +365,7 @@ async function stopSession(
     pushSessionLog(
       session,
       opts?.silent
-        ? "[dashboard] Stop all：已要求停止自動化（保持隱藏）"
+        ? "[dashboard] Stop all：已要求停止自動化（保持原本視窗位置）"
         : "[dashboard] 已要求停止自動化（Take over / Stop）"
     );
     // 即刻回 UI；背景再跟進 manual_control（避免 Stop 掣卡住 30 秒）
@@ -436,7 +437,7 @@ async function stopSession(
 
 async function stopAll() {
   await ensureRuntimeDir();
-  // 標示 Stop all：script 停自動化時唔開窗／fullscreen（多 process 共用，唔好提早刪）
+  // 標示 Stop all：script 停自動化；視窗保持原本位置（唔隱藏）
   await fs.writeFile(
     path.join(RUNTIME_DIR, "stop-all.flag"),
     new Date().toISOString(),

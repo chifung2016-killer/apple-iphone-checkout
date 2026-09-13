@@ -390,7 +390,7 @@ async function throwIfReleased(): Promise<void> {
     await fs.unlink(DASHBOARD_RELEASE_FLAG).catch(() => {});
     throw new ReleaseError(
       SILENT_STOP_ALL
-        ? "Dashboard Stop all：停止自動化（保持隱藏）"
+        ? "Dashboard Stop all：停止自動化（保持原本視窗位置）"
         : "Dashboard 要求停止自動化，改為人手操作"
     );
   }
@@ -7781,7 +7781,7 @@ async function completeDeliveryApplePayReview(
 ): Promise<void> {
   // 任何 secureN 嘅 /shop/checkout?_s=Review 或 /shop/apw/checkout?_s=Review*
   console.log(
-    `步驟：Review — 捲去頁底一次，再撳一次「使用Apple Pay繼續」（URL=${page.url()}）`
+    `步驟：Review — 捲底一次，再強化連撳「使用Apple Pay繼續」（URL=${page.url()}）`
   );
 
   // 等 Review URL 出現
@@ -7803,32 +7803,95 @@ async function completeDeliveryApplePayReview(
 
   console.log("  Review：捲去頁底一次…");
   await scrollPageToBottom(page);
-  await sleepCheckingRelease(350);
+  await sleepCheckingRelease(250);
 
-  console.log("  Review：撳一次「使用Apple Pay繼續」…");
-  let clicked = await clickReviewPagePrimaryCta(page);
-  if (!clicked) {
-    clicked = await clickApplePayContinueFast(page, {
-      waitMs: 6_000,
-      pollMs: 80,
-      hammer: false,
-    });
+  // 強化 autoclick：多策略連撳，直到離開 Review 或逾時
+  const deadline = Date.now() + 45_000;
+  let clicks = 0;
+  console.log("  Review：強化撳「使用Apple Pay繼續」…");
+
+  while (Date.now() < deadline) {
+    await throwIfReleased();
+    if (!isReviewPage(page.url())) {
+      console.log(`  已離開 Review → ${page.url()}（累計撳 ${clicks} 次）`);
+      break;
+    }
+
+    let got = await clickReviewPagePrimaryCta(page);
+    if (!got) {
+      got = await clickApplePayContinueFast(page, {
+        waitMs: 1_200,
+        pollMs: 25,
+        hammer: true,
+      });
+    }
+    if (!got) {
+      // 後備：鍵盤／座標狂撳 sticky footer
+      got = await page
+        .evaluate(() => {
+          const norm = (s: string) =>
+            (s || "").replace(/[\s\u00a0\u200b\ufeff\uf8ff]+/g, "").toLowerCase();
+          const nodes = Array.from(
+            document.querySelectorAll(
+              "button, a, [role='button'], apple-pay-button, [is='apple-pay-button'], [data-autom*='continue' i]"
+            )
+          ) as HTMLElement[];
+          for (const el of nodes) {
+            const t = norm(
+              `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${el.id || ""}`
+            );
+            if (
+              !(
+                (t.includes("apple") && t.includes("pay") && t.includes("繼續")) ||
+                (t.includes("使用") && t.includes("pay") && t.includes("繼續")) ||
+                (t.includes("continue") && t.includes("pay"))
+              )
+            ) {
+              continue;
+            }
+            el.scrollIntoView({ block: "center" });
+            el.click();
+            return true;
+          }
+          const sticky = document.querySelector(
+            "#rs-checkout-continue-button-bottom, .rs-checkout-continuebutton button, [data-autom='continueButton']"
+          ) as HTMLElement | null;
+          if (sticky) {
+            sticky.scrollIntoView({ block: "center" });
+            sticky.click();
+            return true;
+          }
+          return false;
+        })
+        .catch(() => false);
+    }
+
+    if (got) {
+      clicks += 1;
+      if (clicks === 1 || clicks % 5 === 0) {
+        console.log(`  已強化撳「使用Apple Pay繼續」（第 ${clicks} 次）`);
+      }
+      await withReleaseCheck(
+        page
+          .waitForURL((url) => !isReviewPage(url.toString()), { timeout: 700 })
+          .catch(() => {})
+      );
+      if (!isReviewPage(page.url())) break;
+      await sleepCheckingRelease(90);
+      continue;
+    }
+    await sleepCheckingRelease(140);
   }
 
-  if (!clicked) {
+  if (clicks === 0 && isReviewPage(page.url())) {
     throw new StepError("使用Apple Pay繼續", "Review 頁撳唔到主 CTA（使用Apple Pay繼續）。");
   }
-  console.log("  已撳「使用Apple Pay繼續」一次");
-
-  await withReleaseCheck(
-    page
-      .waitForURL((url) => !isReviewPage(url.toString()), { timeout: 12_000 })
-      .catch(() => {})
-  );
-  if (!isReviewPage(page.url())) {
-    console.log(`  已離開 Review → ${page.url()}`);
+  if (isReviewPage(page.url())) {
+    console.warn(
+      `  強化撳咗 ${clicks} 次仍喺 Review（可能等 Apple Pay sheet／人手確認）`
+    );
   } else {
-    console.warn("  撳完仍喺 Review（可能等 Apple Pay sheet／人手確認）");
+    console.log(`  Review CTA 完成（強化撳咗 ${clicks} 次）`);
   }
 
   const eta = await scrapeEstimatedDeliveryText(page).catch(() => null);
@@ -9422,6 +9485,43 @@ async function setBrowserWindowState(
   }
 }
 
+/** Stop all：唔 minimize／唔 fullscreen，還原到原本鋪位／大小 */
+async function restoreBrowserWindowLayout(session: BrowserSession): Promise<void> {
+  const windowId = await ensureSessionWindowId(session);
+  if (windowId == null) return;
+  try {
+    const cdp = await session.page.context().newCDPSession(session.page);
+    // 先取消 minimized
+    await cdp
+      .send("Browser.setWindowBounds", {
+        windowId,
+        bounds: { windowState: "normal" },
+      })
+      .catch(() => {});
+    if (session.windowBounds) {
+      await cdp.send("Browser.setWindowBounds", {
+        windowId,
+        bounds: { ...session.windowBounds, windowState: "normal" },
+      });
+    } else {
+      await cdp.send("Browser.setWindowBounds", {
+        windowId,
+        bounds: { windowState: "normal" },
+      });
+    }
+    await cdp.detach().catch(() => {});
+    await writeStatus({
+      windowState: "normal",
+      windowHidden: false,
+      message: "Stop all：視窗保持原本位置",
+    }).catch(() => {});
+  } catch (err) {
+    console.warn(
+      `${session.tag} 無法還原視窗位置：${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+}
+
 async function readBrowserWindowState(
   session: BrowserSession
 ): Promise<"minimized" | "normal" | "maximized" | "fullscreen" | null> {
@@ -9543,15 +9643,15 @@ async function holdForManualControl(
   }
 
   if (SILENT_STOP_ALL) {
-    console.log("\n已 Stop all：停自動化，瀏覽器保持隱藏（唔開窗／唔 fullscreen）。");
+    console.log("\n已 Stop all：停自動化，瀏覽器保持原本位置（唔隱藏／唔 fullscreen）。");
     for (const s of sessions) {
-      await setBrowserWindowState(s, "minimized").catch(() => {});
+      await restoreBrowserWindowLayout(s).catch(() => {});
     }
     await writeStatus({
       phase: "manual_control",
-      message: "Stop all：自動化已停，視窗保持隱藏",
-      windowHidden: true,
-      windowState: "minimized",
+      message: "Stop all：自動化已停，視窗保持原本位置",
+      windowHidden: false,
+      windowState: "normal",
     });
   } else {
     console.log("\n已停止自動化。瀏覽器保留畀你人手操作（Dashboard 顯示 manual_control）。");
