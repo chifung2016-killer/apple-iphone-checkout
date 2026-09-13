@@ -1685,6 +1685,7 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
   if (!keyword) throw new Error("缺少訂單編號，無法搜尋 Gmail");
   const enc = encodeURIComponent(keyword);
   const searchUrl = `https://mail.google.com/mail/u/0/#search/${enc}`;
+  const normKey = keyword.replace(/[\s-]/g, "");
   const urlHasKeyword = (url: string) => {
     try {
       return decodeURIComponent(url).includes(keyword) || url.includes(enc);
@@ -1692,6 +1693,11 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
       return url.includes(enc) || url.includes(keyword);
     }
   };
+  const textHasOrder = (text: string) => {
+    const t = (text || "").replace(/\s+/g, " ");
+    return t.includes(keyword) || t.replace(/[\s-]/g, "").includes(normKey);
+  };
+
   log(`搜尋郵件（訂單編號）：${keyword}…`);
   await writeStatus({
     phase: "search_email",
@@ -1707,7 +1713,6 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
   await dismissGmailOverlays(page);
   await sleep(800);
 
-  // 若仍未係 search，再試 hash／搜尋欄一次
   if (!/#search\//i.test(page.url()) || !urlHasKeyword(page.url())) {
     await page
       .evaluate((q) => {
@@ -1734,7 +1739,7 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
   log(`搜尋結果頁：${page.url()}`);
   await writeStatus({
     phase: "search_email",
-    message: `已搜尋「${keyword}」，開啟郵件…`,
+    message: `已搜尋「${keyword}」，點開郵件詳情…`,
     url: page.url(),
     orderNumber: keyword,
   });
@@ -1748,7 +1753,6 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
     'div[role="list"] div[role="listitem"]',
   ].join(", ");
 
-  // 等結果列（短等、中途 refresh）
   let rows = page.locator(rowSelectors);
   const rowDeadline = Date.now() + 25_000;
   let count = 0;
@@ -1758,7 +1762,6 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
     await dismissGmailOverlays(page);
     count = await rows.count().catch(() => 0);
     if (count > 0) break;
-    // 空結果提示
     const empty = await page
       .getByText(/沒有與你的搜尋相符|No messages matched|找不到任何郵件/i)
       .first()
@@ -1774,7 +1777,6 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
     rows = page.locator(rowSelectors);
   }
   if (count <= 0) {
-    // 最後一次硬 refresh
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
     await sleep(1200);
     rows = page.locator(rowSelectors);
@@ -1783,42 +1785,94 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
   if (count <= 0) {
     throw new Error(`Gmail 搜尋訂單「${keyword}」搵唔到郵件列`);
   }
-  log(`搜尋到 ${count} 列，準備開啟…`);
+  log(`搜尋到 ${count} 列，揀含訂單編號嘅郵件打開…`);
 
-  const rowHasOrder = (text: string) =>
-    text.includes(keyword) || text.replace(/[\s-]/g, "").includes(keyword.replace(/[\s-]/g, ""));
-  let opened = false;
-  const openAt = async (i: number, why: string) => {
+  const ranked: number[] = [];
+  for (let i = 0; i < Math.min(count, 40); i++) {
+    const text = ((await rows.nth(i).innerText().catch(() => "")) || "").replace(/\s+/g, " ");
+    if (textHasOrder(text)) ranked.push(i);
+  }
+  // 搜尋結果本身已係 order number：冇 snippet 對上就由第一封開始試
+  for (let i = 0; i < Math.min(count, 15); i++) {
+    if (!ranked.includes(i)) ranked.push(i);
+  }
+
+  let openedOk = false;
+  for (const i of ranked) {
+    await throwIfStopped();
+    await dismissGmailOverlays(page);
     const row = rows.nth(i);
     const text = ((await row.innerText().catch(() => "")) || "").replace(/\s+/g, " ");
-    await row.scrollIntoViewIfNeeded().catch(() => {});
-    await row.click({ timeout: 4000 }).catch(() => {});
-    await sleep(200);
-    await row.dblclick({ timeout: 4000 }).catch(() => {});
-    await page.keyboard.press("Enter").catch(() => {});
-    log(`${why}：${text.slice(0, 90)}`);
-    opened = true;
-  };
+    log(`試開第 ${i + 1} 封：${text.slice(0, 90)}`);
 
-  for (let i = 0; i < Math.min(count, 30) && !opened; i++) {
-    await throwIfStopped();
-    const text = ((await rows.nth(i).innerText().catch(() => "")) || "").replace(/\s+/g, " ");
-    if (rowHasOrder(text)) await openAt(i, `已開啟含訂單「${keyword}」郵件`);
+    await row.scrollIntoViewIfNeeded().catch(() => {});
+    // 優先撳主旨／snippet，避免撳到 checkbox
+    const subject = row.locator("span.bog, td.xY span, div.y6 span, span[data-thread-id]").first();
+    if ((await subject.count().catch(() => 0)) > 0) {
+      await subject.click({ timeout: 4000 }).catch(async () => {
+        await row.click({ timeout: 4000 }).catch(() => {});
+      });
+    } else {
+      await row.click({ timeout: 4000 }).catch(() => {});
+    }
+    await sleep(350);
+    // 未入詳情就 dblclick / Enter / o
+    if (!(await isGmailMessageOpen(page))) {
+      await row.dblclick({ timeout: 3000 }).catch(() => {});
+      await sleep(250);
+    }
+    if (!(await isGmailMessageOpen(page))) {
+      await page.keyboard.press("Enter").catch(() => {});
+      await sleep(250);
+    }
+    if (!(await isGmailMessageOpen(page))) {
+      await page.keyboard.press("o").catch(() => {});
+    }
+
+    const bodyOk = await waitForGmailMessageOpen(page, { orderNumber: keyword, timeoutMs: 12_000 });
+    if (!bodyOk) {
+      log("未打開詳情／正文唔含訂單編號，試下一封…");
+      await page.keyboard.press("Escape").catch(() => {});
+      await sleep(300);
+      continue;
+    }
+    log(`已打開含訂單「${keyword}」嘅郵件詳情`);
+    openedOk = true;
+    break;
   }
-  if (!opened) await openAt(0, "已開啟搜尋結果第一封");
+
+  if (!openedOk) {
+    throw new Error(`搜尋結果入面打唔開含訂單「${keyword}」嘅郵件詳情`);
+  }
 
   await writeStatus({
     phase: "email_opened",
-    message: `已開啟訂單「${keyword}」郵件`,
+    message: `已開啟訂單「${keyword}」郵件詳情`,
     url: page.url(),
     orderNumber: keyword,
   });
-  await waitForGmailMessageOpen(page);
+}
+
+async function isGmailMessageOpen(page: Page): Promise<boolean> {
+  const body = page
+    .locator(
+      'div.a3s, div.adn div.a3s, div[data-message-id], h2.hP, div[role="listitem"] div.ii, div.a3s.aiL'
+    )
+    .first();
+  if ((await body.count().catch(() => 0)) === 0) return false;
+  if (!(await body.isVisible().catch(() => false))) return false;
+  const t = ((await body.innerText().catch(() => "")) || "").trim();
+  return t.length > 20;
 }
 
 /** 等 Gmail 郵件正文真正打開（唔係淨係 highlight 列表） */
-async function waitForGmailMessageOpen(page: Page): Promise<void> {
-  const deadline = Date.now() + 20_000;
+async function waitForGmailMessageOpen(
+  page: Page,
+  opts?: { orderNumber?: string; timeoutMs?: number }
+): Promise<boolean> {
+  const orderNumber = String(opts?.orderNumber || "").trim();
+  const normKey = orderNumber.replace(/[\s-]/g, "");
+  const deadline = Date.now() + (opts?.timeoutMs ?? 20_000);
   while (Date.now() < deadline) {
     await throwIfStopped();
     await syncWindowFlags().catch(() => {});
@@ -1827,32 +1881,51 @@ async function waitForGmailMessageOpen(page: Page): Promise<void> {
       .first()
       .click({ timeout: 400 })
       .catch(() => {});
-    const body = page
-      .locator(
-        'div.a3s, div.adn div.a3s, div[data-message-id], h2.hP, div[role="listitem"] div.ii, div.a3s.aiL'
-      )
-      .first();
-    if ((await body.count().catch(() => 0)) > 0 && (await body.isVisible().catch(() => false))) {
-      const t = ((await body.innerText().catch(() => "")) || "").trim();
-      if (t.length > 20) {
+    if (await isGmailMessageOpen(page)) {
+      if (!orderNumber) {
         log("郵件正文已打開");
-        return;
+        return true;
+      }
+      const bodyText = await page
+        .locator("div.a3s, div.adn div.a3s, div[role='listitem'] div.ii")
+        .first()
+        .innerText()
+        .catch(() => "");
+      const subject = await page.locator("h2.hP").first().innerText().catch(() => "");
+      const hay = `${subject}\n${bodyText}`;
+      if (
+        hay.includes(orderNumber) ||
+        hay.replace(/[\s-]/g, "").includes(normKey) ||
+        // 搜尋結果第一封時 snippet 未必重複顯示編號，但有訂單狀態掣都當 OK
+        /訂單狀態|查看訂單|Order Status|View [Yy]our [Oo]rder|Track [Oo]rder/i.test(hay)
+      ) {
+        log("郵件正文已打開（對應訂單）");
+        return true;
       }
     }
-    // 有時單擊未開：再 Enter
     await page.keyboard.press("Enter").catch(() => {});
-    await page.keyboard.press("o").catch(() => {}); // Gmail open shortcut
+    await page.keyboard.press("o").catch(() => {});
     await sleep(400);
   }
-  log("警告：未確認郵件正文，仍繼續試撳訂單狀態");
+  log("警告：未確認郵件正文／訂單編號");
+  return false;
 }
 
 async function clickOrderStatusInEmail(page: Page, context: BrowserContext): Promise<Page> {
-  log("撳「訂單狀態」一次…");
+  log("喺郵件詳情入面撳「訂單狀態」…");
   await dismissGmailOverlays(page);
-  // 正文未開先快等一下（唔重複死等）
-  const bodyVisible = await page.locator("div.a3s, h2.hP").first().isVisible().catch(() => false);
-  if (!bodyVisible) await waitForGmailMessageOpen(page);
+  if (!(await isGmailMessageOpen(page))) {
+    const ok = await waitForGmailMessageOpen(page, { timeoutMs: 12_000 });
+    if (!ok) log("警告：正文未完全確認，仍試撳訂單狀態掣");
+  }
+
+  // 展開「顯示完整郵件」
+  await page
+    .getByText(/顯示完整郵件|顯示整個郵件|View entire message|View full message/i)
+    .first()
+    .click({ timeout: 800 })
+    .catch(() => {});
+  await sleep(300);
 
   const before = new Set(context.pages().map((p) => p));
   const nameRes = [
@@ -1870,41 +1943,51 @@ async function clickOrderStatusInEmail(page: Page, context: BrowserContext): Pro
     /Track [Oo]rder/,
   ];
 
-  // 1) Playwright role=link／button（主頁優先，快）
-  for (const re of nameRes) {
-    const el = page
-      .getByRole("link", { name: re })
-      .or(page.getByRole("button", { name: re }))
-      .first();
-    if ((await el.count().catch(() => 0)) === 0) continue;
-    if (!(await el.isVisible().catch(() => false))) continue;
-    const popupPromise = context.waitForEvent("page", { timeout: 8000 }).catch(() => null);
-    await el.scrollIntoViewIfNeeded().catch(() => {});
-    await el.click({ timeout: 4000 }).catch(async () => {
-      await el.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
-    });
-    log(`已撳訂單狀態相關掣：${re}`);
-    const popup = await popupPromise;
-    if (popup && !popup.isClosed()) {
-      await popup.waitForLoadState("domcontentloaded").catch(() => {});
-      log(`已開新分頁：${popup.url()}`);
-      return popup;
-    }
-    await sleep(1000);
-    for (const p of context.pages()) {
-      if (!before.has(p) && !p.isClosed()) {
-        await p.waitForLoadState("domcontentloaded").catch(() => {});
-        log(`已開新分頁：${p.url()}`);
-        return p;
+  // 優先喺郵件正文／當前對話範圍撳（避免撳到側欄）
+  const scopes = [
+    page.locator("div.a3s, div.adn, div[data-message-id], div.ii").first(),
+    page.locator('div[role="main"]').first(),
+    page.locator("body"),
+  ];
+
+  for (const scope of scopes) {
+    if ((await scope.count().catch(() => 0)) === 0) continue;
+    for (const re of nameRes) {
+      const el = scope
+        .getByRole("link", { name: re })
+        .or(scope.getByRole("button", { name: re }))
+        .or(scope.getByText(re))
+        .first();
+      if ((await el.count().catch(() => 0)) === 0) continue;
+      if (!(await el.isVisible().catch(() => false))) continue;
+      const popupPromise = context.waitForEvent("page", { timeout: 10_000 }).catch(() => null);
+      await el.scrollIntoViewIfNeeded().catch(() => {});
+      await el.click({ timeout: 5000 }).catch(async () => {
+        await el.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
+      });
+      log(`已撳郵件內訂單狀態掣：${re}`);
+      const popup = await popupPromise;
+      if (popup && !popup.isClosed()) {
+        await popup.waitForLoadState("domcontentloaded").catch(() => {});
+        log(`已開新分頁：${popup.url()}`);
+        return popup;
       }
-    }
-    if (/store\.apple\.com|secure\d*\.store\.apple|google\.com\/url/i.test(page.url())) {
-      log(`訂單頁：${page.url()}`);
-      return page;
+      await sleep(1000);
+      for (const p of context.pages()) {
+        if (!before.has(p) && !p.isClosed()) {
+          await p.waitForLoadState("domcontentloaded").catch(() => {});
+          log(`已開新分頁：${p.url()}`);
+          return p;
+        }
+      }
+      if (/store\.apple\.com|secure\d*\.store\.apple|google\.com\/url/i.test(page.url())) {
+        log(`訂單頁：${page.url()}`);
+        return page;
+      }
     }
   }
 
-  // 2) DOM 掃描（處理 span 包住文字／空字 image CTA）
+  // DOM 掃描：只喺郵件正文
   const clicked = await page
     .evaluate(() => {
       const norm = (s: string) => (s || "").replace(/[\s\u00a0\u200b\u200c\u200d\ufeff]+/g, "");
@@ -1918,36 +2001,44 @@ async function clickOrderStatusInEmail(page: Page, context: BrowserContext): Pro
           /orderstatus|vieworder|viewyourorder|checkorder|trackorder/i.test(t)
         );
       };
-      const nodes = Array.from(
-        document.querySelectorAll("a, button, span, td, div, font")
+      const roots = Array.from(
+        document.querySelectorAll("div.a3s, div.adn, div[data-message-id], div.ii")
       ) as HTMLElement[];
-      for (const el of nodes) {
-        const label = `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""}`;
-        if (!hitText(label)) continue;
-        const a =
-          (el.closest("a") as HTMLElement | null) ||
-          (el.tagName === "A" ? el : null) ||
-          (el.querySelector("a") as HTMLElement | null) ||
-          el;
-        a.click();
-        return "text";
-      }
-      for (const a of Array.from(document.querySelectorAll("a[href]")) as HTMLAnchorElement[]) {
-        const href = a.href || "";
-        if (
-          /vieworder|order\/guest|store\.apple\.com|secure\d*\.store\.apple|apple\.com\/.*order/i.test(
-            href
-          )
-        ) {
+      const searchRoots = roots.length ? roots : [document.body];
+      for (const root of searchRoots) {
+        const nodes = Array.from(
+          root.querySelectorAll("a, button, span, td, div, font, img")
+        ) as HTMLElement[];
+        for (const el of nodes) {
+          const label = `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""} ${el.getAttribute("alt") || ""}`;
+          if (!hitText(label)) continue;
+          const a =
+            (el.closest("a") as HTMLElement | null) ||
+            (el.tagName === "A" ? el : null) ||
+            (el.querySelector("a") as HTMLElement | null) ||
+            el;
+          a.scrollIntoView({ block: "center", inline: "nearest" });
           a.click();
-          return "href";
+          return "text";
+        }
+        for (const a of Array.from(root.querySelectorAll("a[href]")) as HTMLAnchorElement[]) {
+          const href = a.href || "";
+          if (
+            /vieworder|order\/guest|store\.apple\.com|secure\d*\.store\.apple|apple\.com\/.*order/i.test(
+              href
+            )
+          ) {
+            a.scrollIntoView({ block: "center", inline: "nearest" });
+            a.click();
+            return "href";
+          }
         }
       }
       return "";
     })
     .catch(() => "");
 
-  if (!clicked) throw new Error("郵件入面揾唔到「訂單狀態」掣／連結");
+  if (!clicked) throw new Error("郵件詳情入面揾唔到「訂單狀態」掣／連結");
   log(`已用 DOM 掃描撳到訂單連結（${clicked}）`);
   await sleep(1000);
 
@@ -1972,7 +2063,6 @@ async function clickOrderStatusInEmail(page: Page, context: BrowserContext): Pro
         timeout: 30_000,
       })
       .catch(() => {});
-    // 有時停喺 google redirect：直接跟 q=
     if (/google\.com\/url/i.test(page.url())) {
       try {
         const q = new URL(page.url()).searchParams.get("q");
@@ -2145,20 +2235,32 @@ async function processOneAccount(
     }
 
     if (!mailOpen || /#search\//i.test(page.url()) || /#inbox/i.test(page.url())) {
-      // 已在正確訂單搜尋結果：直接開郵件；否則用訂單編號搜尋 inbox
+      // 搜尋 → 點開含訂單編號嘅郵件詳情 → 再撳郵件內掣
       await writeStatus({
         phase: "search_email",
-        message: `搜尋／開啟訂單「${orderNumber}」…`,
+        message: `搜尋／開啟訂單「${orderNumber}」郵件詳情…`,
         orderNumber,
       });
       if (onSearch && mailOpen) {
-        log("搜尋頁已有郵件打開，繼續訂單狀態");
+        const bodyOk = await waitForGmailMessageOpen(page, {
+          orderNumber,
+          timeoutMs: 5_000,
+        });
+        if (bodyOk) {
+          log("搜尋頁已有對應郵件打開，繼續撳郵件內掣");
+        } else {
+          await gmailSearchAndOpenOrderEmail(page, orderNumber);
+        }
       } else {
         await gmailSearchAndOpenOrderEmail(page, orderNumber);
       }
     }
 
-    await writeStatus({ phase: "order_status", message: "撳訂單狀態…", orderNumber });
+    await writeStatus({
+      phase: "order_status",
+      message: "喺郵件詳情撳訂單狀態…",
+      orderNumber,
+    });
     const orderPage = await clickOrderStatusInEmail(page, context);
     activePage = orderPage;
     await maybeMinimizeBrowserWindow(orderPage, browser);
