@@ -253,6 +253,33 @@
     .browser-card.is-steps-complete {
       animation: blink-green 1.1s ease-in-out infinite;
     }
+    @keyframes blink-blue {
+      0%, 100% {
+        background: color-mix(in srgb, #3b82f6 14%, var(--field));
+        border-color: color-mix(in srgb, #60a5fa 45%, var(--line));
+        box-shadow: inset 0 0 0 1px color-mix(in srgb, #60a5fa 20%, transparent);
+      }
+      50% {
+        background: color-mix(in srgb, #3b82f6 42%, var(--field));
+        border-color: #60a5fa;
+        box-shadow:
+          inset 0 0 0 1px color-mix(in srgb, #60a5fa 55%, transparent),
+          0 0 14px color-mix(in srgb, #3b82f6 30%, transparent);
+      }
+    }
+    @keyframes blink-pill-blue {
+      0%, 100% { background: #3b82f6; }
+      50% { background: #93c5fd; }
+    }
+    .browser-card.is-opened-highlight {
+      animation: blink-blue 1.1s ease-in-out infinite;
+    }
+    .phase-pill.opened-hl {
+      color: #0b1a33;
+      background: #93c5fd;
+      border-color: transparent;
+      animation: blink-pill-blue 1.1s ease-in-out infinite;
+    }
     .phase-pill.steps {
       color: #062816;
       background: #7ddea8;
@@ -433,7 +460,7 @@
     <header>
       <div>
         <h1>Checkout Dashboard</h1>
-        <p class="sub">控制開幾多個瀏覽器、睇每個狀態，隨時再加開新瀏覽器。</p>
+        <p class="sub">控制開幾多個瀏覽器、睇每個狀態，隨時再加開新瀏覽器。 <a href="/add-order-apple-ac.html" style="color:var(--accent)">add order to apple ac →</a></p>
       </div>
       <div class="badge" id="runBadge"><span class="dot" id="runDot"></span><span id="runLabel">Idle</span></div>
     </header>
@@ -836,6 +863,8 @@
 
     let browsersTab = "opened"; // "opened" | "waiting" | "finished"
     let lastBrowsersSnap = [];
+    /** waiting payment：撳過 Open browser 嘅 task → 藍閃 */
+    const openedHighlightIds = new Set();
 
     function isPaidBrowser(b) {
       const c = b?.card || {};
@@ -941,6 +970,8 @@
         // 綠閃：只喺全部步驟做完（最終頁 steps_complete）
         const stepsFinished =
           !paid && /steps_complete/i.test(String(b.phase || ""));
+        const openedHighlight =
+          !paid && openedHighlightIds.has(String(b.id || ""));
         const waitingPayLabel =
           !paid &&
           /steps_complete|waiting_for_payment|waiting_user|awaiting_payment/i.test(
@@ -955,22 +986,26 @@
           !paid && !stepsFinished && !waitingPayLabel && !addingCart && isTaskStuck(b);
         const pc = paid
           ? "paid"
-          : stuck
-            ? "stuck"
-            : stepsFinished
-              ? "steps"
-              : addingCart
-                ? "adding"
-                : phaseClass(b.phase);
+          : openedHighlight
+            ? "opened-hl"
+            : stuck
+              ? "stuck"
+              : stepsFinished
+                ? "steps"
+                : addingCart
+                  ? "adding"
+                  : phaseClass(b.phase);
         const label = paid
           ? phaseLabel("payment_succeeded")
-          : stuck
-            ? "stuck / error"
-            : stepsFinished || waitingPayLabel
-              ? "waiting for payment"
-              : addingCart
-                ? "adding cart"
-                : phaseLabel(b.phase);
+          : openedHighlight
+            ? "browser opened"
+            : stuck
+              ? "stuck / error"
+              : stepsFinished || waitingPayLabel
+                ? "waiting for payment"
+                : addingCart
+                  ? "adding cart"
+                  : phaseLabel(b.phase);
         const product = c.productType || b.config?.model || "—";
         const colour = displayColour(c.color || b.config?.color || "—");
         const storage = c.storage || b.config?.storage || "—";
@@ -1003,8 +1038,9 @@
           "browser-card",
           paid ? "is-paid" : "",
           stuck ? "is-stuck" : "",
-          !stuck && stepsFinished ? "is-steps-complete" : "",
-          !stuck && !stepsFinished && addingCart ? "is-adding-cart" : "",
+          !stuck && openedHighlight ? "is-opened-highlight" : "",
+          !stuck && !openedHighlight && stepsFinished ? "is-steps-complete" : "",
+          !stuck && !openedHighlight && !stepsFinished && addingCart ? "is-adding-cart" : "",
         ]
           .filter(Boolean)
           .join(" ");
@@ -1621,12 +1657,17 @@
       const id = btn.getAttribute("data-id");
       const act = btn.getAttribute("data-act");
       if (act === "show") {
+        if (browsersTab === "waiting" && id) {
+          openedHighlightIds.add(String(id));
+        }
         const res = await fetch(`/api/browsers/${encodeURIComponent(id)}/show`, { method: "POST" });
         const data = await res.json().catch(() => ({}));
         if (data.state) applySnapshot(data.state);
+        else renderBrowsers(lastBrowsersSnap);
         setTimeout(refresh, 400);
       }
       if (act === "hide") {
+        if (id) openedHighlightIds.delete(String(id));
         await fetch(`/api/browsers/${encodeURIComponent(id)}/hide`, { method: "POST" });
         setTimeout(refresh, 400);
       }
@@ -1648,6 +1689,7 @@
         }
       }
       if (act === "close") {
+        if (id) openedHighlightIds.delete(String(id));
         btn.disabled = true;
         btn.textContent = "Closing…";
         const row = btn.closest("article.browser-card");

@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>add order to apple ac</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg0: #0f1412;
+      --bg1: #171e1a;
+      --panel: #1c2621;
+      --line: #2d3b34;
+      --text: #e8efe9;
+      --muted: #9aada1;
+      --accent: #c4f04d;
+      --accent-ink: #14200a;
+      --warn: #f0b45a;
+      --danger: #ff7a6e;
+      --ok: #6ee7a8;
+      --field: #121916;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Manrope", system-ui, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(900px 500px at 10% -10%, #24352c 0%, transparent 55%),
+        radial-gradient(700px 400px at 100% 0%, #1a2830 0%, transparent 50%),
+        linear-gradient(180deg, var(--bg0), var(--bg1));
+    }
+    .wrap { max-width: 820px; margin: 0 auto; padding: 28px 20px 48px; }
+    header { margin-bottom: 22px; }
+    h1 {
+      font-family: "Fraunces", Georgia, serif; font-weight: 700;
+      font-size: clamp(1.7rem, 3vw, 2.2rem); margin: 0 0 6px; letter-spacing: -0.02em;
+    }
+    .sub { color: var(--muted); font-size: 0.95rem; margin: 0; }
+    .sub a { color: var(--accent); }
+    section {
+      background: color-mix(in srgb, var(--panel) 92%, black);
+      border: 1px solid var(--line); border-radius: 18px; padding: 18px;
+      margin-bottom: 16px;
+    }
+    section h2 {
+      margin: 0 0 14px; font-size: 0.78rem; text-transform: uppercase;
+      letter-spacing: 0.08em; color: var(--muted); font-weight: 600;
+    }
+    label { display: block; font-size: 0.8rem; color: var(--muted); margin: 0 0 6px; }
+    .field { margin-bottom: 12px; }
+    input, textarea {
+      width: 100%; border: 1px solid var(--line); background: var(--field);
+      color: var(--text); border-radius: 10px; padding: 10px 12px; font: inherit; outline: none;
+    }
+    textarea {
+      min-height: 180px;
+      resize: vertical;
+      font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+      font-size: 0.86rem;
+      line-height: 1.45;
+    }
+    input:focus, textarea:focus {
+      border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+    }
+    .hint { color: var(--muted); font-size: 0.82rem; margin: 6px 0 0; }
+    .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 640px) { .row2 { grid-template-columns: 1fr; } }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+    button {
+      font: inherit; border-radius: 10px; padding: 10px 16px; cursor: pointer;
+      border: 1px solid var(--line); background: var(--field); color: var(--text);
+    }
+    .btn-primary {
+      background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 700;
+    }
+    .btn-danger { background: color-mix(in srgb, var(--danger) 22%, var(--field)); border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); }
+    .btn-ghost { background: transparent; }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    #logs {
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 0.8rem;
+      line-height: 1.4;
+      max-height: 360px;
+      overflow: auto;
+      background: #0b100e;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    #logs .dim { color: var(--muted); }
+    #statusPill {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 6px 10px; border-radius: 999px; border: 1px solid var(--line);
+      font-size: 0.82rem; color: var(--muted); margin-bottom: 10px;
+    }
+    #statusPill.run { color: var(--accent-ink); background: color-mix(in srgb, var(--accent) 70%, white); border-color: transparent; }
+    #statusPill.err { color: #3a1010; background: color-mix(in srgb, var(--danger) 55%, white); border-color: transparent; }
+    #statusPill.ok { color: #062816; background: color-mix(in srgb, var(--ok) 55%, white); border-color: transparent; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>add order to apple ac</h1>
+      <p class="sub"><a href="/">← Checkout Dashboard</a> · Gmail 搜「apple store／出貨」→ 訂單狀態 → 加入至 Apple ID</p>
+    </header>
+
+    <section>
+      <h2>Gmail accounts</h2>
+      <div class="field">
+        <label for="accounts">每行一個：email password（空格或 : 或 , 分隔）</label>
+        <textarea id="accounts" placeholder="chifung2016@gmail.com myGmailPassword&#10;other@gmail.com otherPassword"></textarea>
+        <p class="hint">會逐個自動登入 Gmail，搜尋含「apple store」或「出貨」嘅郵件，撳「訂單狀態」一次。</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Apple ID（加入訂單用）</h2>
+      <div class="row2">
+        <div class="field">
+          <label for="appleEmail">Apple ID email</label>
+          <input id="appleEmail" type="email" value="chifung2010@yahoo.com.hk" autocomplete="username" />
+        </div>
+        <div class="field">
+          <label for="applePassword">Apple ID password</label>
+          <input id="applePassword" type="password" value="yY6594083" autocomplete="current-password" />
+        </div>
+      </div>
+      <p class="hint">撳「加入至 Apple ID」後：填呢個電郵 →「繼續使用密碼登入」→ 密碼 → 右箭頭（同 delivery apple ac apple pay訪客模式）。</p>
+      <div class="actions">
+        <button type="button" class="btn-primary" id="btnStart">Start</button>
+        <button type="button" class="btn-danger" id="btnStop" disabled>Stop</button>
+        <button type="button" class="btn-ghost" id="btnClearLogs">Clear logs</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Live log</h2>
+      <div id="statusPill">Idle</div>
+      <div id="logs"></div>
+    </section>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const logsEl = $("logs");
+    const statusPill = $("statusPill");
+    let pollTimer = null;
+
+    function parseAccounts(text) {
+      const out = [];
+      for (const raw of String(text || "").split(/\r?\n/)) {
+        const line = raw.trim();
+        if (!line || line.startsWith("#")) continue;
+        let email = "";
+        let password = "";
+        if (line.includes(":")) {
+          const i = line.indexOf(":");
+          email = line.slice(0, i).trim();
+          password = line.slice(i + 1).trim();
+        } else if (line.includes(",")) {
+          const i = line.indexOf(",");
+          email = line.slice(0, i).trim();
+          password = line.slice(i + 1).trim();
+        } else {
+          const parts = line.split(/\s+/);
+          email = parts[0] || "";
+          password = parts.slice(1).join(" ");
+        }
+        if (email && password) out.push({ email, password });
+      }
+      return out;
+    }
+
+    function setStatus(text, kind) {
+      statusPill.textContent = text;
+      statusPill.className = kind || "";
+    }
+
+    function renderLogs(lines) {
+      logsEl.textContent = (lines || []).join("\n");
+      logsEl.scrollTop = logsEl.scrollHeight;
+    }
+
+    async function refreshStatus() {
+      try {
+        const res = await fetch("/api/add-order-apple-ac/status");
+        const data = await res.json();
+        renderLogs(data.logs || []);
+        if (data.running) {
+          setStatus("Running…", "run");
+          $("btnStart").disabled = true;
+          $("btnStop").disabled = false;
+        } else if (data.lastExitCode === 0) {
+          setStatus("Done", "ok");
+          $("btnStart").disabled = false;
+          $("btnStop").disabled = true;
+        } else if (data.lastExitCode != null && data.lastExitCode !== 0) {
+          setStatus(`Stopped / error (exit ${data.lastExitCode})`, "err");
+          $("btnStart").disabled = false;
+          $("btnStop").disabled = true;
+        } else {
+          setStatus(data.running ? "Running…" : "Idle", data.running ? "run" : "");
+          $("btnStart").disabled = !!data.running;
+          $("btnStop").disabled = !data.running;
+        }
+        if (!data.running && pollTimer) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+        }
+      } catch (err) {
+        setStatus(err instanceof Error ? err.message : String(err), "err");
+      }
+    }
+
+    function startPolling() {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(refreshStatus, 800);
+      refreshStatus();
+    }
+
+    $("btnStart").addEventListener("click", async () => {
+      const accounts = parseAccounts($("accounts").value);
+      if (!accounts.length) {
+        alert("請至少輸入一個 Gmail：email password");
+        return;
+      }
+      const appleEmail = $("appleEmail").value.trim();
+      const applePassword = $("applePassword").value;
+      if (!appleEmail || !applePassword) {
+        alert("請填 Apple ID email / password");
+        return;
+      }
+      $("btnStart").disabled = true;
+      setStatus("Starting…", "run");
+      try {
+        const res = await fetch("/api/add-order-apple-ac/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ accounts, appleEmail, applePassword }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.ok) {
+          alert(data.error || `Start failed (${res.status})`);
+          $("btnStart").disabled = false;
+          setStatus("Idle", "");
+          return;
+        }
+        startPolling();
+      } catch (err) {
+        alert(err instanceof Error ? err.message : String(err));
+        $("btnStart").disabled = false;
+        setStatus("Idle", "");
+      }
+    });
+
+    $("btnStop").addEventListener("click", async () => {
+      await fetch("/api/add-order-apple-ac/stop", { method: "POST" });
+      refreshStatus();
+    });
+
+    $("btnClearLogs").addEventListener("click", () => {
+      logsEl.textContent = "";
+    });
+
+    refreshStatus();
+  </script>
+</body>
+</html>

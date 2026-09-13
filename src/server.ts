@@ -66,6 +66,24 @@ const monitorState: MonitorState = {
   child: null,
 };
 
+type AddOrderJobState = {
+  running: boolean;
+  pid: number | null;
+  startedAt: string | null;
+  lastExitCode: number | null;
+  logs: string[];
+  child: ChildProcess | null;
+};
+
+const addOrderJob: AddOrderJobState = {
+  running: false,
+  pid: null,
+  startedAt: null,
+  lastExitCode: null,
+  logs: [],
+  child: null,
+};
+
 function defaultConfig() {
   return {
     buyUrl:
@@ -1572,6 +1590,117 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
       );
     }
     return sendJson(res, 200, { ok: true });
+  }
+
+  if (pathname === "/api/add-order-apple-ac/status" && req.method === "GET") {
+    return sendJson(res, 200, {
+      ok: true,
+      running: addOrderJob.running,
+      pid: addOrderJob.pid,
+      startedAt: addOrderJob.startedAt,
+      lastExitCode: addOrderJob.lastExitCode,
+      logs: addOrderJob.logs.slice(-400),
+    });
+  }
+
+  if (pathname === "/api/add-order-apple-ac/stop" && req.method === "POST") {
+    const child = addOrderJob.child;
+    if (child && !child.killed) {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        /* ignore */
+      }
+      if (process.platform === "win32" && child.pid) {
+        try {
+          spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+            stdio: "ignore",
+            windowsHide: true,
+          });
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    addOrderJob.logs.push(`[dashboard] stop requested @ ${new Date().toISOString()}`);
+    return sendJson(res, 200, { ok: true });
+  }
+
+  if (pathname === "/api/add-order-apple-ac/start" && req.method === "POST") {
+    if (addOrderJob.running) {
+      return sendJson(res, 409, { ok: false, error: "add-order job 已喺度跑緊" });
+    }
+    let body: {
+      accounts?: Array<{ email?: string; password?: string }>;
+      appleEmail?: string;
+      applePassword?: string;
+    } = {};
+    try {
+      body = JSON.parse(await readBody(req)) as typeof body;
+    } catch {
+      return sendJson(res, 400, { ok: false, error: "invalid JSON" });
+    }
+    const accounts = (body.accounts || [])
+      .map((a) => ({
+        email: String(a?.email || "").trim(),
+        password: String(a?.password || ""),
+      }))
+      .filter((a) => a.email && a.password);
+    if (!accounts.length) {
+      return sendJson(res, 400, { ok: false, error: "需要至少一個 Gmail email + password" });
+    }
+    const appleEmail = String(body.appleEmail || "chifung2010@yahoo.com.hk").trim();
+    const applePassword = String(body.applePassword || "yY6594083");
+    if (!appleEmail || !applePassword) {
+      return sendJson(res, 400, { ok: false, error: "需要 Apple ID email + password" });
+    }
+
+    await ensureRuntimeDir();
+    const configPath = path.join(RUNTIME_DIR, "add-order-apple-ac.json");
+    await fs.writeFile(
+      configPath,
+      JSON.stringify({ accounts, appleEmail, applePassword }, null, 2),
+      "utf8"
+    );
+
+    const tsxCli = path.join(ROOT, "node_modules", "tsx", "dist", "cli.mjs");
+    const script = path.join(ROOT, "src", "add-order-to-apple-ac.ts");
+    addOrderJob.logs = [`[dashboard] start ${new Date().toISOString()} · ${accounts.length} Gmail`];
+    addOrderJob.lastExitCode = null;
+    addOrderJob.startedAt = new Date().toISOString();
+    addOrderJob.running = true;
+
+    const proc = spawn(process.execPath, [tsxCli, script], {
+      cwd: ROOT,
+      env: envForCheckoutChild({
+        ADD_ORDER_CONFIG_PATH: configPath,
+      }),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    addOrderJob.child = proc;
+    addOrderJob.pid = proc.pid ?? null;
+
+    const pushLog = (buf: Buffer) => {
+      const text = buf.toString("utf8");
+      for (const line of text.split(/\r?\n/)) {
+        if (!line.trim()) continue;
+        addOrderJob.logs.push(line);
+        if (addOrderJob.logs.length > 800) {
+          addOrderJob.logs.splice(0, addOrderJob.logs.length - 800);
+        }
+      }
+    };
+    proc.stdout?.on("data", pushLog);
+    proc.stderr?.on("data", pushLog);
+    proc.on("exit", (code) => {
+      addOrderJob.running = false;
+      addOrderJob.lastExitCode = code ?? 1;
+      addOrderJob.child = null;
+      addOrderJob.pid = null;
+      addOrderJob.logs.push(`[dashboard] exit=${code}`);
+    });
+
+    return sendJson(res, 200, { ok: true, pid: addOrderJob.pid });
   }
 
   sendJson(res, 404, { error: "not found" });
