@@ -138,19 +138,19 @@
   <div class="wrap">
     <header>
       <h1>add order to apple ac</h1>
-      <p class="sub"><a href="/">← Checkout Dashboard</a> · 用 Gmail 對齊 Order summary 訂單編號 → 搜郵件 → 訂單狀態 → 加入至 Apple ID</p>
+      <p class="sub"><a href="/">← Checkout Dashboard</a> · email:password:order number → Gmail 搜訂單編號 → 訂單狀態 → 加入至 Apple ID</p>
     </header>
 
     <section>
       <h2>Gmail accounts</h2>
       <div class="field">
-        <label for="accounts">每行一個：email password（空格或 : 或 , 分隔）</label>
-        <textarea id="accounts" autocomplete="off" spellcheck="false" placeholder="you@gmail.com yourPassword&#10;other@gmail.com otherPassword"></textarea>
+        <label for="accounts">每行一個：email:password:order number</label>
+        <textarea id="accounts" autocomplete="off" spellcheck="false" placeholder="you@gmail.com:yourPassword:W123456789&#10;other@gmail.com:otherPassword:W987654321"></textarea>
         <div class="actions" style="margin-top:10px">
           <button type="button" class="btn-primary" id="btnSaveAccounts">Save</button>
           <button type="button" class="btn-danger" id="btnClearAccounts">Clear all</button>
         </div>
-        <p class="hint">Save 會用 AES 加密存喺本機。每個 Gmail 會開成獨立 task（同 Dashboard 一樣有 Open／Hide／Stop／Close／Continue）。</p>
+        <p class="hint">用 <code>:</code> 分隔。第三段訂單編號會用作 Gmail inbox 搜尋關鍵字。Save 會 AES 加密存本機；每個帳號開獨立 task。</p>
       </div>
     </section>
 
@@ -197,22 +197,14 @@
       for (const raw of String(text || "").split(/\r?\n/)) {
         const line = raw.trim();
         if (!line || line.startsWith("#")) continue;
-        let email = "";
-        let password = "";
-        if (line.includes(":")) {
-          const i = line.indexOf(":");
-          email = line.slice(0, i).trim();
-          password = line.slice(i + 1).trim();
-        } else if (line.includes(",")) {
-          const i = line.indexOf(",");
-          email = line.slice(0, i).trim();
-          password = line.slice(i + 1).trim();
-        } else {
-          const parts = line.split(/\s+/);
-          email = parts[0] || "";
-          password = parts.slice(1).join(" ");
-        }
-        if (email && password) out.push({ email, password });
+        // email:password:order number（password 中間可含 :）
+        const first = line.indexOf(":");
+        const last = line.lastIndexOf(":");
+        if (first < 0 || last <= first) continue;
+        const email = line.slice(0, first).trim();
+        const password = line.slice(first + 1, last).trim();
+        const orderNumber = line.slice(last + 1).trim();
+        if (email && password && orderNumber) out.push({ email, password, orderNumber });
       }
       return out;
     }
@@ -295,6 +287,7 @@
             </div>
             <div class="task-meta">
               <div><b>Gmail</b> ${esc(t.emailMasked || "—")}</div>
+              <div><b>Order</b> ${esc(t.orderNumber || "—")}</div>
               <div><b>Status</b> ${esc(t.message || t.phase || "—")}</div>
             </div>
             <div class="task-actions">
@@ -318,7 +311,7 @@
     $("btnStart").addEventListener("click", async () => {
       const accounts = parseAccounts($("accounts").value);
       if (!accounts.length) {
-        alert("請至少輸入一個 Gmail：email password");
+        alert("請至少輸入一行：email:password:order number");
         return;
       }
       const appleEmail = $("appleEmail").value.trim();

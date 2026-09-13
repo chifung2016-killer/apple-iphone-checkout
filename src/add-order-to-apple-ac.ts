@@ -2,7 +2,7 @@
  * Gmail → Apple Store 訂單狀態 → 「加入至 Apple ID」自動化
  * Config via ADD_ORDER_CONFIG_PATH JSON:
  * {
- *   accounts: [{ email, password }, ...],
+ *   accounts: [{ email, password, orderNumber }, ...],
  *   appleEmail, applePassword
  * }
  */
@@ -13,7 +13,7 @@ import { spawn } from "node:child_process";
 import { chromium, type Browser, type BrowserContext, type Frame, type Page } from "playwright";
 import { decryptFromFile, maskEmail, redactSecrets } from "./add-order-secrets.js";
 
-type Account = { email: string; password: string };
+type Account = { email: string; password: string; orderNumber: string };
 
 type JobConfig = {
   accounts: Account[];
@@ -173,99 +173,17 @@ async function loadConfig(): Promise<JobConfig> {
         .map((a) => ({
           email: String(a?.email || "").trim(),
           password: String(a?.password || ""),
+          orderNumber: String((a as { orderNumber?: string })?.orderNumber || "").trim(),
         }))
-        .filter((a) => a.email && a.password)
+        .filter((a) => a.email && a.password && a.orderNumber)
     : [];
-  if (!accounts.length) throw new Error("未有有效嘅 Gmail 帳號（email + password）");
+  if (!accounts.length) {
+    throw new Error("未有有效帳號（格式：email:password:order number）");
+  }
   const appleEmail = String(raw.appleEmail || "chifung2010@yahoo.com.hk").trim();
   const applePassword = String(raw.applePassword || "yY6594083");
   if (!appleEmail || !applePassword) throw new Error("缺少 Apple ID 電郵／密碼");
   return { accounts, appleEmail, applePassword };
-}
-
-function normEmail(s: string): string {
-  return String(s || "").trim().toLowerCase();
-}
-
-/** 由 Order summary 記錄抽出聯絡電郵（同 Dashboard 顯示一致） */
-function orderContactEmail(o: Record<string, unknown>): string {
-  const contact = (o.checkoutContactUsed as Record<string, unknown> | undefined) || {};
-  const ship = (o.confirmationPageShipping as Record<string, unknown> | undefined) || {};
-  const sd = (o.shippingDetails as Record<string, unknown> | undefined) || {};
-  const identity = (o.identity as Record<string, unknown> | undefined) || {};
-  for (const v of [sd.email, contact.email, ship.email, identity.email, o.email]) {
-    const e = String(v || "").trim();
-    if (e && e !== "—") return e;
-  }
-  return "";
-}
-
-async function readJsonLoose(file: string): Promise<unknown> {
-  try {
-    return JSON.parse(await fs.readFile(file, "utf8")) as unknown;
-  } catch {
-    return null;
-  }
-}
-
-/** 讀 Order summary（ROOT + runtime/order-*.json），同 Dashboard 對齊 */
-async function loadOrderSummaryRecords(): Promise<Record<string, unknown>[]> {
-  const merged: Record<string, unknown>[] = [];
-  const push = (data: unknown) => {
-    if (Array.isArray(data)) {
-      for (const item of data) {
-        if (item && typeof item === "object") merged.push(item as Record<string, unknown>);
-      }
-    } else if (data && typeof data === "object") {
-      merged.push(data as Record<string, unknown>);
-    }
-  };
-  push(await readJsonLoose(path.join(ROOT, "order-summary.json")));
-  const runtimeDir = path.join(ROOT, "runtime");
-  try {
-    const files = await fs.readdir(runtimeDir);
-    for (const f of files) {
-      if (!/^order-.*\.json$/i.test(f)) continue;
-      push(await readJsonLoose(path.join(runtimeDir, f)));
-    }
-  } catch {
-    /* empty */
-  }
-  return merged;
-}
-
-/**
- * 用登入嘅 Gmail 對齊 Order summary 入面嘅電郵，攞最新一筆訂單編號。
- */
-async function resolveOrderNumberForGmail(gmail: string): Promise<string> {
-  const want = normEmail(gmail);
-  if (!want) throw new Error("Gmail 電郵係空");
-  const orders = await loadOrderSummaryRecords();
-  const hits: { orderNumber: string; placedAt: string }[] = [];
-  for (const o of orders) {
-    const orderNumber = String(o.orderNumber || "").trim();
-    if (!orderNumber || /^W9876543210$/i.test(orderNumber)) continue;
-    if (normEmail(orderContactEmail(o)) !== want) continue;
-    hits.push({
-      orderNumber,
-      placedAt: String(o.orderPlacedAt || o.scrapedAt || ""),
-    });
-  }
-  if (!hits.length) {
-    throw new Error(
-      `Order summary 揾唔到電郵 ${maskEmail(gmail)} 對應嘅訂單編號（請確認落單時用咗呢個 Gmail）`
-    );
-  }
-  hits.sort((a, b) => b.placedAt.localeCompare(a.placedAt));
-  const pick = hits[0]!;
-  if (hits.length > 1) {
-    log(
-      `Gmail ${maskEmail(gmail)} 對應 ${hits.length} 筆訂單，用最新：${pick.orderNumber}`
-    );
-  } else {
-    log(`Gmail ${maskEmail(gmail)} → 訂單編號 ${pick.orderNumber}`);
-  }
-  return pick.orderNumber;
 }
 
 async function sleep(ms: number) {
@@ -2193,10 +2111,11 @@ async function processOneAccount(
 
   const runSteps = async () => {
     // —— Gmail 之後步驟盡量短、可 resume ——
-    await writeStatus({ phase: "match_order", message: "對齊 Order summary 訂單編號…" });
-    const orderNumber = await resolveOrderNumberForGmail(account.email);
+    const orderNumber = String(account.orderNumber || "").trim();
+    if (!orderNumber) throw new Error("缺少訂單編號（格式：email:password:order number）");
+    log(`用帳號提供嘅訂單編號搜尋：${orderNumber}`);
     await writeStatus({
-      phase: "match_order",
+      phase: "search_email",
       message: `訂單編號 ${orderNumber}`,
       orderNumber,
       email: account.email,
@@ -2219,14 +2138,14 @@ async function processOneAccount(
       .catch(() => false);
 
     if (!onGmail) {
-      await writeStatus({ phase: "gmail_login", message: "Gmail 登入中…" });
+      await writeStatus({ phase: "gmail_login", message: "Gmail 登入中…", orderNumber });
       await gmailLogin(page, account.email, account.password);
     } else {
       log(`已在 Gmail（${page.url()}），跳過登入`);
     }
 
     if (!mailOpen || /#search\//i.test(page.url()) || /#inbox/i.test(page.url())) {
-      // 已在正確訂單搜尋結果：直接開郵件；否則用訂單編號搜尋
+      // 已在正確訂單搜尋結果：直接開郵件；否則用訂單編號搜尋 inbox
       await writeStatus({
         phase: "search_email",
         message: `搜尋／開啟訂單「${orderNumber}」…`,
@@ -2323,11 +2242,12 @@ async function main() {
   const cfg = await loadConfig();
   const account = cfg.accounts[ACCOUNT_INDEX];
   if (!account) throw new Error(`冇 account index=${ACCOUNT_INDEX}`);
-  log(`task ${SESSION_ID} · ${maskEmail(account.email)} · Apple ID=${maskEmail(cfg.appleEmail)}`);
+  log(`task ${SESSION_ID} · ${maskEmail(account.email)} · order=${account.orderNumber} · Apple ID=${maskEmail(cfg.appleEmail)}`);
   await writeStatus({
     phase: "starting",
     emailMasked: maskEmail(account.email),
-    message: "starting",
+    orderNumber: account.orderNumber,
+    message: `starting · ${account.orderNumber}`,
     windowHidden: true,
     keepOpen: false,
     pid: process.pid,

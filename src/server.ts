@@ -83,6 +83,7 @@ const monitorState: MonitorState = {
 type AddOrderTask = {
   id: string;
   emailMasked: string;
+  orderNumber: string;
   index: number;
   pid: number | null;
   running: boolean;
@@ -114,6 +115,7 @@ async function snapshotAddOrderTasks() {
     tasks.push({
       id: t.id,
       emailMasked: t.emailMasked || st?.emailMasked || "—",
+      orderNumber: t.orderNumber || st?.orderNumber || "",
       running: t.running,
       pid: t.pid,
       startedAt: t.startedAt,
@@ -1920,7 +1922,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
 
   if (pathname === "/api/add-order-apple-ac/start" && req.method === "POST") {
     let body: {
-      accounts?: Array<{ email?: string; password?: string }>;
+      accounts?: Array<{ email?: string; password?: string; orderNumber?: string }>;
       appleEmail?: string;
       applePassword?: string;
     } = {};
@@ -1933,10 +1935,14 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
       .map((a) => ({
         email: String(a?.email || "").trim(),
         password: String(a?.password || ""),
+        orderNumber: String(a?.orderNumber || "").trim(),
       }))
-      .filter((a) => a.email && a.password);
+      .filter((a) => a.email && a.password && a.orderNumber);
     if (!accounts.length) {
-      return sendJson(res, 400, { ok: false, error: "需要至少一個 Gmail email + password" });
+      return sendJson(res, 400, {
+        ok: false,
+        error: "需要至少一個帳號：email:password:order number",
+      });
     }
     const appleEmail = String(body.appleEmail || "chifung2010@yahoo.com.hk").trim();
     const applePassword = String(body.applePassword || "yY6594083");
@@ -1959,14 +1965,16 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     for (let i = 0; i < accounts.length; i++) {
       const id = `ao${addOrderNextIndex++}`;
       const emailMasked = maskEmail(accounts[i]!.email);
+      const orderNumber = accounts[i]!.orderNumber;
       const task: AddOrderTask = {
         id,
         emailMasked,
+        orderNumber,
         index: i,
         pid: null,
         running: true,
         startedAt: new Date().toISOString(),
-        logs: [`[dashboard] start ${id} · ${emailMasked}`],
+        logs: [`[dashboard] start ${id} · ${emailMasked} · ${orderNumber}`],
         child: null,
         exitCode: null,
       };
