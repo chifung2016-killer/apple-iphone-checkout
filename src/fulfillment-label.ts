@@ -13,10 +13,14 @@ export function fulfillmentLabelFromPreference(pref: unknown): string {
       return "pickup apple pay";
     case "delivery_apple_pay":
       return "delivery apple pay";
+    case "pickup_applepay_guest":
+      return "pickup applepay訪客模式";
+    case "delivery_applepay_guest":
+      return "delivery applepay訪客模式";
     case "pickup_apple_ac_apple_pay":
-      return "pickup apple ac apple pay";
+      return "pickup apple ac apple pay訪客模式";
     case "delivery_apple_ac_apple_pay":
-      return "delivery apple ac apple pay";
+      return "delivery apple ac apple pay訪客模式";
     case "auto":
       return "Auto（先取貨，失敗改送貨）";
     default:

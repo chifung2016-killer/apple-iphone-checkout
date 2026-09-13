@@ -468,10 +468,12 @@
                 <option value="auto">Auto（先取貨，失敗改送貨）</option>
                 <option value="pickup">pickup credit card訪客模式</option>
                 <option value="delivery">delivery credit card訪客模式</option>
+                <option value="pickup_applepay_guest">pickup applepay訪客模式</option>
+                <option value="delivery_applepay_guest">delivery applepay訪客模式</option>
                 <option value="pickup_apple_pay">pickup apple pay</option>
                 <option value="delivery_apple_pay">delivery apple pay</option>
-                <option value="pickup_apple_ac_apple_pay">pickup apple ac apple pay</option>
-                <option value="delivery_apple_ac_apple_pay">delivery apple ac apple pay</option>
+                <option value="pickup_apple_ac_apple_pay">pickup apple ac apple pay訪客模式</option>
+                <option value="delivery_apple_ac_apple_pay">delivery apple ac apple pay訪客模式</option>
               </select>
             </div>
           </div>
@@ -1033,10 +1035,14 @@
           return "pickup apple pay";
         case "delivery_apple_pay":
           return "delivery apple pay";
+        case "pickup_applepay_guest":
+          return "pickup applepay訪客模式";
+        case "delivery_applepay_guest":
+          return "delivery applepay訪客模式";
         case "pickup_apple_ac_apple_pay":
-          return "pickup apple ac apple pay";
+          return "pickup apple ac apple pay訪客模式";
         case "delivery_apple_ac_apple_pay":
-          return "delivery apple ac apple pay";
+          return "delivery apple ac apple pay訪客模式";
         case "auto":
           return "Auto（先取貨，失敗改送貨）";
         default:

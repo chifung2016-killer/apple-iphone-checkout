@@ -104,7 +104,7 @@ export const MONITOR_CONFIG = {
     /** 優先經 Dashboard /api/browsers/add 開，瀏覽器會顯示喺 dashboard */
     preferDashboard: true,
     dashboardPort: Number(process.env.DASHBOARD_PORT || 8787),
-    /** pickup | delivery | auto | *_apple_pay | *_apple_ac_apple_pay */
+    /** pickup | delivery | auto | *_apple_pay | *_applepay_guest | *_apple_ac_apple_pay */
     fulfillmentPreference: (process.env.MONITOR_FULFILLMENT ||
       "pickup") as
       | "pickup"
@@ -112,6 +112,8 @@ export const MONITOR_CONFIG = {
       | "auto"
       | "pickup_apple_pay"
       | "delivery_apple_pay"
+      | "pickup_applepay_guest"
+      | "delivery_applepay_guest"
       | "pickup_apple_ac_apple_pay"
       | "delivery_apple_ac_apple_pay",
     pickupSearch: process.env.MONITOR_PICKUP_SEARCH || "中環",

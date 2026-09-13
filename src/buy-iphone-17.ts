@@ -41,8 +41,10 @@ let CONFIG = {
   /**
    * pickup = 取貨 + 信用卡（訪客）
    * delivery = 送貨 + 信用卡（訪客）
-   * pickup_apple_pay = 取貨 + Apple Pay（訪客 bag）
-   * delivery_apple_pay = 送貨 + Apple Pay（訪客）
+   * pickup_apple_pay = 取貨 + Apple Pay（購物袋「使用Apple Pay結帳」）
+   * delivery_apple_pay = 送貨 + Apple Pay（訪客 bag 舊路徑）
+   * pickup_applepay_guest = 取貨訪客（同信用卡）→ Billing 揀 Apple Pay → Review
+   * delivery_applepay_guest = 送貨訪客（同信用卡）→ Billing 揀 Apple Pay → Review
    * pickup_apple_ac_apple_pay = 取貨 + Apple 帳戶 + Apple Pay
    * delivery_apple_ac_apple_pay = 送貨 + Apple 帳戶 + Apple Pay
    * auto = 先取貨失敗再送貨（信用卡訪客）
@@ -53,6 +55,8 @@ let CONFIG = {
     | "auto"
     | "pickup_apple_pay"
     | "delivery_apple_pay"
+    | "pickup_applepay_guest"
+    | "delivery_applepay_guest"
     | "pickup_apple_ac_apple_pay"
     | "delivery_apple_ac_apple_pay",
   /** 開賣時間（香港）：「繼續」預計呢個時間先會可用 */
@@ -104,6 +108,7 @@ function prefersDeliveryOnly(): boolean {
   return (
     p === "delivery" ||
     p === "delivery_apple_pay" ||
+    p === "delivery_applepay_guest" ||
     p === "delivery_apple_ac_apple_pay"
   );
 }
@@ -113,6 +118,7 @@ function prefersPickupOnly(): boolean {
   return (
     p === "pickup" ||
     p === "pickup_apple_pay" ||
+    p === "pickup_applepay_guest" ||
     p === "pickup_apple_ac_apple_pay"
   );
 }
@@ -122,6 +128,8 @@ function usesApplePay(): boolean {
   return (
     p === "pickup_apple_pay" ||
     p === "delivery_apple_pay" ||
+    p === "pickup_applepay_guest" ||
+    p === "delivery_applepay_guest" ||
     p === "pickup_apple_ac_apple_pay" ||
     p === "delivery_apple_ac_apple_pay"
   );
@@ -138,6 +146,14 @@ function isPickupApplePay(): boolean {
 
 function isDeliveryApplePay(): boolean {
   return CONFIG.fulfillmentPreference === "delivery_apple_pay";
+}
+
+function isPickupApplepayGuest(): boolean {
+  return CONFIG.fulfillmentPreference === "pickup_applepay_guest";
+}
+
+function isDeliveryApplepayGuest(): boolean {
+  return CONFIG.fulfillmentPreference === "delivery_applepay_guest";
 }
 
 function isDeliveryAppleAcApplePay(): boolean {
@@ -166,10 +182,15 @@ function usesPickupGuestStoreContinueRules(): boolean {
   return prefersPickupOnly();
 }
 
-/** Billing 頁揀 Apple Pay（訪客 delivery apple pay 或 Apple 帳戶模式） */
+/**
+ * Billing 頁揀 Apple Pay →「檢查你的訂單」→ Review「使用Apple Pay繼續」
+ * （訪客 applepay／delivery apple pay／Apple 帳戶模式）
+ */
 function selectsApplePayAtBilling(): boolean {
   return (
     isDeliveryApplePay() ||
+    isPickupApplepayGuest() ||
+    isDeliveryApplepayGuest() ||
     isDeliveryAppleAcApplePay() ||
     isPickupAppleAcApplePay()
   );
@@ -7944,7 +7965,7 @@ async function fillBillingAddressFields(
     return;
   }
 
-  // delivery apple pay／Apple 帳戶 apple pay：Apple Pay → 檢查訂單 → Review 繼續
+  // delivery／pickup applepay訪客／Apple 帳戶 apple pay：Apple Pay → 檢查訂單 → Review 繼續
   if (selectsApplePayAtBilling()) {
     let selected = false;
     for (let round = 1; round <= 3; round++) {
