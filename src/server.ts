@@ -169,7 +169,7 @@ function broadcast(payload: unknown) {
   for (const res of sseClients) res.write(data);
 }
 
-/** 改 dashboard 靜態檔即推 reload；tsx watch 重啟 server 則靠 buildId */
+/** 改 dashboard 靜態檔／add-order worker 即推 reload；tsx watch 重啟 server 則靠 buildId */
 function startLiveReloadWatcher() {
   let timer: ReturnType<typeof setTimeout> | null = null;
   const fire = (reason: string) => {
@@ -198,6 +198,49 @@ function startLiveReloadWatcher() {
       `[live-reload] watch failed：${err instanceof Error ? err.message : String(err)}`
     );
   }
+  // add-order worker／server 改動：推 reload，頁面即時更新
+  const srcDir = path.join(ROOT, "src");
+  try {
+    fsWatch(srcDir, { recursive: false }, (_event, filename) => {
+      const name = String(filename || "").replace(/\\/g, "/");
+      if (!name) return;
+      if (
+        /^(add-order-to-apple-ac|add-order-secrets|server)\.ts$/i.test(name) ||
+        name.endsWith("/add-order-to-apple-ac.ts")
+      ) {
+        fire(`src/${name}`);
+      }
+    });
+    console.log(`[live-reload] watching ${srcDir} (add-order + server)`);
+  } catch (err) {
+    console.warn(
+      `[live-reload] src watch failed：${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+}
+
+let addOrderBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
+async function broadcastAddOrderStatus(): Promise<void> {
+  if (addOrderBroadcastTimer) clearTimeout(addOrderBroadcastTimer);
+  addOrderBroadcastTimer = setTimeout(async () => {
+    try {
+      const tasks = await snapshotAddOrderTasks();
+      const anyRunning = tasks.some((t) => t.running);
+      const allLogs = [...addOrderTasks.values()].flatMap((t) =>
+        t.logs.slice(-40).map((line) => redactSecrets(line))
+      );
+      broadcast({
+        type: "add_order_status",
+        buildId: DASHBOARD_BUILD_ID,
+        running: anyRunning,
+        tasks,
+        logs: allLogs.slice(-400),
+        at: new Date().toISOString(),
+      });
+    } catch {
+      /* ignore */
+    }
+  }, 250);
 }
 
 async function readJson(file: string): Promise<unknown> {
@@ -1733,6 +1776,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     for (const t of addOrderTasks.values()) {
       t.logs = [];
     }
+    void broadcastAddOrderStatus();
     return sendJson(res, 200, { ok: true, logs: [] });
   }
 
@@ -1853,6 +1897,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     if (act === "close") {
       await forceCloseAddOrderTask(id);
     }
+    void broadcastAddOrderStatus();
     return sendJson(res, 200, {
       ok: true,
       tasks: await snapshotAddOrderTasks(),
@@ -1944,6 +1989,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
           task.logs.push(redactSecrets(line));
           if (task.logs.length > 300) task.logs.splice(0, task.logs.length - 300);
         }
+        void broadcastAddOrderStatus();
       };
       proc.stdout?.on("data", pushLog);
       proc.stderr?.on("data", pushLog);
@@ -1953,11 +1999,13 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
         task.child = null;
         task.pid = null;
         task.logs.push(`[dashboard] ${id} exit=${code}`);
+        void broadcastAddOrderStatus();
       });
       created.push(id);
       await new Promise((r) => setTimeout(r, 200));
     }
 
+    void broadcastAddOrderStatus();
     return sendJson(res, 200, {
       ok: true,
       created,

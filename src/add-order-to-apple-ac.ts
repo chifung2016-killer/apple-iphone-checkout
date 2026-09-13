@@ -1474,13 +1474,20 @@ async function gmailSearchAndOpenOrderEmail(page: Page): Promise<void> {
     const row = rows.nth(i);
     const text = ((await row.innerText().catch(() => "")) || "").replace(/\s+/g, " ");
     if (!text.includes(keyword)) continue;
-    await row.click({ timeout: 5000 });
+    // Gmail：單擊有時只係選取，雙擊／Enter 先打開
+    await row.click({ timeout: 5000 }).catch(() => {});
+    await sleep(400);
+    await row.dblclick({ timeout: 5000 }).catch(() => {});
+    await page.keyboard.press("Enter").catch(() => {});
     log(`已開啟含「${keyword}」嘅郵件：${text.slice(0, 80)}`);
     clicked = true;
     break;
   }
   if (!clicked) {
-    await rows.first().click({ timeout: 5000 });
+    await rows.first().click({ timeout: 5000 }).catch(() => {});
+    await sleep(300);
+    await rows.first().dblclick({ timeout: 5000 }).catch(() => {});
+    await page.keyboard.press("Enter").catch(() => {});
     log(`搜尋結果未見「${keyword}」字樣，改開第一封`);
   }
   await writeStatus({
@@ -1488,47 +1495,147 @@ async function gmailSearchAndOpenOrderEmail(page: Page): Promise<void> {
     message: `已開啟「${keyword}」相關郵件`,
     url: page.url(),
   });
-  await sleep(1500);
+  await waitForGmailMessageOpen(page);
+  await sleep(800);
+}
+
+/** 等 Gmail 郵件正文真正打開（唔係淨係 highlight 列表） */
+async function waitForGmailMessageOpen(page: Page): Promise<void> {
+  const deadline = Date.now() + 35_000;
+  while (Date.now() < deadline) {
+    await throwIfStopped();
+    await syncWindowFlags().catch(() => {});
+    // 展開被截斷郵件
+    await page
+      .getByText(/顯示完整郵件|顯示整個郵件|View entire message|View full message|全文を表示/i)
+      .first()
+      .click({ timeout: 600 })
+      .catch(() => {});
+    const body = page
+      .locator(
+        'div.a3s, div.adn div.a3s, div[data-message-id], h2.hP, div[role="listitem"] div.ii'
+      )
+      .first();
+    if ((await body.count().catch(() => 0)) > 0 && (await body.isVisible().catch(() => false))) {
+      const t = ((await body.innerText().catch(() => "")) || "").trim();
+      if (t.length > 20) {
+        log("郵件正文已打開");
+        return;
+      }
+    }
+    await sleep(500);
+  }
+  log("警告：未確認郵件正文，仍繼續試撳訂單狀態");
 }
 
 async function clickOrderStatusInEmail(page: Page, context: BrowserContext): Promise<Page> {
   log("撳「訂單狀態」一次…");
-  const before = new Set(context.pages().map((p) => p));
+  await waitForGmailMessageOpen(page);
+  await dismissGmailOverlays(page);
 
-  const clicked = await page
-    .evaluate(() => {
-      const norm = (s: string) => (s || "").replace(/[\s\u00a0\u200b]+/g, "");
-      const nodes = Array.from(
-        document.querySelectorAll("a, button, span, td, div")
-      ) as HTMLElement[];
-      for (const el of nodes) {
-        const t = norm(el.innerText || el.textContent || "");
-        if (!t.includes("訂單狀態") && !/order\s*status/i.test(el.innerText || "")) continue;
-        // 優先 <a>
-        const a =
-          el.closest("a") ||
-          (el.tagName === "A" ? el : el.querySelector("a")) ||
-          el;
-        (a as HTMLElement).click();
-        return true;
-      }
-      // fallback：href 含 vieworder / store.apple
-      for (const a of Array.from(document.querySelectorAll("a[href]")) as HTMLAnchorElement[]) {
-        const href = a.href || "";
-        if (/vieworder|store\.apple\.com|secure\d*\.store\.apple/i.test(href)) {
-          a.click();
-          return true;
+  const before = new Set(context.pages().map((p) => p));
+  const nameRes = [
+    /訂單狀態/,
+    /查看訂單狀態/,
+    /檢視訂單狀態/,
+    /查看你的訂單/,
+    /查看訂單/,
+    /檢視訂單/,
+    /訂單詳情/,
+    /Order Status/i,
+    /View Order Status/i,
+    /View [Yy]our [Oo]rder/,
+    /Check [Oo]rder/,
+    /Track [Oo]rder/,
+  ];
+
+  // 1) Playwright role=link／button（含各 frame）
+  const scopes: Array<Page | Frame> = [page, ...page.frames()];
+  for (const scope of scopes) {
+    for (const re of nameRes) {
+      const candidates = [
+        scope.getByRole("link", { name: re }),
+        scope.getByRole("button", { name: re }),
+        scope.locator("a, button, span, td").filter({ hasText: re }),
+      ];
+      for (const loc of candidates) {
+        const el = loc.first();
+        if ((await el.count().catch(() => 0)) === 0) continue;
+        if (!(await el.isVisible().catch(() => false))) continue;
+        const popupPromise = context.waitForEvent("page", { timeout: 8000 }).catch(() => null);
+        await el.click({ timeout: 4000 }).catch(async () => {
+          await el.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
+        });
+        log(`已撳訂單狀態相關掣：${re}`);
+        const popup = await popupPromise;
+        if (popup && !popup.isClosed()) {
+          await popup.waitForLoadState("domcontentloaded").catch(() => {});
+          log(`已開新分頁：${popup.url()}`);
+          return popup;
+        }
+        await sleep(1500);
+        for (const p of context.pages()) {
+          if (!before.has(p) && !p.isClosed()) {
+            await p.waitForLoadState("domcontentloaded").catch(() => {});
+            log(`已開新分頁：${p.url()}`);
+            return p;
+          }
+        }
+        if (/store\.apple\.com|secure\d*\.store\.apple|google\.com\/url/i.test(page.url())) {
+          log(`訂單頁：${page.url()}`);
+          return page;
         }
       }
-      return false;
+    }
+  }
+
+  // 2) DOM 掃描（處理 span 包住文字／空字 image CTA）
+  const clicked = await page
+    .evaluate(() => {
+      const norm = (s: string) => (s || "").replace(/[\s\u00a0\u200b\u200c\u200d\ufeff]+/g, "");
+      const hitText = (raw: string) => {
+        const t = norm(raw);
+        return (
+          t.includes("訂單狀態") ||
+          t.includes("查看訂單") ||
+          t.includes("檢視訂單") ||
+          t.includes("訂單詳情") ||
+          /orderstatus|vieworder|viewyourorder|checkorder|trackorder/i.test(t)
+        );
+      };
+      const nodes = Array.from(
+        document.querySelectorAll("a, button, span, td, div, font")
+      ) as HTMLElement[];
+      for (const el of nodes) {
+        const label = `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""}`;
+        if (!hitText(label)) continue;
+        const a =
+          (el.closest("a") as HTMLElement | null) ||
+          (el.tagName === "A" ? el : null) ||
+          (el.querySelector("a") as HTMLElement | null) ||
+          el;
+        a.click();
+        return "text";
+      }
+      for (const a of Array.from(document.querySelectorAll("a[href]")) as HTMLAnchorElement[]) {
+        const href = a.href || "";
+        if (
+          /vieworder|order\/guest|store\.apple\.com|secure\d*\.store\.apple|apple\.com\/.*order/i.test(
+            href
+          )
+        ) {
+          a.click();
+          return "href";
+        }
+      }
+      return "";
     })
-    .catch(() => false);
+    .catch(() => "");
 
   if (!clicked) throw new Error("郵件入面揾唔到「訂單狀態」掣／連結");
-
+  log(`已用 DOM 掃描撳到訂單連結（${clicked}）`);
   await sleep(2000);
 
-  // 新分頁？
   for (const p of context.pages()) {
     if (!before.has(p) && !p.isClosed()) {
       await p.waitForLoadState("domcontentloaded").catch(() => {});
@@ -1537,17 +1644,28 @@ async function clickOrderStatusInEmail(page: Page, context: BrowserContext): Pro
     }
   }
 
-  // 同頁導航（可能經 google redirect）
-  await page.waitForURL(
-    (u) => /store\.apple\.com|secure\d*\.store\.apple|google\.com\/url/i.test(u.toString()),
-    { timeout: 20_000 }
-  ).catch(() => {});
+  await page
+    .waitForURL(
+      (u) => /store\.apple\.com|secure\d*\.store\.apple|google\.com\/url/i.test(u.toString()),
+      { timeout: 25_000 }
+    )
+    .catch(() => {});
 
   if (/google\.com\/url/i.test(page.url())) {
-    // 跟住 redirect
-    await page.waitForURL((u) => /store\.apple\.com|secure\d*\.store\.apple/i.test(u.toString()), {
-      timeout: 30_000,
-    }).catch(() => {});
+    await page
+      .waitForURL((u) => /store\.apple\.com|secure\d*\.store\.apple/i.test(u.toString()), {
+        timeout: 30_000,
+      })
+      .catch(() => {});
+    // 有時停喺 google redirect：直接跟 q=
+    if (/google\.com\/url/i.test(page.url())) {
+      try {
+        const q = new URL(page.url()).searchParams.get("q");
+        if (q) await page.goto(q, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      } catch {
+        /* ignore */
+      }
+    }
   }
 
   log(`訂單頁：${page.url()}`);

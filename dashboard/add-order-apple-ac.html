@@ -455,6 +455,64 @@
 
     loadSavedAccounts();
     refreshStatus();
+    startPolling();
+
+    // 同 Checkout Dashboard：改 HTML／server／worker 即時 reload；task 狀態 SSE 即時更新
+    let addOrderBuildId = null;
+    const es = new EventSource("/api/events");
+    es.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === "reload") {
+          console.log("[live-reload]", msg.reason || "reload");
+          location.reload();
+          return;
+        }
+        if (msg.type === "hello") {
+          if (addOrderBuildId && msg.buildId && addOrderBuildId !== msg.buildId) {
+            location.reload();
+            return;
+          }
+          if (msg.buildId) addOrderBuildId = msg.buildId;
+          return;
+        }
+        if (msg.type === "add_order_status") {
+          if (Array.isArray(msg.logs)) renderLogs(msg.logs);
+          if (Array.isArray(msg.tasks)) renderTasks(msg.tasks);
+          const running = !!msg.running;
+          if (running) {
+            setStatus("Running…", "run");
+            $("btnStart").disabled = true;
+            $("btnStop").disabled = false;
+            if (!pollTimer) startPolling();
+          } else if ((msg.tasks || []).length) {
+            setStatus("Idle / waiting", "");
+            $("btnStart").disabled = false;
+            $("btnStop").disabled = true;
+          } else {
+            setStatus("Idle", "");
+            $("btnStart").disabled = false;
+            $("btnStop").disabled = true;
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+    };
+    setInterval(async () => {
+      try {
+        const res = await fetch("/api/build-id", { cache: "no-store" });
+        const data = await res.json();
+        if (!data?.buildId) return;
+        if (addOrderBuildId && data.buildId !== addOrderBuildId) {
+          location.reload();
+          return;
+        }
+        if (!addOrderBuildId) addOrderBuildId = data.buildId;
+      } catch {
+        /* ignore */
+      }
+    }, 4000);
   </script>
 </body>
 </html>
