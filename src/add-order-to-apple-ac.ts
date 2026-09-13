@@ -186,6 +186,92 @@ async function loadConfig(): Promise<JobConfig> {
   return { accounts, appleEmail, applePassword };
 }
 
+async function readJsonLoose(file: string): Promise<unknown> {
+  try {
+    return JSON.parse(await fs.readFile(file, "utf8")) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+/** 讀 Order summary（ROOT + runtime/order-*.json） */
+async function loadOrderSummaryRecords(): Promise<Record<string, unknown>[]> {
+  const merged: Record<string, unknown>[] = [];
+  const push = (data: unknown) => {
+    if (Array.isArray(data)) {
+      for (const item of data) {
+        if (item && typeof item === "object") merged.push(item as Record<string, unknown>);
+      }
+    } else if (data && typeof data === "object") {
+      merged.push(data as Record<string, unknown>);
+    }
+  };
+  push(await readJsonLoose(path.join(ROOT, "order-summary.json")));
+  const runtimeDir = path.join(ROOT, "runtime");
+  try {
+    const files = await fs.readdir(runtimeDir);
+    for (const f of files) {
+      if (!/^order-.*\.json$/i.test(f)) continue;
+      push(await readJsonLoose(path.join(runtimeDir, f)));
+    }
+  } catch {
+    /* empty */
+  }
+  return merged;
+}
+
+/** 由 Order summary 抽電話（同 Dashboard 顯示一致） */
+function orderContactPhone(o: Record<string, unknown>): string {
+  const contact = (o.checkoutContactUsed as Record<string, unknown> | undefined) || {};
+  const ship = (o.confirmationPageShipping as Record<string, unknown> | undefined) || {};
+  const sd = (o.shippingDetails as Record<string, unknown> | undefined) || {};
+  const identity = (o.identity as Record<string, unknown> | undefined) || {};
+  for (const v of [sd.phone, contact.phone, ship.phone, identity.phone, o.phone]) {
+    const p = String(v || "").trim();
+    if (p && p !== "—") return p;
+  }
+  return "";
+}
+
+/** Apple HK verify 頁通常要 8 位本地號碼 */
+function normalizeHkMobileForApple(raw: string): string {
+  let digits = String(raw || "").replace(/\D/g, "");
+  if (digits.startsWith("852") && digits.length >= 11) digits = digits.slice(-8);
+  if (digits.length > 8) digits = digits.slice(-8);
+  return digits;
+}
+
+async function resolvePhoneForOrderNumber(orderNumber: string): Promise<string> {
+  const want = String(orderNumber || "").trim();
+  if (!want) throw new Error("缺少訂單編號，無法對齊電話");
+  const orders = await loadOrderSummaryRecords();
+  for (const o of orders) {
+    const n = String(o.orderNumber || "").trim();
+    if (n !== want) continue;
+    const phone = normalizeHkMobileForApple(orderContactPhone(o));
+    if (phone) {
+      log(`Order summary：${want} → 電話 ${phone}`);
+      return phone;
+    }
+  }
+  throw new Error(
+    `Order summary 揾唔到訂單「${want}」嘅電話（請確認 Order summary 有該單同 Phone）`
+  );
+}
+
+function isOrderLinkVerifyUrl(url: string): boolean {
+  return /\/shop\/order\/link\/verify/i.test(url);
+}
+
+function isAppleGuestOrderUrl(url: string): boolean {
+  return (
+    /\/shop\/order\/guest\//i.test(url) ||
+    /vieworderstatus/i.test(url) ||
+    /\/vieworder/i.test(url) ||
+    /\/shop\/order\/detail/i.test(url)
+  );
+}
+
 async function sleep(ms: number) {
   const end = Date.now() + ms;
   while (Date.now() < end) {
@@ -2168,13 +2254,13 @@ async function clickOrderStatusInEmail(page: Page, context: BrowserContext): Pro
   return page;
 }
 
-async function waitForAppleOrderGuestPage(page: Page): Promise<void> {
+async function waitForAppleOrderFlowPage(page: Page): Promise<void> {
   const deadline = Date.now() + 45_000;
   while (Date.now() < deadline) {
     await throwIfStopped();
     await syncWindowFlags().catch(() => {});
     const url = page.url();
-    if (/\/shop\/order\/guest\//i.test(url) || /vieworder/i.test(url) || /secure\d*\.store\.apple\.com/i.test(url)) {
+    if (isOrderLinkVerifyUrl(url) || isAppleGuestOrderUrl(url) || /secure\d*\.store\.apple\.com/i.test(url)) {
       await sleep(400);
       return;
     }
@@ -2193,6 +2279,214 @@ async function waitForAppleOrderGuestPage(page: Page): Promise<void> {
     await sleep(300);
   }
   throw new Error(`未到達 Apple 訂單頁：${page.url()}`);
+}
+
+/**
+ * order/link/verify：用 Order summary 該單嘅電話填入，再撳「繼續」
+ */
+async function fillOrderVerifyPhoneAndContinue(page: Page, orderNumber: string): Promise<void> {
+  // 等一下 verify／guest
+  const appearDeadline = Date.now() + 20_000;
+  while (Date.now() < appearDeadline) {
+    await throwIfStopped();
+    const url = page.url();
+    if (isOrderLinkVerifyUrl(url)) break;
+    if (isAppleGuestOrderUrl(url)) {
+      log("已過 verify 頁，唔使填電話");
+      return;
+    }
+    // 已見到「加入至 Apple ID」都當過咗
+    const addVisible = await page
+      .getByRole("button", { name: /加入至\s*Apple\s*ID|Add to Apple ID/i })
+      .or(page.getByText(/加入至\s*Apple\s*ID|Add to Apple ID/i))
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (addVisible) {
+      log("已喺訂單頁（有加入至 Apple ID），跳過 verify");
+      return;
+    }
+    await sleep(300);
+  }
+
+  if (!isOrderLinkVerifyUrl(page.url())) {
+    log(`而家唔係 verify 頁（${page.url()}），跳過填電話`);
+    return;
+  }
+
+  const phone = await resolvePhoneForOrderNumber(orderNumber);
+  log(`verify 頁填寫電話：${phone}`);
+  await writeStatus({
+    phase: "order_verify",
+    message: `填寫訂單電話 ${phone}…`,
+    orderNumber,
+    url: page.url(),
+  });
+
+  const phoneField = page
+    .locator(
+      [
+        'input[type="tel"]',
+        'input[name*="phone" i]',
+        'input[id*="phone" i]',
+        'input[autocomplete="tel"]',
+        'input[data-autom*="phone" i]',
+        'input[aria-label*="電話" i]',
+        'input[aria-label*="Phone" i]',
+        'input[placeholder*="電話" i]',
+        'input[placeholder*="Phone" i]',
+      ].join(", ")
+    )
+    .first();
+
+  const fieldDeadline = Date.now() + 15_000;
+  let filled = false;
+  while (Date.now() < fieldDeadline) {
+    await throwIfStopped();
+    if (await phoneField.isVisible().catch(() => false)) {
+      await phoneField.click({ timeout: 3000 }).catch(() => {});
+      await phoneField.fill("").catch(() => {});
+      await phoneField.fill(phone).catch(async () => {
+        await phoneField.evaluate((el, v) => {
+          const input = el as HTMLInputElement;
+          input.focus();
+          input.value = v;
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          input.dispatchEvent(new Event("change", { bubbles: true }));
+        }, phone);
+      });
+      const val = ((await phoneField.inputValue().catch(() => "")) || "").replace(/\D/g, "");
+      if (val.includes(phone) || phone.includes(val)) {
+        filled = true;
+        break;
+      }
+    }
+    // DOM fallback
+    filled = await page
+      .evaluate((v) => {
+        const inputs = Array.from(
+          document.querySelectorAll("input[type='tel'], input[type='text'], input:not([type])")
+        ) as HTMLInputElement[];
+        for (const input of inputs) {
+          const meta = `${input.name} ${input.id} ${input.placeholder} ${input.getAttribute("aria-label") || ""} ${input.getAttribute("data-autom") || ""}`.toLowerCase();
+          const looksPhone =
+            input.type === "tel" ||
+            /phone|tel|mobile|電話|手提|手機/.test(meta);
+          if (!looksPhone) continue;
+          if (input.offsetParent === null && input.type !== "tel") continue;
+          input.focus();
+          input.value = v;
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          input.dispatchEvent(new Event("change", { bubbles: true }));
+          return true;
+        }
+        return false;
+      }, phone)
+      .catch(() => false);
+    if (filled) break;
+    await sleep(400);
+  }
+  if (!filled) throw new Error("verify 頁揾唔到／填唔入電話欄");
+  log(`已填電話 ${phone}`);
+  await sleep(300);
+
+  // 撳「繼續」
+  let continued = false;
+  for (let i = 0; i < 8 && !continued; i++) {
+    await throwIfStopped();
+    const btn = page
+      .getByRole("button", { name: /^繼續$|Continue/i })
+      .or(page.getByRole("link", { name: /^繼續$|Continue/i }))
+      .or(page.locator('button:has-text("繼續"), a:has-text("繼續"), input[type="submit"]'))
+      .first();
+    if (await btn.isVisible().catch(() => false)) {
+      await btn.scrollIntoViewIfNeeded().catch(() => {});
+      await btn.click({ timeout: 5000 }).catch(async () => {
+        await btn.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
+      });
+      continued = true;
+      log("已撳「繼續」");
+      break;
+    }
+    continued = await page
+      .evaluate(() => {
+        const norm = (s: string) => (s || "").replace(/[\s\u00a0]+/g, "");
+        const nodes = Array.from(
+          document.querySelectorAll("button, a, [role='button'], input[type='submit']")
+        ) as HTMLElement[];
+        for (const el of nodes) {
+          const t = norm(
+            `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${(el as HTMLInputElement).value || ""}`
+          );
+          if (t === "繼續" || t === "Continue" || t.includes("繼續")) {
+            el.click();
+            return true;
+          }
+        }
+        return false;
+      })
+      .catch(() => false);
+    if (continued) {
+      log("已撳「繼續」（DOM）");
+      break;
+    }
+    await sleep(400);
+  }
+  if (!continued) throw new Error("verify 頁撳唔到「繼續」");
+
+  // 等離開 verify
+  const leaveDeadline = Date.now() + 30_000;
+  while (Date.now() < leaveDeadline) {
+    await throwIfStopped();
+    await syncWindowFlags().catch(() => {});
+    if (!isOrderLinkVerifyUrl(page.url())) {
+      log(`已離開 verify：${page.url()}`);
+      return;
+    }
+    await sleep(400);
+  }
+  log(`警告：撳繼續後仍喺 verify：${page.url()}`);
+}
+
+async function waitForAppleGuestOrderPage(page: Page): Promise<void> {
+  const deadline = Date.now() + 45_000;
+  while (Date.now() < deadline) {
+    await throwIfStopped();
+    await syncWindowFlags().catch(() => {});
+    const url = page.url();
+    if (isAppleGuestOrderUrl(url)) {
+      await sleep(400);
+      return;
+    }
+    // 有「加入至 Apple ID」都當到咗
+    const addVisible = await page
+      .getByText(/加入至\s*Apple\s*ID|Add to Apple ID/i)
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (addVisible) {
+      await sleep(300);
+      return;
+    }
+    if (isOrderLinkVerifyUrl(url)) {
+      // 仍喺 verify：外層會再填
+      await sleep(400);
+      continue;
+    }
+    if (/google\.com\/url/i.test(url)) {
+      try {
+        const q = new URL(url).searchParams.get("q");
+        if (q) {
+          await page.goto(q, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+          continue;
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    await sleep(300);
+  }
+  throw new Error(`未到達 Apple 訂單詳情頁：${page.url()}`);
 }
 
 async function clickAddToAppleIdOnce(page: Page): Promise<void> {
@@ -2302,6 +2596,39 @@ async function processOneAccount(
       email: account.email,
     });
 
+    // 已喺 Apple verify／訂單頁（任何分頁）：跳過 Gmail，直接填電話／繼續
+    {
+      const applePage =
+        context.pages().find((p) => {
+          if (p.isClosed()) return false;
+          const u = p.url();
+          return (
+            isOrderLinkVerifyUrl(u) ||
+            isAppleGuestOrderUrl(u) ||
+            /secure\d*\.store\.apple\.com.*\/shop\/order/i.test(u)
+          );
+        }) || null;
+      if (applePage) {
+        log(`已在 Apple 訂單流程（${applePage.url()}），跳過 Gmail`);
+        activePage = applePage;
+        await maybeMinimizeBrowserWindow(applePage, browser);
+        await fillOrderVerifyPhoneAndContinue(applePage, orderNumber);
+        await waitForAppleGuestOrderPage(applePage);
+        await writeStatus({ phase: "add_to_apple_id", message: "加入至 Apple ID…", orderNumber });
+        await clickAddToAppleIdOnce(applePage);
+        await signInAppleIdOnOrderPage(applePage, appleEmail, applePassword);
+        await writeStatus({
+          phase: "steps_complete",
+          message: `步驟完成（${orderNumber}）`,
+          orderNumber,
+          windowHidden: !userKeepBrowserOpen,
+          keepOpen: userKeepBrowserOpen,
+        });
+        log(`完成：${maskEmail(account.email)} · ${orderNumber} → 已嘗試加入 Apple ID`);
+        return;
+      }
+    }
+
     const onGmail = /mail\.google\.com/i.test(page.url());
     const urlHasOrder = (() => {
       const u = page.url();
@@ -2351,8 +2678,19 @@ async function processOneAccount(
     activePage = orderPage;
     await maybeMinimizeBrowserWindow(orderPage, browser);
 
-    await writeStatus({ phase: "apple_order", message: "等待 Apple 訂單頁…", orderNumber });
-    await waitForAppleOrderGuestPage(orderPage);
+    await writeStatus({ phase: "apple_order", message: "等待 Apple 訂單／verify 頁…", orderNumber });
+    await waitForAppleOrderFlowPage(orderPage);
+
+    // order/link/verify：填 Order summary 電話 → 繼續
+    if (isOrderLinkVerifyUrl(orderPage.url())) {
+      await fillOrderVerifyPhoneAndContinue(orderPage, orderNumber);
+    } else {
+      // 有時 redirect 稍慢，再等一下 verify
+      await fillOrderVerifyPhoneAndContinue(orderPage, orderNumber);
+    }
+
+    await writeStatus({ phase: "apple_order", message: "等待訂單詳情頁…", orderNumber });
+    await waitForAppleGuestOrderPage(orderPage);
 
     await writeStatus({ phase: "add_to_apple_id", message: "加入至 Apple ID…", orderNumber });
     await clickAddToAppleIdOnce(orderPage);
