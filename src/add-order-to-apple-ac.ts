@@ -67,6 +67,8 @@ class CloseRequestedError extends Error {
 let activePage: Page | null = null;
 let activeBrowser: Browser | null = null;
 let windowHidden = true;
+/** 用戶撳過 Open browser 之後，自動化唔好再自動 minimize */
+let userKeepBrowserOpen = false;
 /** 同 Checkout Dashboard 嘅鋪位大小（Open browser 用） */
 let windowBounds: { left: number; top: number; width: number; height: number } = {
   left: 4,
@@ -334,6 +336,7 @@ async function maximizeBrowserWindow(page: Page, browser: Browser): Promise<void
   winRestoreBrowserWindow(browser);
   await page.bringToFront().catch(() => {});
   windowHidden = false;
+  userKeepBrowserOpen = true;
   await writeStatus({
     windowHidden: false,
     windowState: "maximized",
@@ -342,7 +345,7 @@ async function maximizeBrowserWindow(page: Page, browser: Browser): Promise<void
   });
 }
 
-/** 同 dashboard：視窗一開就 minimize 隱藏 */
+/** 同 dashboard：視窗一開就 minimize 隱藏（用戶 Open browser 後唔會自動再收） */
 async function minimizeBrowserWindow(page: Page, browser: Browser): Promise<void> {
   try {
     const windowId = await getPageWindowId(page);
@@ -360,6 +363,15 @@ async function minimizeBrowserWindow(page: Page, browser: Browser): Promise<void
   winMinimizeBrowserWindow(browser);
   windowHidden = true;
   await writeStatus({ windowHidden: true, windowState: "minimized" });
+}
+
+/** 自動化用：用戶已 Open browser 就保持開住 */
+async function maybeMinimizeBrowserWindow(page: Page, browser: Browser): Promise<void> {
+  if (userKeepBrowserOpen) {
+    windowHidden = false;
+    return;
+  }
+  await minimizeBrowserWindow(page, browser);
 }
 
 let flagPollTimer: ReturnType<typeof setInterval> | null = null;
@@ -394,9 +406,10 @@ async function syncWindowFlags(): Promise<void> {
   if (!activePage || activePage.isClosed() || !activeBrowser) return;
   if (await consumeFlag(SHOW_FLAG)) {
     await maximizeBrowserWindow(activePage, activeBrowser);
-    log("Open browser：已顯示視窗");
+    log("Open browser：已顯示視窗（會保持開啟直至 Hide／Close）");
   }
   if (await consumeFlag(HIDE_FLAG)) {
+    userKeepBrowserOpen = false;
     await minimizeBrowserWindow(activePage, activeBrowser);
     log("Hide：已隱藏視窗");
   }
@@ -562,62 +575,162 @@ async function clickContinueWithPasswordFast(page: Page): Promise<boolean> {
     "繼續使用密碼登入",
     "使用密碼登入",
     "使用密碼",
+    "以密碼繼續",
     "Continue with Password",
     "Use Password",
+    "Sign in with Password",
   ];
-  const otherNeedles = ["其他選項", "Other Options", "Try Another Way"];
+  const otherNeedles = ["其他選項", "其他选项", "Other Options", "Other Option", "Try Another Way"];
 
-  const clickByTexts = async (needles: string[]): Promise<boolean> => {
+  const clickByTexts = async (needles: string[], loosePassword = false): Promise<boolean> => {
     for (const fr of [...appleAuthFrames(page), page.mainFrame(), ...page.frames()]) {
       const hit = await fr
-        .evaluate((texts) => {
-          const norm = (s: string) =>
-            (s || "").replace(/[\s\u00a0\u200b\ufeff]+/g, "").toLowerCase();
-          const wanted = texts.map((t) => norm(t));
-          const nodes = Array.from(
-            document.querySelectorAll("button, a, [role='button'], span, div")
-          ) as HTMLElement[];
-          for (const el of nodes) {
-            const t = norm(`${el.innerText || ""} ${el.getAttribute("aria-label") || ""}`);
-            if (!t || t.length > 80) continue;
-            if (wanted.some((w) => t.includes(w) || w.includes(t))) {
-              el.click();
+        .evaluate(
+          ({ texts, loose }) => {
+            const norm = (s: string) =>
+              (s || "").replace(/[\s\u00a0\u200b\ufeff]+/g, "").toLowerCase();
+            const wanted = texts.map((t) => norm(t));
+            const nodes = Array.from(
+              document.querySelectorAll("button, a, [role='button'], span, div, li")
+            ) as HTMLElement[];
+            for (const el of nodes) {
+              const raw = `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""}`;
+              const t = norm(raw);
+              if (!t || t.length > 120) continue;
+              const match = wanted.some((w) => t.includes(w) || w.includes(t));
+              const looseHit =
+                loose &&
+                /密碼|password/i.test(raw) &&
+                /繼續|使用|登入|continue|sign|use/i.test(raw);
+              if (!match && !looseHit) continue;
+              const clickable =
+                (el.closest("button, a, [role='button']") as HTMLElement | null) || el;
+              clickable.click();
               return true;
             }
-          }
-          return false;
-        }, needles)
+            return false;
+          },
+          { texts: needles, loose: loosePassword }
+        )
         .catch(() => false);
       if (hit) return true;
     }
     return false;
   };
 
+  // 1) #continue-password（idmsa）
+  for (const fr of [...appleAuthFrames(page), page.mainFrame(), ...page.frames()]) {
+    const byId = fr
+      .locator(
+        "#continue-password, button#continue-password, [id*='continue-password' i], button[data-test*='password' i]"
+      )
+      .first();
+    if ((await byId.count().catch(() => 0)) === 0) continue;
+    const ok = await byId
+      .click({ force: true, timeout: 1500 })
+      .then(() => true)
+      .catch(async () =>
+        byId
+          .evaluate((n) => {
+            (n as HTMLElement).click();
+            return true;
+          })
+          .catch(() => false)
+      );
+    if (ok) return true;
+  }
+
+  // 2) iframe + 主頁 role／text
   for (const iframeSel of APPLE_AUTH_IFRAME_SELS) {
     if ((await page.locator(iframeSel).count().catch(() => 0)) === 0) continue;
     const frame = page.frameLocator(iframeSel);
-    const byId = frame.locator("#continue-password").first();
-    if ((await byId.count().catch(() => 0)) > 0) {
-      if (await byId.click({ force: true, timeout: 1200 }).then(() => true).catch(() => false)) {
-        return true;
-      }
-    }
-    const btn = frame
-      .getByRole("button", { name: /繼續使用密碼|使用密碼|Continue with Password|Use Password/i })
-      .first();
-    if ((await btn.count().catch(() => 0)) > 0) {
-      if (await btn.click({ force: true, timeout: 1200 }).then(() => true).catch(() => false)) {
+    const candidates = [
+      frame.locator("#continue-password"),
+      frame.getByRole("button", {
+        name: /繼續使用密碼|使用密碼|Continue with Password|Use Password|Sign in with Password/i,
+      }),
+      frame.getByRole("link", {
+        name: /繼續使用密碼|使用密碼|Continue with Password|Use Password/i,
+      }),
+      frame.getByText(/繼續使用密碼登入|使用密碼登入|Continue with Password/i),
+    ];
+    for (const loc of candidates) {
+      const el = loc.first();
+      if ((await el.count().catch(() => 0)) === 0) continue;
+      if (
+        await el
+          .click({ force: true, timeout: 1500 })
+          .then(() => true)
+          .catch(() => false)
+      ) {
         return true;
       }
     }
   }
 
-  if (await clickByTexts(pwdNeedles)) return true;
+  // 主頁（signIn/orders 有時唔喺 iframe）
+  const pageCandidates = [
+    page.locator("#continue-password"),
+    page.getByRole("button", {
+      name: /繼續使用密碼登入|繼續使用密碼|使用密碼登入|Continue with Password|Use Password/i,
+    }),
+    page.getByRole("link", {
+      name: /繼續使用密碼登入|繼續使用密碼|使用密碼登入|Continue with Password|Use Password/i,
+    }),
+    page.getByText(/繼續使用密碼登入|使用密碼登入/i),
+  ];
+  for (const loc of pageCandidates) {
+    const el = loc.first();
+    if ((await el.count().catch(() => 0)) === 0) continue;
+    if (!(await el.isVisible().catch(() => false))) continue;
+    if (
+      await el
+        .click({ force: true, timeout: 2000 })
+        .then(() => true)
+        .catch(async () =>
+          el
+            .evaluate((n) => {
+              (n as HTMLElement).click();
+              return true;
+            })
+            .catch(() => false)
+        )
+    ) {
+      return true;
+    }
+  }
+
+  if (await clickByTexts(pwdNeedles, true)) return true;
+
+  // 通行密鑰畫面：先「其他選項」
   if (await clickByTexts(otherNeedles)) {
-    await sleep(400);
-    return clickByTexts(pwdNeedles);
+    await sleep(500);
+    if (await clickByTexts(pwdNeedles, true)) return true;
+    for (const loc of pageCandidates) {
+      const el = loc.first();
+      if ((await el.count().catch(() => 0)) === 0) continue;
+      if (await el.click({ force: true, timeout: 1500 }).then(() => true).catch(() => false)) {
+        return true;
+      }
+    }
   }
   return false;
+}
+
+async function pressEnterOnAppleAuthField(page: Page, kind: "email" | "password"): Promise<void> {
+  const sels =
+    kind === "email"
+      ? ["#account_name_text_field", 'input[type="email"]', 'input[name="accountName"]']
+      : ["#password_text_field", 'input[type="password"]', 'input[name="password"]'];
+  for (const fr of [...appleAuthFrames(page), page.mainFrame(), ...page.frames()]) {
+    for (const sel of sels) {
+      const loc = fr.locator(sel).first();
+      if ((await loc.count().catch(() => 0)) === 0) continue;
+      await loc.focus().catch(() => {});
+      await page.keyboard.press("Enter").catch(() => {});
+      return;
+    }
+  }
 }
 
 async function signInAppleIdOnOrderPage(
@@ -627,22 +740,37 @@ async function signInAppleIdOnOrderPage(
 ): Promise<void> {
   log(`Apple ID 登入：${maskEmail(appleEmail)}`);
   await sleep(600);
+  await writeStatus({
+    phase: "apple_sign_in",
+    message: "Apple ID 登入中…",
+    url: page.url(),
+  });
 
   let emailOk = false;
   for (let i = 0; i < 12; i++) {
+    await throwIfStopped();
+    await syncWindowFlags().catch(() => {});
     emailOk = await fillInAppleAuthFrame(page, "email", appleEmail);
     if (emailOk) break;
     await sleep(400);
   }
   if (!emailOk) throw new Error("揾唔到／填唔入 Apple ID 電郵欄");
 
-  await clickAppleAuthContinue(page);
-  log("已提交電郵");
-  await sleep(500);
+  let advanced = await clickAppleAuthContinue(page);
+  if (!advanced) {
+    await pressEnterOnAppleAuthField(page, "email");
+    advanced = true;
+  }
+  log("已提交電郵，等「繼續使用密碼登入」…");
+  await sleep(700);
 
-  const pwdDeadline = Date.now() + 20000;
+  const pwdDeadline = Date.now() + 45_000;
   let sawPassword = false;
+  let pwdContinueClicks = 0;
   while (Date.now() < pwdDeadline) {
+    await throwIfStopped();
+    await syncWindowFlags().catch(() => {});
+    sawPassword = false;
     for (const fr of [...appleAuthFrames(page), page.mainFrame(), ...page.frames()]) {
       const n = await fr
         .locator("#password_text_field, input[type='password'], input[name='password']")
@@ -654,24 +782,52 @@ async function signInAppleIdOnOrderPage(
       }
     }
     if (sawPassword) break;
-    if (await clickContinueWithPasswordFast(page)) {
-      log("已撳「繼續使用密碼登入」");
-      await sleep(450);
+
+    const clicked = await clickContinueWithPasswordFast(page);
+    if (clicked) {
+      pwdContinueClicks += 1;
+      log(`已撳「繼續使用密碼登入」（第 ${pwdContinueClicks} 次）`);
+      await writeStatus({
+        phase: "apple_sign_in",
+        message: "已撳繼續使用密碼登入",
+        url: page.url(),
+      });
+      await sleep(600);
     } else {
-      await sleep(250);
+      // 有時仲喺電郵步：再提交一次
+      if (pwdContinueClicks === 0 && Date.now() < pwdDeadline - 35_000) {
+        await clickAppleAuthContinue(page).catch(() => false);
+        await pressEnterOnAppleAuthField(page, "email");
+      }
+      await sleep(350);
+    }
+  }
+
+  if (!sawPassword) {
+    // 最後再猛撳幾次密碼掣
+    for (let i = 0; i < 6; i++) {
+      if (await clickContinueWithPasswordFast(page)) {
+        log("補撳「繼續使用密碼登入」成功");
+        await sleep(800);
+        break;
+      }
+      await sleep(400);
     }
   }
 
   let passOk = false;
-  for (let round = 1; round <= 10; round++) {
+  for (let round = 1; round <= 12; round++) {
+    await throwIfStopped();
+    await syncWindowFlags().catch(() => {});
     passOk = await fillInAppleAuthFrame(page, "password", applePassword);
     if (passOk) break;
     await clickContinueWithPasswordFast(page).catch(() => {});
-    await sleep(400);
+    await sleep(450);
   }
-  if (!passOk) throw new Error("揾唔到／填唔入密碼欄");
+  if (!passOk) throw new Error("揾唔到／填唔入密碼欄（請確認已出現「繼續使用密碼登入」）");
 
   await clickAppleAuthContinue(page);
+  await pressEnterOnAppleAuthField(page, "password");
   log("已提交密碼（右箭頭／繼續）");
   await sleep(1500);
 }
@@ -1786,8 +1942,8 @@ async function processOneAccount(
     `視窗鋪位（同 Checkout）：${windowBounds.width}x${windowBounds.height} @ (${windowBounds.left},${windowBounds.top}) · ${ACCOUNT_INDEX + 1}/${WINDOW_TOTAL}`
   );
   await applyCheckoutWindowBounds(page, true).catch(() => {});
-  await minimizeBrowserWindow(page, browser);
-  log("瀏覽器已隱藏（minimized）");
+  await maybeMinimizeBrowserWindow(page, browser);
+  log(userKeepBrowserOpen ? "瀏覽器保持開啟（用戶 Open browser）" : "瀏覽器已隱藏（minimized）");
 
   const runSteps = async () => {
     await writeStatus({ phase: "gmail_login", message: "Gmail 登入中…" });
@@ -1797,7 +1953,7 @@ async function processOneAccount(
     await gmailSearchAndOpenOrderEmail(page);
     const orderPage = await clickOrderStatusInEmail(page, context);
     activePage = orderPage;
-    if (windowHidden) await minimizeBrowserWindow(orderPage, browser);
+    await maybeMinimizeBrowserWindow(orderPage, browser);
     await waitForAppleOrderGuestPage(orderPage);
     await writeStatus({ phase: "add_to_apple_id", message: "加入至 Apple ID…" });
     await clickAddToAppleIdOnce(orderPage);
