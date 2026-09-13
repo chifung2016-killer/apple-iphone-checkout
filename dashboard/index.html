@@ -1650,14 +1650,53 @@
 
     clearPresetSelection();
 
+    let dashboardBuildId = null;
     const es = new EventSource("/api/events");
     es.onmessage = (ev) => {
       try {
         const msg = JSON.parse(ev.data);
-        if (msg.type === "hello" || msg.type === "status") applySnapshot(msg.state);
+        if (msg.type === "reload") {
+          console.log("[live-reload]", msg.reason || "reload");
+          location.reload();
+          return;
+        }
+        if (msg.type === "hello") {
+          if (
+            dashboardBuildId &&
+            msg.buildId &&
+            dashboardBuildId !== msg.buildId
+          ) {
+            console.log("[live-reload] server restarted → refresh page");
+            location.reload();
+            return;
+          }
+          if (msg.buildId) dashboardBuildId = msg.buildId;
+          applySnapshot(msg.state);
+          return;
+        }
+        if (msg.type === "status") applySnapshot(msg.state);
         if (msg.type === "log") appendLogs([msg.line]);
       } catch { /* ignore */ }
     };
+    es.onerror = () => {
+      // EventSource 會自動重連；server 用 tsx watch 重啟後 hello.buildId 變就會自動 reload
+    };
+
+    // 後備：SSE 斷線重連後若 buildId 變咗都 reload
+    setInterval(async () => {
+      try {
+        const res = await fetch("/api/build-id", { cache: "no-store" });
+        const data = await res.json();
+        if (!data?.buildId) return;
+        if (dashboardBuildId && data.buildId !== dashboardBuildId) {
+          location.reload();
+          return;
+        }
+        if (!dashboardBuildId) dashboardBuildId = data.buildId;
+      } catch {
+        /* server 重啟緊 */
+      }
+    }, 4000);
 
     $("cardLimitSearch")?.addEventListener("input", () => {
       renderCardLimitsFromOrders(lastSuccessfulOrders);

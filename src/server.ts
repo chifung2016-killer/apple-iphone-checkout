@@ -4,7 +4,7 @@
  */
 import http from "node:http";
 import fs from "node:fs/promises";
-import { createReadStream, existsSync } from "node:fs";
+import { createReadStream, existsSync, watch as fsWatch } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -28,6 +28,8 @@ const ORDERS_FILE = path.join(ROOT, "order-summary.json");
 const CONTINUE_ALL_FLAG = path.join(ROOT, "dashboard-continue.flag");
 const PROXY_BLACKLIST_FILE = path.join(RUNTIME_DIR, "proxy-blacklist.json");
 const PORT = Number(process.env.DASHBOARD_PORT || 8787);
+/** 每次 server 啟動／tsx watch 重載都會變 → 瀏覽器自動 refresh */
+const DASHBOARD_BUILD_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
 type BrowserSession = {
   id: string;
@@ -85,6 +87,37 @@ function defaultConfig() {
 function broadcast(payload: unknown) {
   const data = `data: ${JSON.stringify(payload)}\n\n`;
   for (const res of sseClients) res.write(data);
+}
+
+/** 改 dashboard 靜態檔即推 reload；tsx watch 重啟 server 則靠 buildId */
+function startLiveReloadWatcher() {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const fire = (reason: string) => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      console.log(`[live-reload] ${reason}`);
+      broadcast({
+        type: "reload",
+        buildId: DASHBOARD_BUILD_ID,
+        reason,
+        at: new Date().toISOString(),
+      });
+    }, 200);
+  };
+  try {
+    fsWatch(PUBLIC, { recursive: true }, (_event, filename) => {
+      const name = String(filename || "");
+      if (!name) return;
+      if (/\.(html|css|js|svg|png|ico|map)$/i.test(name)) {
+        fire(`dashboard/${name.replace(/\\/g, "/")}`);
+      }
+    });
+    console.log(`[live-reload] watching ${PUBLIC}`);
+  } catch (err) {
+    console.warn(
+      `[live-reload] watch failed：${err instanceof Error ? err.message : String(err)}`
+    );
+  }
 }
 
 async function readJson(file: string): Promise<unknown> {
@@ -1348,10 +1381,20 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
     });
-    res.write(`data: ${JSON.stringify({ type: "hello", state: await snapshot() })}\n\n`);
+    res.write(
+      `data: ${JSON.stringify({
+        type: "hello",
+        buildId: DASHBOARD_BUILD_ID,
+        state: await snapshot(),
+      })}\n\n`
+    );
     sseClients.add(res);
     req.on("close", () => sseClients.delete(res));
     return;
+  }
+
+  if (pathname === "/api/build-id" && req.method === "GET") {
+    return sendJson(res, 200, { ok: true, buildId: DASHBOARD_BUILD_ID });
   }
 
   if ((pathname === "/api/run" || pathname === "/api/browsers/add") && req.method === "POST") {
@@ -1548,7 +1591,11 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (!existsSync(filePath)) filePath = path.join(PUBLIC, "index.html");
-    res.writeHead(200, { "Content-Type": contentType(filePath) });
+    res.writeHead(200, {
+      "Content-Type": contentType(filePath),
+      "Cache-Control": "no-store, no-cache, must-revalidate",
+      Pragma: "no-cache",
+    });
     createReadStream(filePath).pipe(res);
   } catch (err) {
     res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
@@ -1557,8 +1604,11 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
+  startLiveReloadWatcher();
   void refreshNextIndexFromDisk().then(() => {
-    console.log(`Checkout dashboard → http://127.0.0.1:${PORT} (next browser id b${nextIndex + 1})`);
+    console.log(
+      `Checkout dashboard → http://127.0.0.1:${PORT} (next browser id b${nextIndex + 1}) [live-reload build=${DASHBOARD_BUILD_ID}]`
+    );
   });
 });
 
