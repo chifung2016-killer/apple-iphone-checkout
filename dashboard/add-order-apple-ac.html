@@ -102,6 +102,36 @@
     #statusPill.run { color: var(--accent-ink); background: color-mix(in srgb, var(--accent) 70%, white); border-color: transparent; }
     #statusPill.err { color: #3a1010; background: color-mix(in srgb, var(--danger) 55%, white); border-color: transparent; }
     #statusPill.ok { color: #062816; background: color-mix(in srgb, var(--ok) 55%, white); border-color: transparent; }
+    .btn-warn {
+      background: color-mix(in srgb, var(--warn) 28%, var(--field));
+      border-color: color-mix(in srgb, var(--warn) 45%, var(--line));
+    }
+    .btn-sm { padding: 7px 10px; font-size: 0.82rem; }
+    .task-list { display: grid; gap: 12px; }
+    .task-card {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px 14px;
+      background: var(--field);
+    }
+    .task-card.is-captcha {
+      border-color: color-mix(in srgb, #60a5fa 55%, var(--line));
+      box-shadow: 0 0 0 1px color-mix(in srgb, #3b82f6 25%, transparent);
+    }
+    .task-head {
+      display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 8px;
+    }
+    .task-head strong { font-family: "Fraunces", Georgia, serif; }
+    .phase-pill {
+      font-size: 0.75rem; padding: 4px 8px; border-radius: 999px;
+      border: 1px solid var(--line); color: var(--muted);
+    }
+    .phase-pill.captcha { background: #93c5fd; color: #0b1a33; border-color: transparent; }
+    .phase-pill.run { background: color-mix(in srgb, var(--accent) 35%, var(--field)); color: var(--accent-ink); border-color: transparent; }
+    .phase-pill.manual { background: color-mix(in srgb, var(--warn) 35%, var(--field)); color: #3a2a10; border-color: transparent; }
+    .phase-pill.done { background: color-mix(in srgb, var(--ok) 40%, var(--field)); color: #062816; border-color: transparent; }
+    .task-meta { font-size: 0.85rem; color: var(--muted); margin-bottom: 10px; }
+    .task-actions { display: flex; flex-wrap: wrap; gap: 8px; }
   </style>
 </head>
 <body>
@@ -120,7 +150,7 @@
           <button type="button" class="btn-primary" id="btnSaveAccounts">Save</button>
           <button type="button" class="btn-danger" id="btnClearAccounts">Clear all</button>
         </div>
-        <p class="hint">Save 會用 AES 加密存喺本機 runtime（唔寫明文）。Clear all 會停 job、抹走加密檔／舊明文／job config／logs，並換密鑰。</p>
+        <p class="hint">Save 會用 AES 加密存喺本機。每個 Gmail 會開成獨立 task（同 Dashboard 一樣有 Open／Hide／Stop／Close／Continue）。</p>
       </div>
     </section>
 
@@ -136,12 +166,17 @@
           <input id="applePassword" type="password" value="yY6594083" autocomplete="new-password" />
         </div>
       </div>
-      <p class="hint">撳「加入至 Apple ID」後：填呢個電郵 →「繼續使用密碼登入」→ 密碼 → 右箭頭（同 delivery apple ac apple pay訪客模式）。</p>
+      <p class="hint">Google 若要輸入數字+英文字母驗證碼，會自動開瀏覽器等人手；完成後可撳該 task 嘅 Continue。</p>
       <div class="actions">
         <button type="button" class="btn-primary" id="btnStart">Start</button>
-        <button type="button" class="btn-danger" id="btnStop" disabled>Stop</button>
+        <button type="button" class="btn-danger" id="btnStop" disabled>Stop all</button>
         <button type="button" class="btn-ghost" id="btnClearLogs">Clear logs</button>
       </div>
+    </section>
+
+    <section>
+      <h2>Tasks</h2>
+      <div class="task-list" id="taskList"><p class="hint">未有 task。填 Gmail 後撳 Start。</p></div>
     </section>
 
     <section>
@@ -197,30 +232,80 @@
         const res = await fetch("/api/add-order-apple-ac/status");
         const data = await res.json();
         renderLogs(data.logs || []);
-        if (data.running) {
+        renderTasks(data.tasks || []);
+        const running = !!data.running;
+        if (running) {
           setStatus("Running…", "run");
           $("btnStart").disabled = true;
           $("btnStop").disabled = false;
-        } else if (data.lastExitCode === 0) {
-          setStatus("Done", "ok");
-          $("btnStart").disabled = false;
-          $("btnStop").disabled = true;
-        } else if (data.lastExitCode != null && data.lastExitCode !== 0) {
-          setStatus(`Stopped / error (exit ${data.lastExitCode})`, "err");
+        } else if ((data.tasks || []).length) {
+          setStatus("Idle / waiting", "");
           $("btnStart").disabled = false;
           $("btnStop").disabled = true;
         } else {
-          setStatus(data.running ? "Running…" : "Idle", data.running ? "run" : "");
-          $("btnStart").disabled = !!data.running;
-          $("btnStop").disabled = !data.running;
+          setStatus("Idle", "");
+          $("btnStart").disabled = false;
+          $("btnStop").disabled = true;
         }
-        if (!data.running && pollTimer) {
-          clearInterval(pollTimer);
-          pollTimer = null;
+        if (!running && pollTimer) {
+          // 仍有 task（manual_control）繼續 poll
+          const alive = (data.tasks || []).some((t) => t.running || /manual|captcha|waiting/i.test(String(t.phase || "")));
+          if (!alive) {
+            clearInterval(pollTimer);
+            pollTimer = null;
+          }
         }
       } catch (err) {
         setStatus(err instanceof Error ? err.message : String(err), "err");
       }
+    }
+
+    function phasePill(phase) {
+      const p = String(phase || "");
+      if (/waiting_captcha/i.test(p)) return { cls: "captcha", label: "captcha — enter letters" };
+      if (/manual_control/i.test(p)) return { cls: "manual", label: "manual / stopped" };
+      if (/steps_complete/i.test(p)) return { cls: "done", label: "steps complete" };
+      if (/error|closed/i.test(p)) return { cls: "", label: p };
+      return { cls: "run", label: p || "running" };
+    }
+
+    function esc(s) {
+      return String(s ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function renderTasks(tasks) {
+      const box = $("taskList");
+      if (!tasks.length) {
+        box.innerHTML = '<p class="hint">未有 task。填 Gmail 後撳 Start。</p>';
+        return;
+      }
+      box.innerHTML = tasks
+        .map((t) => {
+          const pill = phasePill(t.phase);
+          const captcha = /waiting_captcha/i.test(String(t.phase || ""));
+          return `<article class="task-card ${captcha ? "is-captcha" : ""}" data-id="${esc(t.id)}">
+            <div class="task-head">
+              <strong>${esc(t.id)}</strong>
+              <span class="phase-pill ${pill.cls}">${esc(pill.label)}</span>
+            </div>
+            <div class="task-meta">
+              <div><b>Gmail</b> ${esc(t.emailMasked || "—")}</div>
+              <div><b>Status</b> ${esc(t.message || t.phase || "—")}</div>
+            </div>
+            <div class="task-actions">
+              <button type="button" class="btn-primary btn-sm" data-act="show" data-id="${esc(t.id)}">Open browser</button>
+              <button type="button" class="btn-ghost btn-sm" data-act="hide" data-id="${esc(t.id)}">Hide</button>
+              <button type="button" class="btn-danger btn-sm" data-act="stop" data-id="${esc(t.id)}">Stop</button>
+              <button type="button" class="btn-ghost btn-sm" data-act="close" data-id="${esc(t.id)}">Close</button>
+              <button type="button" class="btn-warn btn-sm" data-act="continue" data-id="${esc(t.id)}">Continue</button>
+            </div>
+          </article>`;
+        })
+        .join("");
     }
 
     function startPolling() {
@@ -267,21 +352,37 @@
     $("btnStop").addEventListener("click", async () => {
       $("btnStop").disabled = true;
       $("btnStop").textContent = "Stopping…";
-      setStatus("Stopping…", "err");
+      setStatus("Stopping automation (browsers stay open)…", "err");
       try {
         await fetch("/api/add-order-apple-ac/stop", { method: "POST" });
       } catch {
         /* ignore */
       }
+      $("btnStop").textContent = "Stop all";
       startPolling();
-      setTimeout(() => {
-        $("btnStop").textContent = "Stop";
-        refreshStatus();
-      }, 800);
     });
 
     $("btnClearLogs").addEventListener("click", () => {
       logsEl.textContent = "";
+    });
+
+    $("taskList").addEventListener("click", async (e) => {
+      const btn = e.target.closest("button[data-act]");
+      if (!btn) return;
+      const id = btn.getAttribute("data-id");
+      const act = btn.getAttribute("data-act");
+      if (!id || !act) return;
+      btn.disabled = true;
+      try {
+        await fetch(`/api/add-order-apple-ac/tasks/${encodeURIComponent(id)}/${act}`, {
+          method: "POST",
+        });
+        setTimeout(refreshStatus, 300);
+      } finally {
+        setTimeout(() => {
+          btn.disabled = false;
+        }, 600);
+      }
     });
 
     $("btnSaveAccounts").addEventListener("click", async () => {
@@ -303,9 +404,10 @@
     });
 
     $("btnClearAccounts").addEventListener("click", async () => {
-      if (!confirm("Clear all？會清：輸入框、已存 Gmail、job config、live logs，並換加密 key。")) return;
+      if (!confirm("Clear all？會清：輸入框、已存 Gmail、tasks、logs，並換加密 key。")) return;
       $("accounts").value = "";
       logsEl.textContent = "";
+      $("taskList").innerHTML = '<p class="hint">未有 task。</p>';
       setStatus("Cleared", "ok");
       try {
         const res = await fetch("/api/add-order-apple-ac/accounts/clear", { method: "POST" });
@@ -314,7 +416,6 @@
           alert(data.error || "Clear failed");
           return;
         }
-        // 再拉一次 status，確認 logs 已空
         await refreshStatus();
         setStatus("Cleared — all Gmail history wiped", "ok");
       } catch (err) {

@@ -30,32 +30,83 @@ const LEGACY_CONFIG =
   process.env.ADD_ORDER_CONFIG_PATH ||
   process.env.CHECKOUT_CONFIG_PATH ||
   "";
-const STOP_FLAG =
+const SESSION_ID = String(process.env.ADD_ORDER_SESSION_ID || "ao1").trim() || "ao1";
+const ACCOUNT_INDEX = Math.max(0, Number(process.env.ADD_ORDER_ACCOUNT_INDEX || "0") || 0);
+const STATUS_FILE = path.join(ROOT, "runtime", `status-${SESSION_ID}.json`);
+const SHOW_FLAG = path.join(ROOT, "runtime", `show-${SESSION_ID}.flag`);
+const HIDE_FLAG = path.join(ROOT, "runtime", `hide-${SESSION_ID}.flag`);
+const RELEASE_FLAG = path.join(ROOT, "runtime", `release-${SESSION_ID}.flag`);
+const CONTINUE_FLAG = path.join(ROOT, "runtime", `continue-${SESSION_ID}.flag`);
+const CLOSE_FLAG = path.join(ROOT, "runtime", `close-${SESSION_ID}.flag`);
+const STOP_ALL_FLAG =
   process.env.ADD_ORDER_STOP_FLAG ||
   path.join(ROOT, "runtime", "add-order-stop.flag");
 
 class StopRequestedError extends Error {
   constructor() {
-    super("已收到 Stop");
+    super("已收到 Stop（保留瀏覽器）");
     this.name = "StopRequestedError";
   }
 }
 
-function log(msg: string) {
-  console.log(`[add-order] ${redactSecrets(msg)}`);
+class CloseRequestedError extends Error {
+  constructor() {
+    super("已收到 Close");
+    this.name = "CloseRequestedError";
+  }
 }
 
-async function stopRequested(): Promise<boolean> {
+let activePage: Page | null = null;
+let activeBrowser: Browser | null = null;
+let windowHidden = true;
+
+async function flagExists(p: string): Promise<boolean> {
   try {
-    await fs.access(STOP_FLAG);
+    await fs.access(p);
     return true;
   } catch {
     return false;
   }
 }
 
+async function consumeFlag(p: string): Promise<boolean> {
+  if (!(await flagExists(p))) return false;
+  await fs.unlink(p).catch(() => {});
+  return true;
+}
+
+async function writeStatus(patch: Record<string, unknown>): Promise<void> {
+  await fs.mkdir(path.dirname(STATUS_FILE), { recursive: true }).catch(() => {});
+  let prev: Record<string, unknown> = {};
+  try {
+    prev = JSON.parse(await fs.readFile(STATUS_FILE, "utf8")) as Record<string, unknown>;
+  } catch {
+    /* ignore */
+  }
+  const next = {
+    ...prev,
+    ...patch,
+    id: SESSION_ID,
+    type: "add_order",
+    updatedAt: new Date().toISOString(),
+  };
+  await fs.writeFile(STATUS_FILE, JSON.stringify(next, null, 2), "utf8");
+}
+
+function log(msg: string) {
+  console.log(`[add-order:${SESSION_ID}] ${redactSecrets(msg)}`);
+}
+
+async function throwIfClosed(): Promise<void> {
+  if (await consumeFlag(CLOSE_FLAG)) throw new CloseRequestedError();
+}
+
 async function throwIfStopped(): Promise<void> {
-  if (await stopRequested()) throw new StopRequestedError();
+  await throwIfClosed();
+  // 只停自動化；唔關瀏覽器。全局 Stop 會對每個 task 寫 release-*.flag
+  if (await consumeFlag(RELEASE_FLAG)) {
+    throw new StopRequestedError();
+  }
 }
 
 async function loadConfig(): Promise<JobConfig> {
@@ -85,9 +136,45 @@ async function loadConfig(): Promise<JobConfig> {
 async function sleep(ms: number) {
   const end = Date.now() + ms;
   while (Date.now() < end) {
+    await syncWindowFlags().catch(() => {});
     await throwIfStopped();
     await new Promise((r) => setTimeout(r, Math.min(250, end - Date.now())));
   }
+}
+
+async function maximizeBrowserWindow(page: Page, browser: Browser): Promise<void> {
+  try {
+    const cdp = await page.context().newCDPSession(page);
+    const { windowId } = (await cdp.send("Browser.getWindowForTarget")) as {
+      windowId: number;
+    };
+    await cdp.send("Browser.setWindowBounds", {
+      windowId,
+      bounds: { windowState: "normal" },
+    });
+    await cdp
+      .send("Browser.setWindowBounds", {
+        windowId,
+        bounds: { windowState: "maximized" },
+      })
+      .catch(() => {});
+    await cdp.detach().catch(() => {});
+  } catch {
+    /* ignore */
+  }
+  if (process.platform === "win32") {
+    const proc = (browser as unknown as { process?: () => { pid?: number } | null }).process?.();
+    const pid = proc?.pid;
+    if (pid) {
+      const ps = `Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class W{[DllImport("user32.dll")]public static extern bool SetForegroundWindow(IntPtr h);[DllImport("user32.dll")]public static extern bool ShowWindowAsync(IntPtr h,int n);}' -ErrorAction SilentlyContinue; $p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if($p -and $p.MainWindowHandle -ne 0){[void][W]::ShowWindowAsync($p.MainWindowHandle,3);[void][W]::SetForegroundWindow($p.MainWindowHandle)}`;
+      spawn("powershell", ["-NoProfile", "-Command", ps], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    }
+  }
+  windowHidden = false;
+  await writeStatus({ windowHidden: false, windowState: "maximized" });
 }
 
 /** 同 dashboard：視窗一開就 minimize 隱藏 */
@@ -109,13 +196,45 @@ async function minimizeBrowserWindow(page: Page, browser: Browser): Promise<void
     const proc = (browser as unknown as { process?: () => { pid?: number } | null }).process?.();
     const pid = proc?.pid;
     if (pid) {
-      // 6 = SW_MINIMIZE
       const ps = `Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class W{[DllImport("user32.dll")]public static extern bool ShowWindowAsync(IntPtr h,int n);}' -ErrorAction SilentlyContinue; $p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if($p -and $p.MainWindowHandle -ne 0){[void][W]::ShowWindowAsync($p.MainWindowHandle,6)}`;
       spawn("powershell", ["-NoProfile", "-Command", ps], {
         stdio: "ignore",
         windowsHide: true,
       });
     }
+  }
+  windowHidden = true;
+  await writeStatus({ windowHidden: true, windowState: "minimized" });
+}
+
+async function syncWindowFlags(): Promise<void> {
+  if (!activePage || !activeBrowser) return;
+  if (await consumeFlag(SHOW_FLAG)) {
+    await maximizeBrowserWindow(activePage, activeBrowser);
+    log("Open browser：已顯示視窗");
+  }
+  if (await consumeFlag(HIDE_FLAG)) {
+    await minimizeBrowserWindow(activePage, activeBrowser);
+    log("Hide：已隱藏視窗");
+  }
+}
+
+async function holdBrowserUntilClose(reason: string): Promise<"continue" | "close"> {
+  await writeStatus({
+    phase: "manual_control",
+    message: reason,
+    windowHidden,
+  });
+  log(`${reason} — 瀏覽器保持開啟（Stop 唔關窗）；Continue 繼續／Close 關閉`);
+  while (true) {
+    if (await consumeFlag(CLOSE_FLAG)) return "close";
+    await syncWindowFlags().catch(() => {});
+    if (await consumeFlag(CONTINUE_FLAG)) {
+      await writeStatus({ phase: "running", message: "Continue：恢復自動化" });
+      return "continue";
+    }
+    // 全局 stop 淨係 pause，唔退出 hold
+    await new Promise((r) => setTimeout(r, 400));
   }
 }
 
@@ -378,12 +497,75 @@ function isGmailInboxUrl(url: string): boolean {
   return /mail\.google\.com/i.test(url) && !/accounts\.google\.com/i.test(url);
 }
 
-/** 真正要額外驗證嘅 challenge（唔包括密碼頁 challenge/pwd） */
+/** 真正要額外驗證嘅 challenge（唔包括密碼頁 challenge/pwd、captcha 字元頁） */
 function isExtraGoogleChallenge(url: string): boolean {
   if (/\/challenge\/pwd\b/i.test(url)) return false;
+  if (/captcha|recaptcha|identifier/i.test(url) && /challenge/i.test(url)) return false;
   return /\/challenge\/(totp|iap|selection|sk|dp|kpe|ootp|bc|pk|sms|wa|idv|ipp)/i.test(
     url
   ) || /\/signin\/challenge\/(?:totp|iap|selection)/i.test(url);
+}
+
+/** Google 畫面驗證碼：要輸入數字+英文字母 */
+async function isCaptchaChallengePage(page: Page): Promise<boolean> {
+  const url = page.url();
+  if (/captcha|recaptcha|challenge\/ipp|challenge\/bc/i.test(url)) return true;
+  const hit = await page
+    .evaluate(() => {
+      const t = (document.body?.innerText || "").slice(0, 4000);
+      if (
+        /輸入你看到的字|輸入畫面中的字|Type the text|Enter the characters|characters you see|不是機器人|I'm not a robot|驗證碼/i.test(
+          t
+        )
+      ) {
+        return true;
+      }
+      // captcha 圖／輸入框
+      if (
+        document.querySelector(
+          'img[src*="captcha" i], #captchaimg, input[name*="captcha" i], input[id*="captcha" i]'
+        )
+      ) {
+        return true;
+      }
+      return false;
+    })
+    .catch(() => false);
+  return Boolean(hit);
+}
+
+async function waitForManualCaptcha(
+  page: Page,
+  browser: Browser
+): Promise<void> {
+  if (!(await isCaptchaChallengePage(page))) return;
+  log("Google 要輸入數字+英文字母驗證碼 — 已開瀏覽器，請人手輸入後撳 Next；或撳 Continue");
+  await maximizeBrowserWindow(page, browser);
+  await writeStatus({
+    phase: "waiting_captcha",
+    message: "請輸入 Google 畫面驗證碼（數字+英文字母），完成後可撳 Continue",
+    windowHidden: false,
+  });
+
+  const deadline = Date.now() + 15 * 60_000;
+  while (Date.now() < deadline) {
+    await throwIfStopped();
+    await syncWindowFlags().catch(() => {});
+    if (await consumeFlag(CONTINUE_FLAG)) {
+      log("Continue：繼續檢查是否已過驗證碼");
+    }
+    if (isGmailInboxUrl(page.url())) {
+      log("驗證碼後已入 Gmail");
+      return;
+    }
+    if (!(await isCaptchaChallengePage(page))) {
+      // 可能去咗密碼頁或下一步
+      log("已離開驗證碼頁");
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw new Error("等驗證碼逾時（15 分鐘）");
 }
 
 async function clickGoogleNext(page: Page, which: "identifier" | "password"): Promise<void> {
@@ -478,8 +660,28 @@ async function gmailLogin(page: Page, email: string, password: string): Promise<
   const pwdDeadline = Date.now() + 45_000;
   let pwdReady = false;
   while (Date.now() < pwdDeadline) {
+    if (activeBrowser) await waitForManualCaptcha(page, activeBrowser);
     if (isExtraGoogleChallenge(page.url())) {
-      throw new Error(`Gmail 需要額外驗證（2FA／電話）：${page.url()} — 請人手完成後重跑`);
+      if (activeBrowser) {
+        await maximizeBrowserWindow(page, activeBrowser);
+        await writeStatus({
+          phase: "waiting_user",
+          message: "需要額外驗證，請人手完成後撳 Continue",
+          windowHidden: false,
+        });
+        while (Date.now() < pwdDeadline) {
+          await throwIfStopped();
+          if (await consumeFlag(CONTINUE_FLAG)) break;
+          if (
+            (await page.locator('input[type="password"]:visible').count().catch(() => 0)) > 0
+          ) {
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 400));
+        }
+      } else {
+        throw new Error(`Gmail 需要額外驗證：${page.url()}`);
+      }
     }
     const pwd = page
       .locator('input[type="password"]:visible, input[name="Passwd"]:visible, input[name="password"]:visible')
@@ -488,7 +690,6 @@ async function gmailLogin(page: Page, email: string, password: string): Promise<
       pwdReady = true;
       break;
     }
-    // 有時仲要再撳「繼續使用密碼」類選項
     const tryPwd = page.getByRole("button", { name: /password|密碼/i }).first();
     if ((await tryPwd.count().catch(() => 0)) > 0) {
       await tryPwd.click({ timeout: 1500 }).catch(() => {});
@@ -516,7 +717,7 @@ async function gmailLogin(page: Page, email: string, password: string): Promise<
   await clickGoogleNext(page, "password");
   log("已提交密碼，等入 Gmail…");
 
-  const deadline = Date.now() + 90_000;
+  const deadline = Date.now() + 15 * 60_000;
   while (Date.now() < deadline) {
     const url = page.url();
     if (isGmailInboxUrl(url)) {
@@ -524,8 +725,17 @@ async function gmailLogin(page: Page, email: string, password: string): Promise<
       await sleep(1500);
       return;
     }
+    if (activeBrowser) await waitForManualCaptcha(page, activeBrowser);
     if (isExtraGoogleChallenge(url)) {
-      throw new Error(`Gmail 需要額外驗證（2FA／電話）：${url} — 請人手完成後重跑`);
+      if (activeBrowser) {
+        await maximizeBrowserWindow(page, activeBrowser);
+        await writeStatus({
+          phase: "waiting_user",
+          message: "需要額外驗證，請人手完成後撳 Continue",
+          windowHidden: false,
+        });
+        if (await consumeFlag(CONTINUE_FLAG)) continue;
+      }
     }
     // 仍喺密碼頁：可能 Next 未撳到，再試一次
     if (/\/challenge\/pwd\b/i.test(url)) {
@@ -542,13 +752,15 @@ async function gmailLogin(page: Page, email: string, password: string): Promise<
       }
       await clickGoogleNext(page, "password");
     }
-    // 拒絕／錯誤訊息
     const err = page.locator('[aria-live="assertive"], div[jsname="B34EJ"], span[jsname="B34EJ"]').first();
     if ((await err.count().catch(() => 0)) > 0) {
       const t = ((await err.textContent().catch(() => "")) || "").trim();
       if (t && /wrong|incorrect|密碼|password|couldn't|無法/i.test(t)) {
         throw new Error(`Gmail 登入被拒：${t}`);
       }
+    }
+    if (await consumeFlag(CONTINUE_FLAG)) {
+      log("Continue：繼續等入 Gmail");
     }
     await sleep(500);
   }
@@ -702,6 +914,12 @@ async function processOneAccount(
 ): Promise<void> {
   await throwIfStopped();
   log(`======== 開始處理 ${maskEmail(account.email)} ========`);
+  await writeStatus({
+    phase: "running",
+    emailMasked: maskEmail(account.email),
+    message: "running",
+    windowHidden: true,
+  });
   const context = await browser.newContext({
     locale: "zh-HK",
     viewport: { width: 1280, height: 900 },
@@ -712,22 +930,49 @@ async function processOneAccount(
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
   });
   const page = await context.newPage();
-  // 同 dashboard：一開就 minimize，全程保持隱藏
+  activePage = page;
+  activeBrowser = browser;
   await minimizeBrowserWindow(page, browser);
   log("瀏覽器已隱藏（minimized）");
-  try {
+
+  const runSteps = async () => {
+    await writeStatus({ phase: "gmail_login", message: "Gmail 登入中…" });
     await gmailLogin(page, account.email, account.password);
-    await minimizeBrowserWindow(page, browser);
+    if (windowHidden) await minimizeBrowserWindow(page, browser);
+    await writeStatus({ phase: "search_email", message: "搜尋訂單郵件…" });
     await gmailSearchAndOpenOrderEmail(page);
     const orderPage = await clickOrderStatusInEmail(page, context);
-    await minimizeBrowserWindow(orderPage, browser);
+    activePage = orderPage;
+    if (windowHidden) await minimizeBrowserWindow(orderPage, browser);
     await waitForAppleOrderGuestPage(orderPage);
+    await writeStatus({ phase: "add_to_apple_id", message: "加入至 Apple ID…" });
     await clickAddToAppleIdOnce(orderPage);
     await signInAppleIdOnOrderPage(orderPage, appleEmail, applePassword);
+    await writeStatus({
+      phase: "steps_complete",
+      message: "步驟完成",
+      windowHidden,
+    });
     log(`完成：${maskEmail(account.email)} → 已嘗試加入 Apple ID`);
-    await sleep(2000);
-  } finally {
-    await context.close().catch(() => {});
+  };
+
+  for (;;) {
+    try {
+      await runSteps();
+      break;
+    } catch (err) {
+      if (err instanceof CloseRequestedError) throw err;
+      if (err instanceof StopRequestedError) {
+        const next = await holdBrowserUntilClose("Stop：已停自動化，瀏覽器保持開啟");
+        if (next === "close") throw new CloseRequestedError();
+        continue;
+      }
+      throw err;
+    }
+  }
+  for (;;) {
+    const next = await holdBrowserUntilClose("步驟完成，瀏覽器保持開啟");
+    if (next === "close") throw new CloseRequestedError();
   }
 }
 
@@ -750,41 +995,53 @@ async function launchBrowser(): Promise<Browser> {
 }
 
 async function main() {
-  await fs.unlink(STOP_FLAG).catch(() => {});
+  await fs.unlink(STOP_ALL_FLAG).catch(() => {});
+  await fs.unlink(RELEASE_FLAG).catch(() => {});
+  await fs.unlink(CLOSE_FLAG).catch(() => {});
+  await fs.unlink(CONTINUE_FLAG).catch(() => {});
+  await fs.unlink(SHOW_FLAG).catch(() => {});
+  await fs.unlink(HIDE_FLAG).catch(() => {});
+
   const cfg = await loadConfig();
-  log(`共 ${cfg.accounts.length} 個 Gmail；Apple ID=${maskEmail(cfg.appleEmail)}`);
+  const account = cfg.accounts[ACCOUNT_INDEX];
+  if (!account) throw new Error(`冇 account index=${ACCOUNT_INDEX}`);
+  log(`task ${SESSION_ID} · ${maskEmail(account.email)} · Apple ID=${maskEmail(cfg.appleEmail)}`);
+  await writeStatus({
+    phase: "starting",
+    emailMasked: maskEmail(account.email),
+    message: "starting",
+    windowHidden: true,
+    pid: process.pid,
+  });
 
   const browser = await launchBrowser();
-
-  const onSignal = () => {
-    log("收到中止訊號，準備停止…");
-    void fs.writeFile(STOP_FLAG, new Date().toISOString(), "utf8").catch(() => {});
-  };
-  process.on("SIGTERM", onSignal);
-  process.on("SIGINT", onSignal);
+  activeBrowser = browser;
 
   try {
-    for (const acc of cfg.accounts) {
-      await throwIfStopped();
-      try {
-        await processOneAccount(browser, acc, cfg.appleEmail, cfg.applePassword);
-      } catch (err) {
-        if (err instanceof StopRequestedError) throw err;
-        log(`失敗 ${maskEmail(acc.email)}：${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
+    await processOneAccount(browser, account, cfg.appleEmail, cfg.applePassword);
   } catch (err) {
-    if (err instanceof StopRequestedError) {
-      log("已停止（Stop）");
+    if (err instanceof CloseRequestedError) {
+      log("Close：關閉瀏覽器");
+      await writeStatus({ phase: "closed", message: "closed" });
     } else {
-      throw err;
+      log(`失敗：${err instanceof Error ? err.message : String(err)}`);
+      await writeStatus({
+        phase: "error",
+        message: err instanceof Error ? err.message : String(err),
+      });
+      try {
+        await holdBrowserUntilClose("出錯後保持瀏覽器開啟");
+      } catch {
+        /* close */
+      }
     }
   } finally {
     await browser.close().catch(() => {});
-    process.off("SIGTERM", onSignal);
-    process.off("SIGINT", onSignal);
+    activeBrowser = null;
+    activePage = null;
+    await writeStatus({ phase: "closed", message: "browser closed", windowHidden: true });
   }
-  log("全部帳號處理完");
+  log("task 結束");
 }
 
 main().catch((err) => {

@@ -22,6 +22,7 @@ import {
 import {
   decryptFromFile,
   encryptToFile,
+  maskEmail,
   redactSecrets,
   rotateKey,
   secureWipeFile,
@@ -79,23 +80,69 @@ const monitorState: MonitorState = {
   child: null,
 };
 
-type AddOrderJobState = {
-  running: boolean;
+type AddOrderTask = {
+  id: string;
+  emailMasked: string;
+  index: number;
   pid: number | null;
-  startedAt: string | null;
-  lastExitCode: number | null;
+  running: boolean;
+  startedAt: string;
   logs: string[];
   child: ChildProcess | null;
+  exitCode: number | null;
 };
 
-const addOrderJob: AddOrderJobState = {
-  running: false,
-  pid: null,
-  startedAt: null,
-  lastExitCode: null,
-  logs: [],
-  child: null,
-};
+const addOrderTasks = new Map<string, AddOrderTask>();
+let addOrderNextIndex = 1;
+
+async function readAddOrderStatus(id: string): Promise<Record<string, unknown> | null> {
+  try {
+    return JSON.parse(
+      await fs.readFile(path.join(RUNTIME_DIR, `status-${id}.json`), "utf8")
+    ) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+async function snapshotAddOrderTasks() {
+  const tasks = [];
+  for (const t of addOrderTasks.values()) {
+    const st = await readAddOrderStatus(t.id);
+    tasks.push({
+      id: t.id,
+      emailMasked: t.emailMasked || st?.emailMasked || "—",
+      running: t.running,
+      pid: t.pid,
+      startedAt: t.startedAt,
+      exitCode: t.exitCode,
+      phase: st?.phase || (t.running ? "running" : "idle"),
+      message: st?.message || "",
+      windowHidden: st?.windowHidden !== false,
+      logs: t.logs.slice(-80).map(redactSecrets),
+    });
+  }
+  return tasks;
+}
+
+function stopAddOrderAutomation(id: string) {
+  const nid = String(id || "").trim();
+  void fs.writeFile(
+    path.join(RUNTIME_DIR, `release-${nid}.flag`),
+    `takeover\n${new Date().toISOString()}`,
+    "utf8"
+  );
+}
+
+function killAddOrderTask(id: string) {
+  const t = addOrderTasks.get(id);
+  void fs.writeFile(
+    path.join(RUNTIME_DIR, `close-${id}.flag`),
+    new Date().toISOString(),
+    "utf8"
+  );
+  if (t?.child) killProc(t.child);
+}
 
 function defaultConfig() {
   return {
@@ -1606,13 +1653,19 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
   }
 
   if (pathname === "/api/add-order-apple-ac/status" && req.method === "GET") {
+    const tasks = await snapshotAddOrderTasks();
+    const anyRunning = tasks.some((t) => t.running);
+    const allLogs = [...addOrderTasks.values()].flatMap((t) =>
+      t.logs.slice(-40).map((line) => redactSecrets(line))
+    );
     return sendJson(res, 200, {
       ok: true,
-      running: addOrderJob.running,
-      pid: addOrderJob.pid,
-      startedAt: addOrderJob.startedAt,
-      lastExitCode: addOrderJob.lastExitCode,
-      logs: addOrderJob.logs.slice(-400).map(redactSecrets),
+      running: anyRunning,
+      tasks,
+      logs: allLogs.slice(-400),
+      lastExitCode: anyRunning
+        ? null
+        : [...addOrderTasks.values()].at(-1)?.exitCode ?? null,
     });
   }
 
@@ -1623,7 +1676,6 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
       text = await decryptFromFile(GMAIL_ACCOUNTS_ENC, ADD_ORDER_KEY);
     } catch {
       try {
-        // 舊版明文 → 升格加密後刪明文
         text = await fs.readFile(GMAIL_ACCOUNTS_LEGACY, "utf8");
         if (text.trim()) {
           await encryptToFile(GMAIL_ACCOUNTS_ENC, ADD_ORDER_KEY, text);
@@ -1652,40 +1704,22 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
 
   if (pathname === "/api/add-order-apple-ac/accounts/clear" && req.method === "POST") {
     await ensureRuntimeDir();
-    // 先停 job，避免仲寫 config／log
-    const child = addOrderJob.child;
-    const pid = child?.pid || addOrderJob.pid;
-    await fs.writeFile(ADD_ORDER_STOP_FLAG, new Date().toISOString(), "utf8").catch(() => {});
-    if (child) killProc(child);
-    else if (process.platform === "win32" && pid) {
-      spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
-        stdio: "ignore",
-        shell: true,
-      });
+    for (const id of [...addOrderTasks.keys()]) {
+      killAddOrderTask(id);
     }
-    addOrderJob.running = false;
-    addOrderJob.child = null;
-    addOrderJob.pid = null;
-    addOrderJob.lastExitCode = null;
-    addOrderJob.logs = [];
-    addOrderJob.startedAt = null;
-
-    // 清晒所有相關歷史／密文／明文殘留，並換 key
+    addOrderTasks.clear();
     await secureWipeFile(GMAIL_ACCOUNTS_ENC);
     await secureWipeFile(GMAIL_ACCOUNTS_LEGACY);
     await secureWipeFile(ADD_ORDER_JOB_ENC);
     await secureWipeFile(ADD_ORDER_JOB_LEGACY);
     await secureWipeFile(ADD_ORDER_STOP_FLAG);
     await rotateKey(ADD_ORDER_KEY);
-
     return sendJson(res, 200, {
       ok: true,
       cleared: [
         "ui",
+        "tasks",
         "gmail-accounts.enc",
-        "gmail-accounts-saved.txt",
-        "add-order-job.enc",
-        "add-order-apple-ac.json",
         "logs",
         "key-rotated",
       ],
@@ -1694,29 +1728,49 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
 
   if (pathname === "/api/add-order-apple-ac/stop" && req.method === "POST") {
     await ensureRuntimeDir();
-    await fs.writeFile(ADD_ORDER_STOP_FLAG, new Date().toISOString(), "utf8");
-    const child = addOrderJob.child;
-    const pid = child?.pid || addOrderJob.pid;
-    if (child) {
-      killProc(child);
-    } else if (process.platform === "win32" && pid) {
-      spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
-        stdio: "ignore",
-        shell: true,
-      });
+    // 只停自動化，唔關瀏覽器
+    for (const t of addOrderTasks.values()) {
+      stopAddOrderAutomation(t.id);
+      t.logs.push(`[dashboard] stop automation @ ${new Date().toISOString()}`);
     }
-    addOrderJob.running = false;
-    addOrderJob.child = null;
-    addOrderJob.pid = null;
-    addOrderJob.lastExitCode = addOrderJob.lastExitCode ?? 1;
-    addOrderJob.logs.push(`[dashboard] stop requested @ ${new Date().toISOString()}`);
-    return sendJson(res, 200, { ok: true });
+    return sendJson(res, 200, {
+      ok: true,
+      tasks: await snapshotAddOrderTasks(),
+    });
+  }
+
+  const aoAct = pathname.match(
+    /^\/api\/add-order-apple-ac\/tasks\/([^/]+)\/(show|hide|stop|continue|close)$/
+  );
+  if (aoAct && req.method === "POST") {
+    await ensureRuntimeDir();
+    const id = decodeURIComponent(aoAct[1]!);
+    const act = aoAct[2]!;
+    const flagMap: Record<string, string> = {
+      show: `show-${id}.flag`,
+      hide: `hide-${id}.flag`,
+      stop: `release-${id}.flag`,
+      continue: `continue-${id}.flag`,
+      close: `close-${id}.flag`,
+    };
+    const flagName = flagMap[act];
+    if (!flagName) return sendJson(res, 400, { ok: false, error: "bad act" });
+    const payload =
+      act === "stop"
+        ? `takeover\n${new Date().toISOString()}`
+        : new Date().toISOString();
+    await fs.writeFile(path.join(RUNTIME_DIR, flagName), payload, "utf8");
+    if (act === "close") {
+      const t = addOrderTasks.get(id);
+      if (t?.child) killProc(t.child);
+    }
+    return sendJson(res, 200, {
+      ok: true,
+      tasks: await snapshotAddOrderTasks(),
+    });
   }
 
   if (pathname === "/api/add-order-apple-ac/start" && req.method === "POST") {
-    if (addOrderJob.running) {
-      return sendJson(res, 409, { ok: false, error: "add-order job 已喺度跑緊" });
-    }
     let body: {
       accounts?: Array<{ email?: string; password?: string }>;
       appleEmail?: string;
@@ -1743,8 +1797,6 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     }
 
     await ensureRuntimeDir();
-    await fs.unlink(ADD_ORDER_STOP_FLAG).catch(() => {});
-    // 加密 job config（唔再寫明文 JSON）
     await encryptToFile(
       ADD_ORDER_JOB_ENC,
       ADD_ORDER_KEY,
@@ -1754,49 +1806,73 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
 
     const tsxCli = path.join(ROOT, "node_modules", "tsx", "dist", "cli.mjs");
     const script = path.join(ROOT, "src", "add-order-to-apple-ac.ts");
-    addOrderJob.logs = [
-      `[dashboard] start ${new Date().toISOString()} · ${accounts.length} Gmail (encrypted job)`,
-    ];
-    addOrderJob.lastExitCode = null;
-    addOrderJob.startedAt = new Date().toISOString();
-    addOrderJob.running = true;
+    const created: string[] = [];
 
-    const proc = spawn(process.execPath, [tsxCli, script], {
-      cwd: ROOT,
-      env: envForCheckoutChild({
-        ADD_ORDER_JOB_ENC: ADD_ORDER_JOB_ENC,
-        ADD_ORDER_KEY_PATH: ADD_ORDER_KEY,
-        ADD_ORDER_STOP_FLAG: ADD_ORDER_STOP_FLAG,
-      }),
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    addOrderJob.child = proc;
-    addOrderJob.pid = proc.pid ?? null;
+    for (let i = 0; i < accounts.length; i++) {
+      const id = `ao${addOrderNextIndex++}`;
+      const emailMasked = maskEmail(accounts[i]!.email);
+      const task: AddOrderTask = {
+        id,
+        emailMasked,
+        index: i,
+        pid: null,
+        running: true,
+        startedAt: new Date().toISOString(),
+        logs: [`[dashboard] start ${id} · ${emailMasked}`],
+        child: null,
+        exitCode: null,
+      };
+      addOrderTasks.set(id, task);
 
-    const pushLog = (buf: Buffer) => {
-      const text = buf.toString("utf8");
-      for (const line of text.split(/\r?\n/)) {
-        if (!line.trim()) continue;
-        addOrderJob.logs.push(redactSecrets(line));
-        if (addOrderJob.logs.length > 800) {
-          addOrderJob.logs.splice(0, addOrderJob.logs.length - 800);
-        }
+      for (const f of [
+        `release-${id}.flag`,
+        `close-${id}.flag`,
+        `continue-${id}.flag`,
+        `show-${id}.flag`,
+        `hide-${id}.flag`,
+      ]) {
+        await fs.unlink(path.join(RUNTIME_DIR, f)).catch(() => {});
       }
-    };
-    proc.stdout?.on("data", pushLog);
-    proc.stderr?.on("data", pushLog);
-    proc.on("exit", (code) => {
-      addOrderJob.running = false;
-      addOrderJob.lastExitCode = code ?? 1;
-      addOrderJob.child = null;
-      addOrderJob.pid = null;
-      addOrderJob.logs.push(`[dashboard] exit=${code}`);
-      // 跑完即抹走 job 密文，減少落地時間
-      void secureWipeFile(ADD_ORDER_JOB_ENC);
-      void secureWipeFile(ADD_ORDER_JOB_LEGACY);
-    });
 
-    return sendJson(res, 200, { ok: true, pid: addOrderJob.pid });
+      const proc = spawn(process.execPath, [tsxCli, script], {
+        cwd: ROOT,
+        env: envForCheckoutChild({
+          ADD_ORDER_JOB_ENC: ADD_ORDER_JOB_ENC,
+          ADD_ORDER_KEY_PATH: ADD_ORDER_KEY,
+          ADD_ORDER_SESSION_ID: id,
+          ADD_ORDER_ACCOUNT_INDEX: String(i),
+        }),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      task.child = proc;
+      task.pid = proc.pid ?? null;
+
+      const pushLog = (buf: Buffer) => {
+        const text = buf.toString("utf8");
+        for (const line of text.split(/\r?\n/)) {
+          if (!line.trim()) continue;
+          task.logs.push(redactSecrets(line));
+          if (task.logs.length > 300) task.logs.splice(0, task.logs.length - 300);
+        }
+      };
+      proc.stdout?.on("data", pushLog);
+      proc.stderr?.on("data", pushLog);
+      proc.on("exit", (code) => {
+        task.running = false;
+        task.exitCode = code ?? 1;
+        task.child = null;
+        task.pid = null;
+        task.logs.push(`[dashboard] ${id} exit=${code}`);
+      });
+      created.push(id);
+      await new Promise((r) => setTimeout(r, 200));
+    }
+
+    return sendJson(res, 200, {
+      ok: true,
+      created,
+      tasks: await snapshotAddOrderTasks(),
+    });
   }
 
   sendJson(res, 404, { error: "not found" });
