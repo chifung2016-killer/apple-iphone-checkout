@@ -32,6 +32,14 @@ const LEGACY_CONFIG =
   "";
 const SESSION_ID = String(process.env.ADD_ORDER_SESSION_ID || "ao1").trim() || "ao1";
 const ACCOUNT_INDEX = Math.max(0, Number(process.env.ADD_ORDER_ACCOUNT_INDEX || "0") || 0);
+/** 同 Checkout Dashboard：並排鋪位用 */
+const WINDOW_TOTAL = Math.max(
+  1,
+  Number(process.env.ADD_ORDER_WINDOW_TOTAL || process.env.ADD_ORDER_ACCOUNT_COUNT || "1") || 1
+);
+/** 同 buy-iphone-17 CONFIG 預設 */
+const WINDOW_WIDTH = 960;
+const WINDOW_HEIGHT = 980;
 const STATUS_FILE = path.join(ROOT, "runtime", `status-${SESSION_ID}.json`);
 const SHOW_FLAG = path.join(ROOT, "runtime", `show-${SESSION_ID}.flag`);
 const HIDE_FLAG = path.join(ROOT, "runtime", `hide-${SESSION_ID}.flag`);
@@ -59,6 +67,36 @@ class CloseRequestedError extends Error {
 let activePage: Page | null = null;
 let activeBrowser: Browser | null = null;
 let windowHidden = true;
+/** 同 Checkout Dashboard 嘅鋪位大小（Open browser 用） */
+let windowBounds: { left: number; top: number; width: number; height: number } = {
+  left: 4,
+  top: 4,
+  width: WINDOW_WIDTH,
+  height: WINDOW_HEIGHT,
+};
+
+/** 同 Checkout Dashboard `computeWindowLayout` */
+function computeWindowLayout(
+  index: number,
+  total: number,
+  screenW: number,
+  screenH: number
+): { x: number; y: number; width: number; height: number } {
+  const n = Math.max(1, total);
+  const gap = 4;
+  const cols = n === 1 ? 1 : 2;
+  const rows = n <= 2 ? 1 : 2;
+  const width = Math.max(320, Math.floor((screenW - gap * (cols + 1)) / cols));
+  const height = Math.max(320, Math.floor((screenH - gap * (rows + 1)) / rows));
+  const col = index % cols;
+  const row = Math.floor(index / cols);
+  return {
+    x: gap + col * (width + gap),
+    y: gap + row * (height + gap),
+    width,
+    height,
+  };
+}
 
 async function flagExists(p: string): Promise<boolean> {
   try {
@@ -251,46 +289,45 @@ async function getPageWindowId(page: Page): Promise<number | null> {
   }
 }
 
-async function maximizeBrowserWindow(page: Page, browser: Browser): Promise<void> {
-  log("Open browser：還原／最大化視窗…");
+async function applyCheckoutWindowBounds(page: Page, minimized: boolean): Promise<void> {
+  const windowId = await getPageWindowId(page);
+  if (windowId == null) return;
+  const cdp = await page.context().newCDPSession(page);
   try {
-    await page.bringToFront().catch(() => {});
-    const windowId = await getPageWindowId(page);
-    if (windowId != null) {
-      const cdp = await page.context().newCDPSession(page);
-      await cdp.send("Browser.setWindowBounds", {
-        windowId,
-        bounds: { windowState: "normal" },
-      });
-      await new Promise((r) => setTimeout(r, 120));
-      const screen = await page
-        .evaluate(() => ({
-          aw: Math.max(window.screen?.availWidth || 0, 1280),
-          ah: Math.max(window.screen?.availHeight || 0, 720),
-        }))
-        .catch(() => ({ aw: 1920, ah: 1080 }));
-      await cdp
-        .send("Browser.setWindowBounds", {
-          windowId,
-          bounds: {
-            left: 0,
-            top: 0,
-            width: screen.aw,
-            height: screen.ah,
-            windowState: "normal",
-          },
+    await cdp.send("Browser.setWindowBounds", {
+      windowId,
+      bounds: {
+        ...windowBounds,
+        windowState: minimized ? "minimized" : "normal",
+      },
+    });
+    if (!minimized) {
+      await page
+        .setViewportSize({
+          width: Math.max(360, windowBounds.width - 16),
+          height: Math.max(400, windowBounds.height - 88),
         })
         .catch(() => {});
+      // 同 Checkout：先套鋪位再 maximize
       await cdp
         .send("Browser.setWindowBounds", {
           windowId,
           bounds: { windowState: "maximized" },
         })
         .catch(() => {});
-      await cdp.detach().catch(() => {});
-    } else {
-      log("Open browser：CDP 無 windowId，改用 Windows API");
     }
+  } finally {
+    await cdp.detach().catch(() => {});
+  }
+}
+
+async function maximizeBrowserWindow(page: Page, browser: Browser): Promise<void> {
+  log(
+    `Open browser：用 Checkout 尺寸 ${windowBounds.width}x${windowBounds.height} @ (${windowBounds.left},${windowBounds.top})`
+  );
+  try {
+    await page.bringToFront().catch(() => {});
+    await applyCheckoutWindowBounds(page, false);
   } catch (err) {
     log(`Open browser CDP 失敗：${err instanceof Error ? err.message : String(err)}`);
   }
@@ -301,6 +338,7 @@ async function maximizeBrowserWindow(page: Page, browser: Browser): Promise<void
     windowHidden: false,
     windowState: "maximized",
     message: "browser opened",
+    windowBounds,
   });
 }
 
@@ -645,64 +683,70 @@ function isGmailInboxUrl(url: string): boolean {
   );
 }
 
-/** 確保已喺 Gmail 收件箱 UI（登入後有時停喺中轉頁） */
-async function ensureGmailInbox(page: Page): Promise<void> {
-  if (!isGmailInboxUrl(page.url())) {
-    log("導向 Gmail 收件箱…");
+async function dismissGmailOverlays(page: Page): Promise<void> {
+  const labels = [
+    /^(Got it|我知道了|了解|確定|OK|Close|關閉|稍後|Not now|暫時不要)$/i,
+    /^(Accept all|全部接受)$/i,
+  ];
+  for (const re of labels) {
     await page
-      .goto("https://mail.google.com/mail/u/0/#inbox", {
-        waitUntil: "domcontentloaded",
-        timeout: 90_000,
-      })
+      .getByRole("button", { name: re })
+      .first()
+      .click({ timeout: 800 })
       .catch(() => {});
   }
-  // 處理「繼續」／帳戶選擇殘留
-  for (let i = 0; i < 8; i++) {
+}
+
+/** 確保已喺 Gmail 收件箱 UI（登入後有時停喺 /mail/u/0/ 中轉頁） */
+async function ensureGmailInbox(page: Page): Promise<void> {
+  const target = "https://mail.google.com/mail/u/0/#inbox";
+  const url0 = page.url();
+  // 即使已係 mail.google.com，都強制入 #inbox（避免停喺 /mail/u/0/）
+  if (!/#inbox\b/i.test(url0) || !isGmailInboxUrl(url0)) {
+    log("導向 Gmail 收件箱 #inbox…");
+    await page.goto(target, { waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
+  }
+  await dismissGmailOverlays(page);
+
+  for (let i = 0; i < 20; i++) {
     await throwIfStopped();
+    await syncWindowFlags().catch(() => {});
     const url = page.url();
     if (/accounts\.google\.com/i.test(url)) {
-      // 可能仲要撳繼續
       await page
         .getByRole("button", { name: /^(Next|下一步|繼續|Continue|我了解)$/i })
         .first()
         .click({ timeout: 1500 })
         .catch(() => {});
-      await page
-        .goto("https://mail.google.com/mail/u/0/#inbox", {
-          waitUntil: "domcontentloaded",
-          timeout: 60_000,
-        })
-        .catch(() => {});
+      await page.goto(target, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
     }
+    await dismissGmailOverlays(page);
+
     const search = page
       .locator(
-        'input[aria-label*="Search" i], input[aria-label*="搜尋" i], input[name="q"], form[role="search"] input'
+        'input[aria-label*="Search" i], input[aria-label*="搜尋" i], input[name="q"], form[role="search"] input, input[placeholder*="Search mail" i]'
       )
       .first();
     if ((await search.count().catch(() => 0)) > 0 && (await search.isVisible().catch(() => false))) {
       log(`已入 Gmail 收件箱：${page.url()}`);
       await writeStatus({ phase: "gmail_ready", message: "Gmail 已開啟", url: page.url() });
-      await sleep(800);
+      await sleep(600);
       return;
     }
-    // 左側 Inbox / 主要 都當入咗
-    const inboxUi = page.locator('div[role="main"], div.AO, div.nH').first();
+    const inboxUi = page.locator('div[role="main"], div.AO, table.F, div.Cp').first();
     if ((await inboxUi.count().catch(() => 0)) > 0) {
-      log(`已入 Gmail UI：${page.url()}`);
-      await sleep(800);
-      return;
+      // 有主體但未有搜尋欄：再 refresh 一次 hash
+      if (!/#inbox\b/i.test(page.url())) {
+        await page.goto(target, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+      } else {
+        log(`已入 Gmail UI：${page.url()}`);
+        await sleep(800);
+        return;
+      }
     }
     await sleep(700);
   }
-  // 最後再強制 refresh 一次
-  if (!isGmailInboxUrl(page.url())) {
-    await page
-      .goto("https://mail.google.com/mail/u/0/#inbox", {
-        waitUntil: "domcontentloaded",
-        timeout: 90_000,
-      })
-      .catch(() => {});
-  }
+  await page.goto(target, { waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
   await sleep(1500);
   log(`Gmail 現況：${page.url()}`);
 }
@@ -1265,59 +1309,185 @@ async function gmailLogin(page: Page, email: string, password: string): Promise<
 }
 
 async function gmailSearchAndOpenOrderEmail(page: Page): Promise<void> {
-  await ensureGmailInbox(page);
-  log("搜尋郵件：出貨…");
-  await writeStatus({ phase: "search_email", message: "搜尋「出貨」郵件…" });
+  const keyword = "出貨";
+  log(`搜尋郵件：${keyword}…`);
+  await writeStatus({
+    phase: "search_email",
+    message: `搜尋「${keyword}」郵件…`,
+    url: page.url(),
+  });
 
-  const searchSelectors = [
-    'input[aria-label*="Search" i]',
-    'input[aria-label*="搜尋" i]',
-    'input[name="q"]',
-    'form[role="search"] input',
-    'input[placeholder*="Search" i]',
-    'input[placeholder*="搜尋" i]',
-  ];
-  let search = page.locator(searchSelectors.join(", ")).first();
-  const searchDeadline = Date.now() + 45_000;
-  while (Date.now() < searchDeadline) {
+  // 唔好死等 inbox 載完；Gmail 頂欄搜尋通常早過郵件列表出現
+  if (!/mail\.google\.com/i.test(page.url())) {
+    await page
+      .goto("https://mail.google.com/mail/u/0/#inbox", {
+        waitUntil: "commit",
+        timeout: 60_000,
+      })
+      .catch(() => {});
+  }
+  await dismissGmailOverlays(page);
+
+  const searchBox = () =>
+    page
+      .locator(
+        [
+          'input[aria-label*="Search mail" i]',
+          'input[aria-label*="Search" i]',
+          'input[aria-label*="搜尋郵件" i]',
+          'input[aria-label*="搜尋" i]',
+          'input[name="q"]',
+          'form[role="search"] input',
+          'div[role="search"] input',
+          'input[placeholder*="Search" i]',
+          'input[placeholder*="搜尋" i]',
+        ].join(", ")
+      )
+      .first();
+
+  const triggerHashSearch = async (): Promise<boolean> => {
+    await page
+      .evaluate((q) => {
+        const next = `#search/${encodeURIComponent(q)}`;
+        // 強制觸發 hashchange（即使已經喺 search）
+        if (location.hash === next) location.hash = "#inbox";
+        location.hash = next;
+      }, keyword)
+      .catch(() => {});
+    await sleep(900);
+    return /#search\//i.test(page.url());
+  };
+
+  const typeInSearchBox = async (): Promise<boolean> => {
+    // Gmail 快捷鍵「/」聚焦搜尋
+    await page.keyboard.press("/").catch(() => {});
+    await sleep(350);
+    let box = searchBox();
+    if (!(await box.isVisible().catch(() => false))) {
+      // 再試撳放大鏡／搜尋掣
+      await page
+        .locator('button[aria-label*="Search" i], button[aria-label*="搜尋" i], div[aria-label*="Search" i]')
+        .first()
+        .click({ timeout: 1500 })
+        .catch(() => {});
+      await sleep(400);
+      box = searchBox();
+    }
+    if (!(await box.isVisible().catch(() => false))) return false;
+
+    await box.click({ timeout: 2500 }).catch(() => {});
+    await box.fill("").catch(() => {});
+    const filled = await box
+      .fill(keyword)
+      .then(() => true)
+      .catch(() => false);
+    if (!filled) {
+      await page.keyboard.press("Control+A").catch(() => {});
+      await page.keyboard.type(keyword, { delay: 40 }).catch(() => {});
+    }
+    await page.keyboard.press("Enter");
+    log(`已喺搜尋欄輸入「${keyword}」並 Enter`);
+    await sleep(1500);
+    return /#search\//i.test(page.url()) || true;
+  };
+
+  let ok = false;
+  for (let attempt = 1; attempt <= 10 && !ok; attempt++) {
     await throwIfStopped();
-    if ((await search.count().catch(() => 0)) > 0 && (await search.isVisible().catch(() => false))) {
+    await syncWindowFlags().catch(() => {});
+    await dismissGmailOverlays(page);
+    log(`執行搜尋「${keyword}」（第 ${attempt}/10 次）… URL=${page.url()}`);
+
+    // 1) 優先搜尋欄（唔用 full page.goto，避免卡 #inbox loading）
+    if (await typeInSearchBox()) {
+      ok = true;
       break;
     }
-    await page.keyboard.press("/").catch(() => {});
-    await sleep(800);
-    search = page.locator(searchSelectors.join(", ")).first();
+    // 2) SPA hash（唔 reload）
+    if (await triggerHashSearch()) {
+      log(`已用 hash 搜尋：${page.url()}`);
+      ok = true;
+      break;
+    }
+    await sleep(700);
   }
-  await search.waitFor({ state: "visible", timeout: 15_000 });
-  await search.click({ timeout: 3000 });
-  await search.fill("");
-  await search.fill("出貨");
-  await page.keyboard.press("Enter");
-  await sleep(2500);
+
+  if (!ok || !/#search\//i.test(page.url())) {
+    // 最後先用 commit（唔等 networkidle，減少卡死）
+    const searchUrl = `https://mail.google.com/mail/u/0/#search/${encodeURIComponent(keyword)}`;
+    log(`fallback goto：${searchUrl}`);
+    await page.goto(searchUrl, { waitUntil: "commit", timeout: 45_000 }).catch(() => {});
+    await sleep(1500);
+    if (!/#search\//i.test(page.url())) {
+      await triggerHashSearch();
+    }
+  }
+
+  // 等到真正進入 search 結果
+  const searchDeadline = Date.now() + 40_000;
+  while (Date.now() < searchDeadline && !/#search\//i.test(page.url())) {
+    await throwIfStopped();
+    await syncWindowFlags().catch(() => {});
+    log(`仍未入 search（而家 ${page.url()}），再試輸入…`);
+    await typeInSearchBox();
+    await triggerHashSearch();
+    await sleep(1000);
+  }
+  if (!/#search\//i.test(page.url())) {
+    throw new Error(`搜尋「${keyword}」失敗，仍停喺：${page.url()}`);
+  }
+  log(`已進入搜尋結果：${page.url()}`);
+  await writeStatus({
+    phase: "search_email",
+    message: `已搜尋「${keyword}」`,
+    url: page.url(),
+  });
+  await sleep(1800);
+  await dismissGmailOverlays(page);
 
   const rows = page.locator(
     "tr.zA, div[role='main'] tr.zA, div.Cp tr.zA, div[role='list'] div[role='listitem']"
   );
-  await rows.first().waitFor({ state: "visible", timeout: 45_000 });
+  const rowDeadline = Date.now() + 45_000;
+  let ready = false;
+  while (Date.now() < rowDeadline) {
+    await throwIfStopped();
+    await syncWindowFlags().catch(() => {});
+    if ((await rows.count().catch(() => 0)) > 0) {
+      ready = true;
+      break;
+    }
+    // 空結果：再觸發一次 hash search
+    if (Date.now() % 8000 < 1200) {
+      await triggerHashSearch();
+    }
+    await sleep(800);
+  }
+  if (!ready) {
+    throw new Error(`Gmail 搜尋「${keyword}」搵唔到郵件列 — 請 Open browser 確認`);
+  }
 
-  // 優先揀正文／標題含「出貨」嘅列
   let clicked = false;
   const n = await rows.count().catch(() => 0);
   for (let i = 0; i < Math.min(n, 40); i++) {
     await throwIfStopped();
     const row = rows.nth(i);
     const text = ((await row.innerText().catch(() => "")) || "").replace(/\s+/g, " ");
-    if (!text.includes("出貨")) continue;
+    if (!text.includes(keyword)) continue;
     await row.click({ timeout: 5000 });
-    log(`已開啟含「出貨」嘅郵件：${text.slice(0, 80)}`);
+    log(`已開啟含「${keyword}」嘅郵件：${text.slice(0, 80)}`);
     clicked = true;
     break;
   }
   if (!clicked) {
     await rows.first().click({ timeout: 5000 });
-    log("搜尋結果未見「出貨」字樣，改開第一封");
+    log(`搜尋結果未見「${keyword}」字樣，改開第一封`);
   }
-  await writeStatus({ phase: "email_opened", message: "已開啟「出貨」相關郵件" });
+  await writeStatus({
+    phase: "email_opened",
+    message: `已開啟「${keyword}」相關郵件`,
+    url: page.url(),
+  });
   await sleep(1500);
 }
 
@@ -1458,7 +1628,11 @@ async function processOneAccount(
   });
   const context = await browser.newContext({
     locale: "zh-HK",
-    viewport: { width: 1280, height: 900 },
+    timezoneId: "Asia/Hong_Kong",
+    viewport: {
+      width: Math.max(360, WINDOW_WIDTH - 16),
+      height: Math.max(400, WINDOW_HEIGHT - 88),
+    },
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
   });
@@ -1469,13 +1643,38 @@ async function processOneAccount(
   activePage = page;
   activeBrowser = browser;
   startFlagPoller();
+
+  // 同 Checkout Dashboard：讀螢幕後按總數鋪位
+  const screen = await page
+    .evaluate(() => ({
+      w: window.screen.availWidth || 1920,
+      h: window.screen.availHeight || 1080,
+    }))
+    .catch(() => ({ w: 1920, h: 1080 }));
+  const layout = computeWindowLayout(ACCOUNT_INDEX, WINDOW_TOTAL, screen.w, screen.h);
+  windowBounds = {
+    left: layout.x,
+    top: layout.y,
+    width: layout.width,
+    height: layout.height,
+  };
+  await page
+    .setViewportSize({
+      width: Math.max(360, windowBounds.width - 16),
+      height: Math.max(400, windowBounds.height - 88),
+    })
+    .catch(() => {});
+  log(
+    `視窗鋪位（同 Checkout）：${windowBounds.width}x${windowBounds.height} @ (${windowBounds.left},${windowBounds.top}) · ${ACCOUNT_INDEX + 1}/${WINDOW_TOTAL}`
+  );
+  await applyCheckoutWindowBounds(page, true).catch(() => {});
   await minimizeBrowserWindow(page, browser);
   log("瀏覽器已隱藏（minimized）");
 
   const runSteps = async () => {
     await writeStatus({ phase: "gmail_login", message: "Gmail 登入中…" });
     await gmailLogin(page, account.email, account.password);
-    if (windowHidden) await minimizeBrowserWindow(page, browser);
+    // 登入後即刻搜「出貨」——唔好先死等 #inbox 載完／再 minimize（會卡住 loading）
     await writeStatus({ phase: "search_email", message: "搜尋訂單郵件…" });
     await gmailSearchAndOpenOrderEmail(page);
     const orderPage = await clickOrderStatusInEmail(page, context);
@@ -1529,6 +1728,7 @@ async function launchBrowser(): Promise<Browser> {
     args: [
       "--disable-blink-features=AutomationControlled",
       "--disable-features=IsolateOrigins,site-per-process",
+      `--window-size=${WINDOW_WIDTH},${WINDOW_HEIGHT}`,
       "--start-minimized",
     ],
     ignoreDefaultArgs: ["--enable-automation"] as string[],

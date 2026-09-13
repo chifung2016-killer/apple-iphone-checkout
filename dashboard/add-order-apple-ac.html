@@ -363,8 +363,13 @@
       startPolling();
     });
 
-    $("btnClearLogs").addEventListener("click", () => {
+    $("btnClearLogs").addEventListener("click", async () => {
       logsEl.textContent = "";
+      try {
+        await fetch("/api/add-order-apple-ac/logs/clear", { method: "POST" });
+      } catch {
+        /* ignore */
+      }
     });
 
     $("taskList").addEventListener("click", async (e) => {

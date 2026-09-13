@@ -1729,6 +1729,13 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     });
   }
 
+  if (pathname === "/api/add-order-apple-ac/logs/clear" && req.method === "POST") {
+    for (const t of addOrderTasks.values()) {
+      t.logs = [];
+    }
+    return sendJson(res, 200, { ok: true, logs: [] });
+  }
+
   if (pathname === "/api/add-order-apple-ac/accounts" && req.method === "GET") {
     await ensureRuntimeDir();
     let text = "";
@@ -1923,6 +1930,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
           ADD_ORDER_KEY_PATH: ADD_ORDER_KEY,
           ADD_ORDER_SESSION_ID: id,
           ADD_ORDER_ACCOUNT_INDEX: String(i),
+          ADD_ORDER_WINDOW_TOTAL: String(accounts.length),
         }),
         stdio: ["ignore", "pipe", "pipe"],
       });
