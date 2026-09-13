@@ -1862,10 +1862,15 @@ async function pollIphone18GotoUntilNextPage(page: Page): Promise<boolean> {
   return false;
 }
 
-/** iPhone 18 加購：先試 CONFIG slug；出錯／失敗就轉 goto + refresh */
+/** iPhone 18 加購：先試 CONFIG slug；頁面真係壞先轉 goto + refresh */
 async function addIphone18WithGotoFallback(page: Page): Promise<boolean> {
   // 已改走 goto：直接輪詢 goto
   if (iphone18GotoPages.has(page) || /\/goto\/buy_iphone\/iphone_18/i.test(page.url())) {
+    return pollIphone18GotoUntilNextPage(page);
+  }
+
+  if (await isIphone18BuyPageError(page)) {
+    console.warn("  偵測到 iPhone 18 設定頁錯誤 → 立即轉 goto");
     return pollIphone18GotoUntilNextPage(page);
   }
 
@@ -1873,23 +1878,19 @@ async function addIphone18WithGotoFallback(page: Page): Promise<boolean> {
     isIphone18ConfiguredSlugUrl(page.url()) ||
     isIphone18ConfiguredSlugUrl(CONFIG.buyUrl);
 
-  if (await isIphone18BuyPageError(page)) {
-    console.warn("  偵測到 iPhone 18 設定頁錯誤 → 立即轉 goto");
-    return pollIphone18GotoUntilNextPage(page);
-  }
-
   await ensureTradeInAndAppleCareForAddToBag(page).catch(() => {});
   const first = await keepClickingContinueUntilNextPage(page, {
     maxMs: onSlug ? 20_000 : 35_000,
   });
   if (first) return true;
 
-  if (onSlug || (await isIphone18BuyPageError(page))) {
-    console.warn("  iPhone 18 設定 slug 加購失敗 → 轉 goto 並 refresh");
+  if (await isIphone18BuyPageError(page)) {
+    console.warn("  iPhone 18 設定頁加購失敗且變成錯誤頁 → 轉 goto 並 refresh");
     return pollIphone18GotoUntilNextPage(page);
   }
 
-  // 非 slug（已係 goto／一般 buy）：繼續喺當頁 refresh 邏輯由外層處理
+  // 正常 slug 只係今輪未入袋：交俾外層 refresh，唔好鎖死喺 goto
+  console.warn("  iPhone 18 今輪未入下一頁，留喺設定 slug 由外層再 refresh");
   return false;
 }
 
@@ -3394,13 +3395,12 @@ async function addToBagAndOpenBag(page: Page): Promise<void> {
     }
 
     console.log(`  refresh 產品頁…`);
-    // iPhone 18：若設定頁已出錯／已切 goto，走 goto 輪詢
+    // iPhone 18：只有已切 goto／而家頁真係錯誤，先走 goto 輪詢（唔好淨因為 CONFIG 係 slug 就強制 goto）
     if (isIphone18Task()) {
       if (
         iphone18GotoPages.has(page) ||
         /\/goto\/buy_iphone\/iphone_18/i.test(page.url()) ||
-        (await isIphone18BuyPageError(page)) ||
-        isIphone18ConfiguredSlugUrl(CONFIG.buyUrl)
+        (await isIphone18BuyPageError(page))
       ) {
         const gotoOk = await addIphone18WithGotoFallback(page);
         if (gotoOk) {
@@ -7492,107 +7492,208 @@ async function clickCheckYourOrder(page: Page): Promise<boolean> {
   ];
   const needles = CHECK_ORDER_NEEDLES;
 
-  // Apple Pay Billing（任何 secureN ?_s=Billing*）：重試撳直到去到 Review
-  if (selectsApplePayAtBilling()) {
-    console.log(
-      `步驟：Billing 強化重試撳「檢查你的訂單」（URL=${page.url()}）`
-    );
-    const deadline = Date.now() + 32_000;
-    let clicks = 0;
+  /**
+   * 所有 Delivery method（Billing-init）：
+   * 撳一次 → 等 loading logo 消失 → 若仍喺 Billing 再撳一次 → 重複直到下一頁
+   */
+  console.log(
+    `步驟：Billing「檢查你的訂單」（撳一次→等 loading→再試）｜${page.url()}`
+  );
+  const deadline = Date.now() + 60_000;
+  let clicks = 0;
 
-    while (Date.now() < deadline) {
-      await throwIfReleased();
+  while (Date.now() < deadline) {
+    await throwIfReleased();
 
-      if (isReviewPage(page.url())) {
-        console.log(`  已到 Review（「檢查你的訂單」累計撳 ${clicks} 次）`);
+    if (isReviewPage(page.url())) {
+      console.log(`  已到 Review（「檢查你的訂單」累計撳 ${clicks} 次）`);
+      return true;
+    }
+    if (!isBillingPage(page.url()) && clicks > 0) {
+      console.log(`  已離開 Billing → ${page.url()}`);
+      return true;
+    }
+
+    // 等上一次 loading 完先再撳
+    if (await isCheckoutLoadingVisible(page)) {
+      console.log("  仍見 loading，先等消失…");
+      await waitForCheckoutLoadingSettled(page, { timeoutMs: 18_000 });
+      if (isReviewPage(page.url()) || (!isBillingPage(page.url()) && clicks > 0)) {
         return true;
       }
-
-      // 1) 強化 DOM（含 disabled／data-autom）
-      let hit = await clickCheckoutButtonByDomText(page, needles, {
-        allowDisabled: true,
-      });
-
-      // 2) sticky / autom / submit
-      if (!hit) {
-        const autom = [
-          page.locator('[data-autom="continueButton"], [data-autom*="continue" i]').filter({
-            hasText: CHECK_ORDER_RE,
-          }),
-          page.locator(
-            "#rs-checkout-continue-button-bottom, #rs-checkout-continue-button-top, .rs-checkout-continuebutton button, .rs-checkout-continuebutton a"
-          ),
-          page.locator('button[type="submit"]').filter({ hasText: CHECK_ORDER_RE }),
-          page.getByRole("button", { name: CHECK_ORDER_RE }),
-          page.getByRole("link", { name: CHECK_ORDER_RE }),
-          page.getByText(CHECK_ORDER_RE).first(),
-        ];
-        for (const loc of autom) {
-          const el = loc.first();
-          if ((await el.count().catch(() => 0)) === 0) continue;
-          hit = await el
-            .click({ force: true, timeout: 1000 })
-            .then(() => true)
-            .catch(async () =>
-              el
-                .evaluate((n) => {
-                  const node = n as HTMLElement;
-                  (node.closest("button") || node.closest("a") || node).click();
-                })
-                .then(() => true)
-                .catch(() => false)
-            );
-          if (hit) break;
-        }
-      }
-
-      // 3) 一般 once 路徑（短 wait）
-      if (!hit) {
-        hit = await clickCheckoutCtaOnce(page, "檢查你的訂單", patterns, needles, {
-          waitMs: 600,
-          pollMs: 40,
-        });
-      }
-
-      if (hit) {
-        clicks += 1;
-        console.log(`  已撳「檢查你的訂單」（第 ${clicks} 次重試）`);
-        await withReleaseCheck(
-          page
-            .waitForURL(
-              (url) => isReviewPage(url.toString()) || !isBillingPage(url.toString()),
-              { timeout: 900 }
-            )
-            .catch(() => {})
-        );
-        if (isReviewPage(page.url())) {
-          console.log("  已到達 Review");
-          return true;
-        }
-      }
-
-      await sleepCheckingRelease(hit ? 220 : 160);
     }
 
-    if (isReviewPage(page.url())) return true;
-    console.warn(
-      `  Billing 仍未到 Review（已撳「檢查你的訂單」${clicks} 次）：${page.url()}`
+    let hit = await clickCheckoutButtonByDomText(page, needles, {
+      allowDisabled: false,
+    });
+    if (!hit) {
+      const autom = [
+        page.locator('[data-autom="continueButton"], [data-autom*="continue" i]').filter({
+          hasText: CHECK_ORDER_RE,
+        }),
+        page.locator(
+          "#rs-checkout-continue-button-bottom, #rs-checkout-continue-button-top, .rs-checkout-continuebutton button, .rs-checkout-continuebutton a"
+        ),
+        page.locator('button[type="submit"]').filter({ hasText: CHECK_ORDER_RE }),
+        page.getByRole("button", { name: CHECK_ORDER_RE }),
+        page.getByRole("link", { name: CHECK_ORDER_RE }),
+        page.getByText(CHECK_ORDER_RE).first(),
+      ];
+      for (const loc of autom) {
+        const el = loc.first();
+        if ((await el.count().catch(() => 0)) === 0) continue;
+        const disabled = await el.isDisabled().catch(() => false);
+        if (disabled) continue;
+        hit = await el
+          .click({ force: true, timeout: 1200 })
+          .then(() => true)
+          .catch(async () =>
+            el
+              .evaluate((n) => {
+                const node = n as HTMLElement;
+                (node.closest("button") || node.closest("a") || node).click();
+              })
+              .then(() => true)
+              .catch(() => false)
+          );
+        if (hit) break;
+      }
+    }
+    if (!hit) {
+      hit = await clickCheckoutCtaOnce(page, "檢查你的訂單", patterns, needles, {
+        waitMs: 900,
+        pollMs: 60,
+      });
+    }
+
+    if (!hit) {
+      console.warn("  今輪揾唔到／撳唔到「檢查你的訂單」，稍後再試…");
+      await sleepCheckingRelease(500);
+      continue;
+    }
+
+    clicks += 1;
+    console.log(`  已撳「檢查你的訂單」第 ${clicks} 次 — 等 loading…`);
+    await waitForCheckoutLoadingSettled(page, { timeoutMs: 20_000 });
+
+    await withReleaseCheck(
+      page
+        .waitForURL(
+          (url) => isReviewPage(url.toString()) || !isBillingPage(url.toString()),
+          { timeout: 2_500 }
+        )
+        .catch(() => {})
     );
-    return clicks > 0 && !isBillingPage(page.url());
+
+    if (isReviewPage(page.url())) {
+      console.log("  loading 完後已到達 Review");
+      return true;
+    }
+    if (!isBillingPage(page.url())) {
+      console.log(`  loading 完後已離開 Billing → ${page.url()}`);
+      return true;
+    }
+    console.log("  loading 已消失但仍喺 Billing — 會再撳一次「檢查你的訂單」");
   }
 
-  return doubleConfirmCheckoutCta(
-    page,
-    "檢查你的訂單",
-    patterns,
-    needles,
-    {
-      onceOnly: false,
-      stillOnStep: (url) => isBillingPage(url) && !isReviewPage(url),
-      waitMs: 25_000,
-      gapMs: 600,
-    }
+  if (isReviewPage(page.url())) return true;
+  console.warn(
+    `  Billing 仍未到下一頁（已撳「檢查你的訂單」${clicks} 次）：${page.url()}`
   );
+  return clicks > 0 && !isBillingPage(page.url());
+}
+
+/** Billing 頁是否仲有 loading logo／spinner */
+async function isCheckoutLoadingVisible(page: Page): Promise<boolean> {
+  return page
+    .evaluate(() => {
+      const sels = [
+        ".rs-loader",
+        ".rs-waitindicator",
+        ".as-spinner",
+        ".spinner",
+        '[aria-busy="true"]',
+        ".form-mask",
+        ".rs-checkout-loader",
+        'div[role="progressbar"]',
+        ".progress-bar",
+      ];
+      const visible = (el: Element) => {
+        const style = window.getComputedStyle(el);
+        if (
+          style.display === "none" ||
+          style.visibility === "hidden" ||
+          Number(style.opacity) === 0
+        ) {
+          return false;
+        }
+        const r = el.getBoundingClientRect();
+        return r.width > 2 && r.height > 2;
+      };
+      for (const sel of sels) {
+        for (const el of document.querySelectorAll(sel)) {
+          if (visible(el)) return true;
+        }
+      }
+      for (const el of document.querySelectorAll("[class]")) {
+        const cls = String((el as HTMLElement).className || "");
+        if (!/loading|spinner|waitindicator|busy/i.test(cls)) continue;
+        if (visible(el)) return true;
+      }
+      const btns = document.querySelectorAll(
+        '[data-autom="continueButton"], #rs-checkout-continue-button-bottom, #rs-checkout-continue-button-top, .rs-checkout-continuebutton button'
+      );
+      for (const btn of btns) {
+        if (
+          btn.getAttribute("aria-busy") === "true" ||
+          /\b(loading|busy|pending)\b/i.test(String((btn as HTMLElement).className || ""))
+        ) {
+          if (visible(btn)) return true;
+        }
+        if (btn.querySelector(".spinner, .rs-loader, .rs-waitindicator")) {
+          if (visible(btn)) return true;
+        }
+      }
+      return false;
+    })
+    .catch(() => false);
+}
+
+/** 撳完 CTA 後：等 loading 出現（可選）再等消失 */
+async function waitForCheckoutLoadingSettled(
+  page: Page,
+  opts?: { timeoutMs?: number }
+): Promise<void> {
+  const timeoutMs = opts?.timeoutMs ?? 20_000;
+  const deadline = Date.now() + timeoutMs;
+
+  // 畀少少時間等 loading 出現
+  const appearUntil = Date.now() + 1_200;
+  let saw = false;
+  while (Date.now() < appearUntil) {
+    await throwIfReleased();
+    if (isReviewPage(page.url()) || !isBillingPage(page.url())) return;
+    if (await isCheckoutLoadingVisible(page)) {
+      saw = true;
+      break;
+    }
+    await sleepCheckingRelease(80);
+  }
+  if (saw) console.log("  見到 loading logo，等佢消失…");
+
+  while (Date.now() < deadline) {
+    await throwIfReleased();
+    if (isReviewPage(page.url()) || !isBillingPage(page.url())) return;
+    if (!(await isCheckoutLoadingVisible(page))) {
+      await sleepCheckingRelease(280);
+      if (!(await isCheckoutLoadingVisible(page))) {
+        if (saw) console.log("  loading logo 已消失");
+        return;
+      }
+    }
+    await sleepCheckingRelease(120);
+  }
+  console.warn("  等 loading 消失逾時，繼續下一步");
 }
 
 async function scrapeEstimatedDeliveryText(page: Page): Promise<string | null> {
@@ -7679,7 +7780,9 @@ async function completeDeliveryApplePayReview(
   session?: BrowserSession
 ): Promise<void> {
   // 任何 secureN 嘅 /shop/checkout?_s=Review 或 /shop/apw/checkout?_s=Review*
-  console.log(`步驟：Review 強制重試撳主 CTA（URL=${page.url()}）`);
+  console.log(
+    `步驟：Review — 捲去頁底一次，再撳一次「使用Apple Pay繼續」（URL=${page.url()}）`
+  );
 
   // 等 Review URL 出現
   if (!isReviewPage(page.url())) {
@@ -7690,55 +7793,43 @@ async function completeDeliveryApplePayReview(
     );
   }
 
-  if (session && isReviewPage(page.url())) {
+  if (!isReviewPage(page.url())) {
+    throw new StepError("使用Apple Pay繼續", `未到達 Review 頁：${page.url()}`);
+  }
+
+  if (session) {
     await revealAndEnlargeBrowser(session).catch(() => {});
   }
 
-  const deadline = Date.now() + 45_000;
-  let clicks = 0;
-  let sawReview = isReviewPage(page.url());
+  console.log("  Review：捲去頁底一次…");
+  await scrollPageToBottom(page);
+  await sleepCheckingRelease(350);
 
-  while (Date.now() < deadline) {
-    await throwIfReleased();
-    const onReview = isReviewPage(page.url());
-    if (onReview) sawReview = true;
-
-    let got = false;
-    if (onReview) {
-      got = await clickReviewPagePrimaryCta(page);
-    }
-    if (!got) {
-      got = await clickApplePayContinueFast(page, {
-        waitMs: onReview ? 1000 : 600,
-        pollMs: 15,
-        hammer: true,
-      });
-    }
-    if (got) {
-      clicks += 1;
-      console.log(`  已撳 Review 主 CTA（第 ${clicks} 次）`);
-    }
-
-    if (sawReview && !isReviewPage(page.url()) && clicks > 0) {
-      console.log("  已離開 Review");
-      break;
-    }
-    if (onReview) {
-      await sleepCheckingRelease(120);
-      continue;
-    }
-    if (isBillingPage(page.url())) {
-      await sleepCheckingRelease(160);
-      continue;
-    }
-    if (clicks > 0) break;
-    await sleepCheckingRelease(140);
+  console.log("  Review：撳一次「使用Apple Pay繼續」…");
+  let clicked = await clickReviewPagePrimaryCta(page);
+  if (!clicked) {
+    clicked = await clickApplePayContinueFast(page, {
+      waitMs: 6_000,
+      pollMs: 80,
+      hammer: false,
+    });
   }
 
-  if (clicks === 0) {
+  if (!clicked) {
     throw new StepError("使用Apple Pay繼續", "Review 頁撳唔到主 CTA（使用Apple Pay繼續）。");
   }
-  console.log(`  Review CTA 完成（重試撳咗 ${clicks} 次）`);
+  console.log("  已撳「使用Apple Pay繼續」一次");
+
+  await withReleaseCheck(
+    page
+      .waitForURL((url) => !isReviewPage(url.toString()), { timeout: 12_000 })
+      .catch(() => {})
+  );
+  if (!isReviewPage(page.url())) {
+    console.log(`  已離開 Review → ${page.url()}`);
+  } else {
+    console.warn("  撳完仍喺 Review（可能等 Apple Pay sheet／人手確認）");
+  }
 
   const eta = await scrapeEstimatedDeliveryText(page).catch(() => null);
   if (session) {
