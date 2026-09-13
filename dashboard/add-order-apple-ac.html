@@ -279,11 +279,12 @@
 
     function renderTasks(tasks) {
       const box = $("taskList");
-      if (!tasks.length) {
+      const list = (tasks || []).filter((t) => !/^closed$/i.test(String(t.phase || "")));
+      if (!list.length) {
         box.innerHTML = '<p class="hint">未有 task。填 Gmail 後撳 Start。</p>';
         return;
       }
-      box.innerHTML = tasks
+      box.innerHTML = list
         .map((t) => {
           const pill = phasePill(t.phase);
           const captcha = /waiting_captcha/i.test(String(t.phase || ""));
@@ -373,10 +374,22 @@
       const act = btn.getAttribute("data-act");
       if (!id || !act) return;
       btn.disabled = true;
+      const card = btn.closest("article.task-card");
       try {
-        await fetch(`/api/add-order-apple-ac/tasks/${encodeURIComponent(id)}/${act}`, {
-          method: "POST",
-        });
+        const res = await fetch(
+          `/api/add-order-apple-ac/tasks/${encodeURIComponent(id)}/${act}`,
+          { method: "POST" }
+        );
+        const data = await res.json().catch(() => ({}));
+        if (act === "close") {
+          if (card) card.remove();
+          if (Array.isArray(data.tasks)) renderTasks(data.tasks);
+          else if (!$("taskList").querySelector("article.task-card")) {
+            $("taskList").innerHTML = '<p class="hint">未有 task。填 Gmail 後撳 Start。</p>';
+          }
+        } else if (Array.isArray(data.tasks)) {
+          renderTasks(data.tasks);
+        }
         setTimeout(refreshStatus, 300);
       } finally {
         setTimeout(() => {

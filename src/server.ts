@@ -109,6 +109,8 @@ async function snapshotAddOrderTasks() {
   const tasks = [];
   for (const t of addOrderTasks.values()) {
     const st = await readAddOrderStatus(t.id);
+    const phase = String(st?.phase || (t.running ? "running" : "idle"));
+    if (/^closed$/i.test(phase) && !t.running) continue;
     tasks.push({
       id: t.id,
       emailMasked: t.emailMasked || st?.emailMasked || "—",
@@ -116,7 +118,7 @@ async function snapshotAddOrderTasks() {
       pid: t.pid,
       startedAt: t.startedAt,
       exitCode: t.exitCode,
-      phase: st?.phase || (t.running ? "running" : "idle"),
+      phase,
       message: st?.message || "",
       windowHidden: st?.windowHidden !== false,
       logs: t.logs.slice(-80).map(redactSecrets),
@@ -229,8 +231,66 @@ function killProc(proc: ChildProcess) {
     spawn("taskkill", ["/pid", String(proc.pid), "/T", "/F"], {
       stdio: "ignore",
       shell: true,
+      windowsHide: true,
     });
   }
+}
+
+async function forceCloseAddOrderTask(id: string): Promise<void> {
+  const nid = String(id || "").trim();
+  await ensureRuntimeDir();
+  await fs.writeFile(
+    path.join(RUNTIME_DIR, `close-${nid}.flag`),
+    new Date().toISOString(),
+    "utf8"
+  );
+  const t = addOrderTasks.get(nid);
+  if (t?.child) {
+    killProc(t.child);
+    // Windows 再補一刀
+    if (process.platform === "win32" && t.pid) {
+      spawn("taskkill", ["/pid", String(t.pid), "/T", "/F"], {
+        stdio: "ignore",
+        shell: true,
+        windowsHide: true,
+      });
+    }
+  }
+  if (t) {
+    t.running = false;
+    t.child = null;
+    t.pid = null;
+    t.exitCode = 0;
+    t.logs.push(`[dashboard] Close ${nid}`);
+  }
+  try {
+    const stPath = path.join(RUNTIME_DIR, `status-${nid}.json`);
+    let prev: Record<string, unknown> = {};
+    try {
+      prev = JSON.parse(await fs.readFile(stPath, "utf8")) as Record<string, unknown>;
+    } catch {
+      /* empty */
+    }
+    await fs.writeFile(
+      stPath,
+      JSON.stringify(
+        {
+          ...prev,
+          phase: "closed",
+          message: "closed",
+          windowHidden: true,
+          updatedAt: new Date().toISOString(),
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+  } catch {
+    /* ignore */
+  }
+  // 即刻由 Tasks 列表移除（唔等 process）
+  addOrderTasks.delete(nid);
 }
 
 async function isDismissedBrowser(id: string): Promise<boolean> {
@@ -1705,7 +1765,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
   if (pathname === "/api/add-order-apple-ac/accounts/clear" && req.method === "POST") {
     await ensureRuntimeDir();
     for (const id of [...addOrderTasks.keys()]) {
-      killAddOrderTask(id);
+      await forceCloseAddOrderTask(id);
     }
     addOrderTasks.clear();
     await secureWipeFile(GMAIL_ACCOUNTS_ENC);
@@ -1784,8 +1844,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
       }
     }
     if (act === "close") {
-      const t = addOrderTasks.get(id);
-      if (t?.child) killProc(t.child);
+      await forceCloseAddOrderTask(id);
     }
     return sendJson(res, 200, {
       ok: true,

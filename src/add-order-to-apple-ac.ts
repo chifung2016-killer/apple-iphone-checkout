@@ -341,6 +341,18 @@ function stopFlagPoller(): void {
 }
 
 async function syncWindowFlags(): Promise<void> {
+  // Close：任何時候都即關
+  if (await flagExists(CLOSE_FLAG)) {
+    await fs.unlink(CLOSE_FLAG).catch(() => {});
+    log("Close：收到關閉要求，結束 task");
+    await writeStatus({ phase: "closed", message: "closed", windowHidden: true });
+    try {
+      await activeBrowser?.close();
+    } catch {
+      /* ignore */
+    }
+    process.exit(0);
+  }
   if (!activePage || activePage.isClosed() || !activeBrowser) return;
   if (await consumeFlag(SHOW_FLAG)) {
     await maximizeBrowserWindow(activePage, activeBrowser);
@@ -821,15 +833,14 @@ async function waitForManualCaptcha(
 ): Promise<void> {
   if (isGmailInboxUrl(page.url())) return;
   if (!(await isCaptchaChallengePage(page))) return;
-  log("Google 要輸入數字+英文字母驗證碼");
-  await maximizeBrowserWindow(page, browser);
+  log("Google 要輸入數字+英文字母驗證碼（保持隱藏；要睇就撳 Open browser）");
+  // 登入過程唔自動開窗
   await writeStatus({
     phase: "waiting_captcha",
-    message: "嘗試自動 OCR／請人手輸入驗證碼，完成後可撳 Continue",
-    windowHidden: false,
+    message: "請 Open browser 人手輸入驗證碼，完成後撳 Continue",
+    windowHidden,
   });
 
-  // 先試自動 OCR（有 tesseract 先得）
   try {
     if (await tryAutoSolveImageCaptcha(page)) {
       log("驗證碼：自動填入成功");
@@ -839,12 +850,12 @@ async function waitForManualCaptcha(
     log(`驗證碼自動填入失敗：${err instanceof Error ? err.message : String(err)}`);
   }
 
-  log("請人手輸入驗證碼後撳 Next；或撳 Continue");
+  log("請人手輸入驗證碼後撳 Next；或撳 Continue（瀏覽器保持隱藏）");
   const deadline = Date.now() + 15 * 60_000;
   while (Date.now() < deadline) {
     await throwIfStopped();
     await syncWindowFlags().catch(() => {});
-  if (await consumeFlag(CONTINUE_FLAG)) {
+    if (await consumeFlag(CONTINUE_FLAG)) {
       log("Continue：繼續檢查是否已過驗證碼");
     }
     // 密碼欄已出 → 驗證碼完
@@ -1075,14 +1086,15 @@ async function gmailLogin(page: Page, email: string, password: string): Promise<
     }
     if (isExtraGoogleChallenge(page.url())) {
       if (activeBrowser) {
-        await maximizeBrowserWindow(page, activeBrowser);
+        // 登入期間唔自動開窗；要睇就撳 Open browser
         await writeStatus({
           phase: "waiting_user",
-          message: "需要額外驗證，請人手完成後撳 Continue",
-          windowHidden: false,
+          message: "需要額外驗證 — 請 Open browser 人手完成後撳 Continue",
+          windowHidden,
         });
         while (Date.now() < pwdDeadline) {
           await throwIfStopped();
+          await syncWindowFlags().catch(() => {});
           if (isGmailInboxUrl(page.url())) {
             await ensureGmailInbox(page);
             return;
@@ -1145,16 +1157,16 @@ async function gmailLogin(page: Page, email: string, password: string): Promise<
   }
   if (!passOk) {
     if (activeBrowser) {
-      await maximizeBrowserWindow(page, activeBrowser);
       await writeStatus({
         phase: "waiting_password",
-        message: "自動填密碼失敗 — 請人手輸入密碼後撳 Continue",
-        windowHidden: false,
+        message: "自動填密碼失敗 — 請 Open browser 人手輸入密碼後撳 Continue",
+        windowHidden,
       });
-      log("自動填密碼失敗：請人手輸入密碼，然後撳 Continue");
+      log("自動填密碼失敗：保持隱藏；請 Open browser 入密碼後 Continue");
       const waitPwd = Date.now() + 15 * 60_000;
       while (Date.now() < waitPwd) {
         await throwIfStopped();
+        await syncWindowFlags().catch(() => {});
         if (isGmailInboxUrl(page.url())) {
           await ensureGmailInbox(page);
           return;
@@ -1199,12 +1211,12 @@ async function gmailLogin(page: Page, email: string, password: string): Promise<
     }
     if (isExtraGoogleChallenge(page.url())) {
       if (activeBrowser) {
-        await maximizeBrowserWindow(page, activeBrowser);
         await writeStatus({
           phase: "waiting_user",
-          message: "需要額外驗證，請人手完成後撳 Continue",
-          windowHidden: false,
+          message: "需要額外驗證 — 請 Open browser 人手完成後撳 Continue",
+          windowHidden,
         });
+        await syncWindowFlags().catch(() => {});
         if (await consumeFlag(CONTINUE_FLAG)) continue;
       }
     }
@@ -1254,8 +1266,8 @@ async function gmailLogin(page: Page, email: string, password: string): Promise<
 
 async function gmailSearchAndOpenOrderEmail(page: Page): Promise<void> {
   await ensureGmailInbox(page);
-  log('搜尋郵件：「apple store」或「出貨」…');
-  await writeStatus({ phase: "search_email", message: "搜尋訂單郵件…" });
+  log("搜尋郵件：出貨…");
+  await writeStatus({ phase: "search_email", message: "搜尋「出貨」郵件…" });
 
   const searchSelectors = [
     'input[aria-label*="Search" i]',
@@ -1279,17 +1291,33 @@ async function gmailSearchAndOpenOrderEmail(page: Page): Promise<void> {
   await search.waitFor({ state: "visible", timeout: 15_000 });
   await search.click({ timeout: 3000 });
   await search.fill("");
-  await search.fill('("apple store" OR 出貨 OR "Apple Store")');
+  await search.fill("出貨");
   await page.keyboard.press("Enter");
   await sleep(2500);
 
-  const row = page
-    .locator("tr.zA, div[role='main'] tr.zA, div.Cp tr.zA, div[role='list'] div[role='listitem']")
-    .first();
-  await row.waitFor({ state: "visible", timeout: 45_000 });
-  await row.click({ timeout: 5000 });
-  log("已開啟搜尋到嘅郵件");
-  await writeStatus({ phase: "email_opened", message: "已開啟訂單相關郵件" });
+  const rows = page.locator(
+    "tr.zA, div[role='main'] tr.zA, div.Cp tr.zA, div[role='list'] div[role='listitem']"
+  );
+  await rows.first().waitFor({ state: "visible", timeout: 45_000 });
+
+  // 優先揀正文／標題含「出貨」嘅列
+  let clicked = false;
+  const n = await rows.count().catch(() => 0);
+  for (let i = 0; i < Math.min(n, 40); i++) {
+    await throwIfStopped();
+    const row = rows.nth(i);
+    const text = ((await row.innerText().catch(() => "")) || "").replace(/\s+/g, " ");
+    if (!text.includes("出貨")) continue;
+    await row.click({ timeout: 5000 });
+    log(`已開啟含「出貨」嘅郵件：${text.slice(0, 80)}`);
+    clicked = true;
+    break;
+  }
+  if (!clicked) {
+    await rows.first().click({ timeout: 5000 });
+    log("搜尋結果未見「出貨」字樣，改開第一封");
+  }
+  await writeStatus({ phase: "email_opened", message: "已開啟「出貨」相關郵件" });
   await sleep(1500);
 }
 
@@ -1483,9 +1511,7 @@ async function processOneAccount(
         message: err instanceof Error ? err.message : String(err),
         windowHidden,
       });
-      if (activeBrowser && activePage) {
-        await maximizeBrowserWindow(activePage, activeBrowser).catch(() => {});
-      }
+      // 唔自動開窗；要睇就撳 Open browser
       const next = await holdBrowserUntilClose("出錯後保持瀏覽器開啟 — Continue 重試／Close 關閉");
       if (next === "close") throw new CloseRequestedError();
       continue;
