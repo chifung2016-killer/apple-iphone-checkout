@@ -906,21 +906,26 @@
           c.fulfillmentMode
         );
         const paid = isPaidBrowser(b);
-        const waitingPay =
+        // 綠閃：只喺全部步驟做完（最終頁 steps_complete）
+        const stepsFinished =
+          !paid && /steps_complete/i.test(String(b.phase || ""));
+        const waitingPayLabel =
           !paid &&
           /steps_complete|waiting_for_payment|waiting_user|awaiting_payment/i.test(
             String(b.phase || "")
           );
         const addingCart =
           !paid &&
-          !waitingPay &&
+          !stepsFinished &&
+          !waitingPayLabel &&
           /polling_continue|adding_cart/i.test(String(b.phase || ""));
-        const stuck = !paid && !waitingPay && !addingCart && isTaskStuck(b);
+        const stuck =
+          !paid && !stepsFinished && !waitingPayLabel && !addingCart && isTaskStuck(b);
         const pc = paid
           ? "paid"
           : stuck
             ? "stuck"
-            : waitingPay
+            : stepsFinished
               ? "steps"
               : addingCart
                 ? "adding"
@@ -929,7 +934,7 @@
           ? phaseLabel("payment_succeeded")
           : stuck
             ? "stuck / error"
-            : waitingPay
+            : stepsFinished || waitingPayLabel
               ? "waiting for payment"
               : addingCart
                 ? "adding cart"
@@ -966,8 +971,8 @@
           "browser-card",
           paid ? "is-paid" : "",
           stuck ? "is-stuck" : "",
-          !stuck && waitingPay ? "is-steps-complete" : "",
-          !stuck && !waitingPay && addingCart ? "is-adding-cart" : "",
+          !stuck && stepsFinished ? "is-steps-complete" : "",
+          !stuck && !stepsFinished && addingCart ? "is-adding-cart" : "",
         ]
           .filter(Boolean)
           .join(" ");

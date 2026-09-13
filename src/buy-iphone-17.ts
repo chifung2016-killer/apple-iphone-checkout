@@ -539,9 +539,10 @@ async function writeStatus(patch: Record<string, unknown>): Promise<void> {
       }
     } else if (
       /steps_complete/i.test(String(prev.phase || "")) &&
-      (!patch.phase || /waiting_user|idle/i.test(String(patch.phase || "")))
+      (!patch.phase ||
+        /waiting_user|idle|waiting_for_payment/i.test(String(patch.phase || "")))
     ) {
-      // steps_complete 之後 window sync／idle 唔好降級；waiting_for_payment 可以寫入
+      // steps_complete 之後 window sync／waiting_for_payment 唔好降級
       next.phase = "steps_complete";
     }
 
@@ -7781,7 +7782,7 @@ async function completeDeliveryApplePayReview(
 ): Promise<void> {
   // 任何 secureN 嘅 /shop/checkout?_s=Review 或 /shop/apw/checkout?_s=Review*
   console.log(
-    `步驟：Review — 捲底一次，再強化連撳「使用Apple Pay繼續」（URL=${page.url()}）`
+    `步驟：Review — 捲底一次，只撳一次「使用Apple Pay繼續」（URL=${page.url()}）`
   );
 
   // 等 Review URL 出現
@@ -7803,95 +7804,71 @@ async function completeDeliveryApplePayReview(
 
   console.log("  Review：捲去頁底一次…");
   await scrollPageToBottom(page);
-  await sleepCheckingRelease(250);
+  await sleepCheckingRelease(300);
 
-  // 強化 autoclick：多策略連撳，直到離開 Review 或逾時
-  const deadline = Date.now() + 45_000;
-  let clicks = 0;
-  console.log("  Review：強化撳「使用Apple Pay繼續」…");
-
-  while (Date.now() < deadline) {
-    await throwIfReleased();
-    if (!isReviewPage(page.url())) {
-      console.log(`  已離開 Review → ${page.url()}（累計撳 ${clicks} 次）`);
-      break;
-    }
-
-    let got = await clickReviewPagePrimaryCta(page);
-    if (!got) {
-      got = await clickApplePayContinueFast(page, {
-        waitMs: 1_200,
-        pollMs: 25,
-        hammer: true,
-      });
-    }
-    if (!got) {
-      // 後備：鍵盤／座標狂撳 sticky footer
-      got = await page
-        .evaluate(() => {
-          const norm = (s: string) =>
-            (s || "").replace(/[\s\u00a0\u200b\ufeff\uf8ff]+/g, "").toLowerCase();
-          const nodes = Array.from(
-            document.querySelectorAll(
-              "button, a, [role='button'], apple-pay-button, [is='apple-pay-button'], [data-autom*='continue' i]"
+  console.log("  Review：只撳一次「使用Apple Pay繼續」…");
+  let clicked = await clickReviewPagePrimaryCta(page);
+  if (!clicked) {
+    clicked = await clickApplePayContinueFast(page, {
+      waitMs: 5_000,
+      pollMs: 80,
+      hammer: false,
+    });
+  }
+  if (!clicked) {
+    clicked = await page
+      .evaluate(() => {
+        const norm = (s: string) =>
+          (s || "").replace(/[\s\u00a0\u200b\ufeff\uf8ff]+/g, "").toLowerCase();
+        const nodes = Array.from(
+          document.querySelectorAll(
+            "button, a, [role='button'], apple-pay-button, [is='apple-pay-button'], [data-autom*='continue' i]"
+          )
+        ) as HTMLElement[];
+        for (const el of nodes) {
+          const t = norm(
+            `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${el.id || ""}`
+          );
+          if (
+            !(
+              (t.includes("apple") && t.includes("pay") && t.includes("繼續")) ||
+              (t.includes("使用") && t.includes("pay") && t.includes("繼續")) ||
+              (t.includes("continue") && t.includes("pay"))
             )
-          ) as HTMLElement[];
-          for (const el of nodes) {
-            const t = norm(
-              `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${el.id || ""}`
-            );
-            if (
-              !(
-                (t.includes("apple") && t.includes("pay") && t.includes("繼續")) ||
-                (t.includes("使用") && t.includes("pay") && t.includes("繼續")) ||
-                (t.includes("continue") && t.includes("pay"))
-              )
-            ) {
-              continue;
-            }
-            el.scrollIntoView({ block: "center" });
-            el.click();
-            return true;
+          ) {
+            continue;
           }
-          const sticky = document.querySelector(
-            "#rs-checkout-continue-button-bottom, .rs-checkout-continuebutton button, [data-autom='continueButton']"
-          ) as HTMLElement | null;
-          if (sticky) {
-            sticky.scrollIntoView({ block: "center" });
-            sticky.click();
-            return true;
-          }
-          return false;
-        })
-        .catch(() => false);
-    }
-
-    if (got) {
-      clicks += 1;
-      if (clicks === 1 || clicks % 5 === 0) {
-        console.log(`  已強化撳「使用Apple Pay繼續」（第 ${clicks} 次）`);
-      }
-      await withReleaseCheck(
-        page
-          .waitForURL((url) => !isReviewPage(url.toString()), { timeout: 700 })
-          .catch(() => {})
-      );
-      if (!isReviewPage(page.url())) break;
-      await sleepCheckingRelease(90);
-      continue;
-    }
-    await sleepCheckingRelease(140);
+          el.scrollIntoView({ block: "center" });
+          el.click();
+          return true;
+        }
+        const sticky = document.querySelector(
+          "#rs-checkout-continue-button-bottom, .rs-checkout-continuebutton button, [data-autom='continueButton']"
+        ) as HTMLElement | null;
+        if (sticky) {
+          sticky.scrollIntoView({ block: "center" });
+          sticky.click();
+          return true;
+        }
+        return false;
+      })
+      .catch(() => false);
   }
 
-  if (clicks === 0 && isReviewPage(page.url())) {
+  if (!clicked) {
     throw new StepError("使用Apple Pay繼續", "Review 頁撳唔到主 CTA（使用Apple Pay繼續）。");
   }
-  if (isReviewPage(page.url())) {
-    console.warn(
-      `  強化撳咗 ${clicks} 次仍喺 Review（可能等 Apple Pay sheet／人手確認）`
-    );
+  console.log("  已撳「使用Apple Pay繼續」一次（唔再連撳）");
+
+  await withReleaseCheck(
+    page
+      .waitForURL((url) => !isReviewPage(url.toString()), { timeout: 12_000 })
+      .catch(() => {})
+  );
+  if (!isReviewPage(page.url())) {
+    console.log(`  已離開 Review → ${page.url()}`);
   } else {
-    console.log(`  Review CTA 完成（強化撳咗 ${clicks} 次）`);
+    console.warn("  撳完一次仍喺 Review（可能等 Apple Pay sheet／人手確認）");
   }
 
   const eta = await scrapeEstimatedDeliveryText(page).catch(() => null);
@@ -8517,11 +8494,11 @@ async function markWaitingForPayment(
   }
 }
 
-/** 自動化步驟全部做完：保持隱藏、唔自動開窗；dashboard 顯示 waiting for payment */
+/** 自動化步驟全部做完（最終頁）：保持隱藏；dashboard 綠閃 steps_complete */
 async function sealStepsComplete(session: BrowserSession): Promise<void> {
   await setBrowserWindowState(session, "minimized").catch(() => {});
   await writeStatus({
-    phase: "waiting_for_payment",
+    phase: "steps_complete",
     windowHidden: true,
     windowState: "minimized",
     message: "waiting for payment",
@@ -8532,7 +8509,7 @@ async function sealStepsComplete(session: BrowserSession): Promise<void> {
     }),
   });
   console.log(
-    `${session.tag} 步驟已完成 → waiting for payment；瀏覽器保持隱藏，唔會自動開啟`
+    `${session.tag} 步驟已完成 → steps_complete（綠閃）；瀏覽器保持隱藏，唔會自動開啟`
   );
 }
 
@@ -8548,17 +8525,25 @@ async function holdSessionsHiddenUntilClose(
     await setBrowserWindowState(s, "minimized").catch(() => {});
   }
 
-  let phase = "waiting_for_payment";
+  let phase = "steps_complete";
   try {
     const st = JSON.parse(await fs.readFile(STATUS_FILE, "utf8")) as {
       phase?: string;
     };
     if (/payment_succeeded|orders_ready/i.test(String(st.phase || ""))) {
       phase = "payment_succeeded";
-    } else {
-      phase = "waiting_for_payment";
+    } else if (/steps_complete/i.test(String(st.phase || ""))) {
+      phase = "steps_complete";
       await writeStatus({
-        phase: "waiting_for_payment",
+        phase: "steps_complete",
+        windowHidden: true,
+        windowState: "minimized",
+        message: "waiting for payment",
+      });
+    } else {
+      phase = "steps_complete";
+      await writeStatus({
+        phase: "steps_complete",
         windowHidden: true,
         windowState: "minimized",
         message: "waiting for payment",
@@ -8566,7 +8551,7 @@ async function holdSessionsHiddenUntilClose(
     }
   } catch {
     await writeStatus({
-      phase: "waiting_for_payment",
+      phase: "steps_complete",
       windowHidden: true,
       windowState: "minimized",
       message: "waiting for payment",
@@ -8616,8 +8601,8 @@ async function holdSessionsHiddenUntilClose(
         }
       }
     }
-    // waiting for payment：若仍標 hidden 但視窗被彈出，再藏返（Open browser 會標 windowHidden=false）
-    if (/waiting_for_payment/i.test(phase)) {
+    // waiting for payment / steps_complete：若仍標 hidden 但視窗被彈出，再藏返（Open browser 會標 windowHidden=false）
+    if (/waiting_for_payment|steps_complete/i.test(phase)) {
       try {
         const st = JSON.parse(await fs.readFile(STATUS_FILE, "utf8")) as {
           windowHidden?: boolean;
@@ -8630,7 +8615,9 @@ async function holdSessionsHiddenUntilClose(
             }
           }
           await writeStatus({
-            phase: "waiting_for_payment",
+            phase: /steps_complete/i.test(phase)
+              ? "steps_complete"
+              : "waiting_for_payment",
             windowHidden: true,
             windowState: "minimized",
           }).catch(() => {});
