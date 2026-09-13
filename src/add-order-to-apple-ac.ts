@@ -1636,7 +1636,10 @@ async function gmailLogin(page: Page, email: string, password: string): Promise<
 }
 
 async function gmailSearchAndOpenOrderEmail(page: Page): Promise<void> {
-  const keyword = "出貨";
+  const keyword = "apple 出貨";
+  /** 列表配對用（主旨未必有連續「apple 出貨」字串） */
+  const rowMatch = (text: string) =>
+    text.includes("出貨") && /apple/i.test(text);
   log(`搜尋郵件：${keyword}…`);
   await writeStatus({
     phase: "search_email",
@@ -1796,26 +1799,34 @@ async function gmailSearchAndOpenOrderEmail(page: Page): Promise<void> {
 
   let clicked = false;
   const n = await rows.count().catch(() => 0);
-  for (let i = 0; i < Math.min(n, 40); i++) {
+  const tryOpenRow = async (row: ReturnType<typeof rows.nth>, text: string, why: string) => {
+    await row.click({ timeout: 5000 }).catch(() => {});
+    await sleep(300);
+    await row.dblclick({ timeout: 5000 }).catch(() => {});
+    await page.keyboard.press("Enter").catch(() => {});
+    log(`${why}：${text.slice(0, 80)}`);
+  };
+
+  // 1) 優先：同時含 apple + 出貨
+  for (let i = 0; i < Math.min(n, 40) && !clicked; i++) {
     await throwIfStopped();
     const row = rows.nth(i);
     const text = ((await row.innerText().catch(() => "")) || "").replace(/\s+/g, " ");
-    if (!text.includes(keyword)) continue;
-    // Gmail：單擊有時只係選取，雙擊／Enter 先打開
-    await row.click({ timeout: 5000 }).catch(() => {});
-    await sleep(400);
-    await row.dblclick({ timeout: 5000 }).catch(() => {});
-    await page.keyboard.press("Enter").catch(() => {});
-    log(`已開啟含「${keyword}」嘅郵件：${text.slice(0, 80)}`);
+    if (!rowMatch(text)) continue;
+    await tryOpenRow(row, text, `已開啟「${keyword}」郵件`);
     clicked = true;
-    break;
+  }
+  // 2) 其次：只含 出貨
+  for (let i = 0; i < Math.min(n, 40) && !clicked; i++) {
+    await throwIfStopped();
+    const row = rows.nth(i);
+    const text = ((await row.innerText().catch(() => "")) || "").replace(/\s+/g, " ");
+    if (!text.includes("出貨")) continue;
+    await tryOpenRow(row, text, "已開啟含「出貨」郵件");
+    clicked = true;
   }
   if (!clicked) {
-    await rows.first().click({ timeout: 5000 }).catch(() => {});
-    await sleep(300);
-    await rows.first().dblclick({ timeout: 5000 }).catch(() => {});
-    await page.keyboard.press("Enter").catch(() => {});
-    log(`搜尋結果未見「${keyword}」字樣，改開第一封`);
+    await tryOpenRow(rows.first(), "", `搜尋「${keyword}」未見明確配對，改開第一封`);
   }
   await writeStatus({
     phase: "email_opened",
@@ -2119,7 +2130,7 @@ async function processOneAccount(
   const runSteps = async () => {
     await writeStatus({ phase: "gmail_login", message: "Gmail 登入中…" });
     await gmailLogin(page, account.email, account.password);
-    // 登入後即刻搜「出貨」——唔好先死等 #inbox 載完／再 minimize（會卡住 loading）
+    // 登入後即刻搜「apple 出貨」——唔好先死等 #inbox 載完／再 minimize（會卡住 loading）
     await writeStatus({ phase: "search_email", message: "搜尋訂單郵件…" });
     await gmailSearchAndOpenOrderEmail(page);
     const orderPage = await clickOrderStatusInEmail(page, context);
