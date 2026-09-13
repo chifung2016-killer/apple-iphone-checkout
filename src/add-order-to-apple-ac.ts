@@ -226,7 +226,15 @@ function orderContactPhone(o: Record<string, unknown>): string {
   const ship = (o.confirmationPageShipping as Record<string, unknown> | undefined) || {};
   const sd = (o.shippingDetails as Record<string, unknown> | undefined) || {};
   const identity = (o.identity as Record<string, unknown> | undefined) || {};
-  for (const v of [sd.phone, contact.phone, ship.phone, identity.phone, o.phone]) {
+  const delivery = (o.deliveryDetails as Record<string, unknown> | undefined) || {};
+  for (const v of [
+    sd.phone,
+    contact.phone,
+    ship.phone,
+    identity.phone,
+    delivery.phone,
+    o.phone,
+  ]) {
     const p = String(v || "").trim();
     if (p && p !== "—") return p;
   }
@@ -241,21 +249,66 @@ function normalizeHkMobileForApple(raw: string): string {
   return digits;
 }
 
+function orderNumbersEqual(a: string, b: string): boolean {
+  const na = String(a || "").trim().toUpperCase().replace(/[\s-]/g, "");
+  const nb = String(b || "").trim().toUpperCase().replace(/[\s-]/g, "");
+  return Boolean(na && nb && na === nb);
+}
+
+/** 由 Apple verify URL 抽出訂單編號（?_w=W…） */
+function orderNumberFromAppleUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    const w = u.searchParams.get("_w") || u.searchParams.get("orderNumber") || "";
+    if (w.trim()) return w.trim();
+  } catch {
+    /* ignore */
+  }
+  const m = String(url || "").match(/[?&]_w=([A-Za-z0-9-]+)/);
+  return m?.[1]?.trim() || "";
+}
+
 async function resolvePhoneForOrderNumber(orderNumber: string): Promise<string> {
   const want = String(orderNumber || "").trim();
   if (!want) throw new Error("缺少訂單編號，無法對齊電話");
+
+  // 1) order-summary.json / runtime/order-*.json（同 Dashboard Order summary）
   const orders = await loadOrderSummaryRecords();
   for (const o of orders) {
     const n = String(o.orderNumber || "").trim();
-    if (n !== want) continue;
+    if (!orderNumbersEqual(n, want)) continue;
     const phone = normalizeHkMobileForApple(orderContactPhone(o));
     if (phone) {
       log(`Order summary：${want} → 電話 ${phone}`);
       return phone;
     }
   }
+
+  // 2) status-b*.json card.phone（Finished / runtime）
+  const runtimeDir = path.join(ROOT, "runtime");
+  try {
+    const files = await fs.readdir(runtimeDir);
+    for (const f of files) {
+      if (!/^status-b\d+\.json$/i.test(f) && !/^status-fin-.+\.json$/i.test(f)) continue;
+      const st = (await readJsonLoose(path.join(runtimeDir, f))) as Record<string, unknown> | null;
+      if (!st || typeof st !== "object") continue;
+      const card = (st.card as Record<string, unknown> | undefined) || {};
+      const n = String(card.orderNumber || "").trim();
+      if (!orderNumbersEqual(n, want)) continue;
+      const phone = normalizeHkMobileForApple(
+        String(card.phone || (card.deliveryDetails as { phone?: string } | undefined)?.phone || "")
+      );
+      if (phone) {
+        log(`runtime status：${want} → 電話 ${phone}`);
+        return phone;
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+
   throw new Error(
-    `Order summary 揾唔到訂單「${want}」嘅電話（請確認 Order summary 有該單同 Phone）`
+    `Order summary 揾唔到訂單「${want}」嘅 Phone（Dashboard Order summary 請確認有該單電話）`
   );
 }
 
@@ -2282,23 +2335,22 @@ async function waitForAppleOrderFlowPage(page: Page): Promise<void> {
 }
 
 /**
- * order/link/verify：用 Order summary 該單嘅電話填入，再撳「繼續」
+ * order/link/verify：用 Order summary 該單嘅 Phone 填入，再撳「繼續」
  */
 async function fillOrderVerifyPhoneAndContinue(page: Page, orderNumber: string): Promise<void> {
-  // 等一下 verify／guest
-  const appearDeadline = Date.now() + 20_000;
+  // 等 verify 頁出現（或已過）
+  const appearDeadline = Date.now() + 25_000;
   while (Date.now() < appearDeadline) {
     await throwIfStopped();
+    await syncWindowFlags().catch(() => {});
     const url = page.url();
     if (isOrderLinkVerifyUrl(url)) break;
     if (isAppleGuestOrderUrl(url)) {
       log("已過 verify 頁，唔使填電話");
       return;
     }
-    // 已見到「加入至 Apple ID」都當過咗
     const addVisible = await page
-      .getByRole("button", { name: /加入至\s*Apple\s*ID|Add to Apple ID/i })
-      .or(page.getByText(/加入至\s*Apple\s*ID|Add to Apple ID/i))
+      .getByText(/加入至\s*Apple\s*ID|Add to Apple ID/i)
       .first()
       .isVisible()
       .catch(() => false);
@@ -2314,101 +2366,136 @@ async function fillOrderVerifyPhoneAndContinue(page: Page, orderNumber: string):
     return;
   }
 
-  const phone = await resolvePhoneForOrderNumber(orderNumber);
-  log(`verify 頁填寫電話：${phone}`);
+  const fromUrl = orderNumberFromAppleUrl(page.url());
+  const orderNo = String(orderNumber || fromUrl || "").trim() || fromUrl;
+  if (!orderNo) throw new Error("verify 頁缺少訂單編號（URL _w= / 帳號設定）");
+
+  const phone = await resolvePhoneForOrderNumber(orderNo);
+  log(`verify 頁填寫電話（Order summary Phone）：${phone} · 訂單 ${orderNo}`);
   await writeStatus({
     phase: "order_verify",
     message: `填寫訂單電話 ${phone}…`,
-    orderNumber,
+    orderNumber: orderNo,
     url: page.url(),
   });
 
-  const phoneField = page
-    .locator(
-      [
-        'input[type="tel"]',
-        'input[name*="phone" i]',
-        'input[id*="phone" i]',
-        'input[autocomplete="tel"]',
-        'input[data-autom*="phone" i]',
-        'input[aria-label*="電話" i]',
-        'input[aria-label*="Phone" i]',
-        'input[placeholder*="電話" i]',
-        'input[placeholder*="Phone" i]',
-      ].join(", ")
-    )
-    .first();
-
-  const fieldDeadline = Date.now() + 15_000;
-  let filled = false;
-  while (Date.now() < fieldDeadline) {
-    await throwIfStopped();
-    if (await phoneField.isVisible().catch(() => false)) {
-      await phoneField.click({ timeout: 3000 }).catch(() => {});
-      await phoneField.fill("").catch(() => {});
-      await phoneField.fill(phone).catch(async () => {
-        await phoneField.evaluate((el, v) => {
-          const input = el as HTMLInputElement;
-          input.focus();
-          input.value = v;
+  const setPhoneViaDom = async (value: string): Promise<boolean> => {
+    return page
+      .evaluate((v) => {
+        const setNative = (input: HTMLInputElement, text: string) => {
+          const proto = window.HTMLInputElement.prototype;
+          const desc = Object.getOwnPropertyDescriptor(proto, "value");
+          if (desc?.set) desc.set.call(input, text);
+          else input.value = text;
           input.dispatchEvent(new Event("input", { bubbles: true }));
           input.dispatchEvent(new Event("change", { bubbles: true }));
-        }, phone);
-      });
-      const val = ((await phoneField.inputValue().catch(() => "")) || "").replace(/\D/g, "");
+          try {
+            input.dispatchEvent(
+              new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" })
+            );
+          } catch {
+            /* ignore */
+          }
+          input.dispatchEvent(new Event("blur", { bubbles: true }));
+        };
+        const score = (input: HTMLInputElement) => {
+          const meta =
+            `${input.name} ${input.id} ${input.placeholder} ${input.type} ` +
+            `${input.getAttribute("aria-label") || ""} ${input.getAttribute("data-autom") || ""} ` +
+            `${input.getAttribute("autocomplete") || ""}`.toLowerCase();
+          let s = 0;
+          if (input.type === "tel") s += 50;
+          if (/phone|tel|mobile|電話|手提|手機|聯絡/.test(meta)) s += 40;
+          if (/order|verify|guest/.test(meta)) s += 5;
+          if (input.offsetParent === null && getComputedStyle(input).display === "none") s -= 100;
+          return s;
+        };
+        const inputs = Array.from(
+          document.querySelectorAll("input")
+        ) as HTMLInputElement[];
+        const ranked = inputs
+          .map((el) => ({ el, s: score(el) }))
+          .filter((x) => x.s > 0)
+          .sort((a, b) => b.s - a.s);
+        const target = ranked[0]?.el || inputs.find((i) => i.type === "tel");
+        if (!target) return false;
+        target.scrollIntoView({ block: "center", inline: "nearest" });
+        target.focus();
+        setNative(target, "");
+        setNative(target, v);
+        return (target.value || "").replace(/\D/g, "").includes(v.replace(/\D/g, ""));
+      }, value)
+      .catch(() => false);
+  };
+
+  const fieldDeadline = Date.now() + 20_000;
+  let filled = false;
+  while (Date.now() < fieldDeadline && !filled) {
+    await throwIfStopped();
+
+    const candidates = [
+      page.getByLabel(/電話|Phone|手提|手機|Mobile/i).first(),
+      page.getByPlaceholder(/電話|Phone|手提|手機|Mobile/i).first(),
+      page.locator('input[type="tel"]').first(),
+      page.locator('input[name*="phone" i], input[id*="phone" i], input[autocomplete="tel"]').first(),
+      page.locator('input[data-autom*="phone" i], input[aria-label*="電話" i]').first(),
+    ];
+
+    for (const field of candidates) {
+      if (!(await field.isVisible().catch(() => false))) continue;
+      await field.scrollIntoViewIfNeeded().catch(() => {});
+      await field.click({ timeout: 3000 }).catch(() => {});
+      await field.fill("").catch(() => {});
+      await field.fill(phone).catch(() => {});
+      let val = ((await field.inputValue().catch(() => "")) || "").replace(/\D/g, "");
+      if (!(val.includes(phone) || phone.includes(val))) {
+        // 逐字輸入（應付受控 input）
+        await field.click({ timeout: 2000 }).catch(() => {});
+        await page.keyboard.press("Control+A").catch(() => {});
+        await page.keyboard.press("Meta+A").catch(() => {});
+        await page.keyboard.press("Backspace").catch(() => {});
+        await field.pressSequentially(phone, { delay: 40 }).catch(async () => {
+          await page.keyboard.type(phone, { delay: 40 }).catch(() => {});
+        });
+        val = ((await field.inputValue().catch(() => "")) || "").replace(/\D/g, "");
+      }
       if (val.includes(phone) || phone.includes(val)) {
         filled = true;
         break;
       }
     }
-    // DOM fallback
-    filled = await page
-      .evaluate((v) => {
-        const inputs = Array.from(
-          document.querySelectorAll("input[type='tel'], input[type='text'], input:not([type])")
-        ) as HTMLInputElement[];
-        for (const input of inputs) {
-          const meta = `${input.name} ${input.id} ${input.placeholder} ${input.getAttribute("aria-label") || ""} ${input.getAttribute("data-autom") || ""}`.toLowerCase();
-          const looksPhone =
-            input.type === "tel" ||
-            /phone|tel|mobile|電話|手提|手機/.test(meta);
-          if (!looksPhone) continue;
-          if (input.offsetParent === null && input.type !== "tel") continue;
-          input.focus();
-          input.value = v;
-          input.dispatchEvent(new Event("input", { bubbles: true }));
-          input.dispatchEvent(new Event("change", { bubbles: true }));
-          return true;
-        }
-        return false;
-      }, phone)
-      .catch(() => false);
+
+    if (!filled) {
+      filled = await setPhoneViaDom(phone);
+    }
     if (filled) break;
     await sleep(400);
   }
-  if (!filled) throw new Error("verify 頁揾唔到／填唔入電話欄");
+  if (!filled) throw new Error("verify 頁揾唔到／填唔入電話欄（Order summary Phone）");
   log(`已填電話 ${phone}`);
-  await sleep(300);
+  await sleep(400);
 
-  // 撳「繼續」
-  let continued = false;
-  for (let i = 0; i < 8 && !continued; i++) {
-    await throwIfStopped();
+  const clickContinue = async (): Promise<boolean> => {
     const btn = page
       .getByRole("button", { name: /^繼續$|Continue/i })
       .or(page.getByRole("link", { name: /^繼續$|Continue/i }))
-      .or(page.locator('button:has-text("繼續"), a:has-text("繼續"), input[type="submit"]'))
+      .or(page.locator('button.button:has-text("繼續"), button:has-text("繼續"), a:has-text("繼續")'))
+      .or(page.locator('input[type="submit"][value*="繼續"], input[type="submit"][value*="Continue" i]'))
       .first();
     if (await btn.isVisible().catch(() => false)) {
       await btn.scrollIntoViewIfNeeded().catch(() => {});
-      await btn.click({ timeout: 5000 }).catch(async () => {
+      // 有時要等電話驗證完先 enable
+      for (let t = 0; t < 10; t++) {
+        const disabled = await btn.isDisabled().catch(() => false);
+        if (!disabled) break;
+        await sleep(300);
+      }
+      await btn.click({ timeout: 5000, force: true }).catch(async () => {
         await btn.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
       });
-      continued = true;
-      log("已撳「繼續」");
-      break;
+      return true;
     }
-    continued = await page
+    return page
       .evaluate(() => {
         const norm = (s: string) => (s || "").replace(/[\s\u00a0]+/g, "");
         const nodes = Array.from(
@@ -2418,7 +2505,7 @@ async function fillOrderVerifyPhoneAndContinue(page: Page, orderNumber: string):
           const t = norm(
             `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${(el as HTMLInputElement).value || ""}`
           );
-          if (t === "繼續" || t === "Continue" || t.includes("繼續")) {
+          if (t === "繼續" || /^Continue$/i.test(t) || (t.includes("繼續") && t.length < 12)) {
             el.click();
             return true;
           }
@@ -2426,22 +2513,38 @@ async function fillOrderVerifyPhoneAndContinue(page: Page, orderNumber: string):
         return false;
       })
       .catch(() => false);
+  };
+
+  let continued = false;
+  for (let i = 0; i < 10 && !continued; i++) {
+    await throwIfStopped();
+    continued = await clickContinue();
     if (continued) {
-      log("已撳「繼續」（DOM）");
+      log(i === 0 ? "已撳「繼續」" : `已撳「繼續」（第 ${i + 1} 次）`);
       break;
     }
-    await sleep(400);
+    // 再確保電話仍在欄入面
+    await setPhoneViaDom(phone);
+    await sleep(450);
   }
   if (!continued) throw new Error("verify 頁撳唔到「繼續」");
 
-  // 等離開 verify
-  const leaveDeadline = Date.now() + 30_000;
+  // 等離開 verify；若仍停住，再填一次電話＋繼續
+  const leaveDeadline = Date.now() + 35_000;
+  let retried = false;
   while (Date.now() < leaveDeadline) {
     await throwIfStopped();
     await syncWindowFlags().catch(() => {});
     if (!isOrderLinkVerifyUrl(page.url())) {
       log(`已離開 verify：${page.url()}`);
       return;
+    }
+    if (!retried && Date.now() > leaveDeadline - 20_000) {
+      retried = true;
+      log("仍喺 verify，再填電話並撳繼續…");
+      await setPhoneViaDom(phone);
+      await sleep(300);
+      await clickContinue();
     }
     await sleep(400);
   }
@@ -2469,7 +2572,14 @@ async function waitForAppleGuestOrderPage(page: Page): Promise<void> {
       return;
     }
     if (isOrderLinkVerifyUrl(url)) {
-      // 仍喺 verify：外層會再填
+      // 仍喺 verify：再填一次電話＋繼續
+      const orderNo = orderNumberFromAppleUrl(url);
+      if (orderNo) {
+        log("Guest wait：仍喺 verify，再填電話…");
+        await fillOrderVerifyPhoneAndContinue(page, orderNo).catch((err) => {
+          log(`再填電話失敗：${err instanceof Error ? err.message : String(err)}`);
+        });
+      }
       await sleep(400);
       continue;
     }
