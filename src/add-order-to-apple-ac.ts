@@ -570,6 +570,73 @@ async function clickAppleAuthContinue(page: Page): Promise<boolean> {
   return false;
 }
 
+async function clickLeftAuthActionButton(page: Page): Promise<boolean> {
+  // signIn/orders：兩個掣並排時撳最左（通常係「繼續使用密碼登入」），避開右邊通行密鑰／#sign-in 箭嘴
+  for (const fr of [...appleAuthFrames(page), page.mainFrame(), ...page.frames()]) {
+    const hit = await fr
+      .evaluate(() => {
+        const visible = (el: Element) => {
+          const r = (el as HTMLElement).getBoundingClientRect();
+          const s = window.getComputedStyle(el as HTMLElement);
+          return (
+            r.width > 12 &&
+            r.height > 12 &&
+            s.visibility !== "hidden" &&
+            s.display !== "none" &&
+            s.opacity !== "0"
+          );
+        };
+        const labelOf = (el: HTMLElement) =>
+          `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${el.id || ""} ${el.className || ""}`;
+
+        const nodes = Array.from(
+          document.querySelectorAll("button, a, [role='button']")
+        ) as HTMLElement[];
+        const actions = nodes.filter((el) => {
+          if (!visible(el)) return false;
+          const t = labelOf(el);
+          if (/取消|cancel|close|關閉|返回|back/i.test(t)) return false;
+          // 唔好撳電郵欄右邊藍色箭嘴 #sign-in（通常係最右）
+          if (el.id === "sign-in" || /aid-continue|icon-button|move/i.test(el.className)) {
+            // 除非佢文字本身係密碼
+            if (!/密碼|password/i.test(t)) return false;
+          }
+          return true;
+        });
+        if (!actions.length) return "";
+
+        // 優先：含密碼字樣
+        const pwdBtns = actions.filter((el) => /密碼|password/i.test(labelOf(el)));
+        const pool = pwdBtns.length ? pwdBtns : actions;
+        pool.sort(
+          (a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left
+        );
+        const target = pool[0]!;
+        target.click();
+        return (labelOf(target) || "left-button").trim().slice(0, 80);
+      })
+      .catch(() => "");
+    if (hit) {
+      log(`已撳左邊登入掣：${hit}`);
+      return true;
+    }
+  }
+  return false;
+}
+
+async function hasVisibleApplePasswordField(page: Page): Promise<boolean> {
+  for (const fr of [...appleAuthFrames(page), page.mainFrame(), ...page.frames()]) {
+    const loc = fr
+      .locator(
+        "#password_text_field:visible, input[type='password']:visible, input[name='password']:visible, input[autocomplete='current-password']:visible"
+      )
+      .first();
+    if ((await loc.count().catch(() => 0)) === 0) continue;
+    if (await loc.isVisible().catch(() => false)) return true;
+  }
+  return false;
+}
+
 async function clickContinueWithPasswordFast(page: Page): Promise<boolean> {
   const pwdNeedles = [
     "繼續使用密碼登入",
@@ -605,6 +672,8 @@ async function clickContinueWithPasswordFast(page: Page): Promise<boolean> {
               if (!match && !looseHit) continue;
               const clickable =
                 (el.closest("button, a, [role='button']") as HTMLElement | null) || el;
+              // 避開電郵步右邊 #sign-in 箭嘴
+              if (clickable.id === "sign-in" && !/密碼|password/i.test(raw)) continue;
               clickable.click();
               return true;
             }
@@ -617,6 +686,9 @@ async function clickContinueWithPasswordFast(page: Page): Promise<boolean> {
     }
     return false;
   };
+
+  // 0) 左邊掣（密碼選項通常在左）
+  if (await clickLeftAuthActionButton(page)) return true;
 
   // 1) #continue-password（idmsa）
   for (const fr of [...appleAuthFrames(page), page.mainFrame(), ...page.frames()]) {
@@ -668,7 +740,6 @@ async function clickContinueWithPasswordFast(page: Page): Promise<boolean> {
     }
   }
 
-  // 主頁（signIn/orders 有時唔喺 iframe）
   const pageCandidates = [
     page.locator("#continue-password"),
     page.getByRole("button", {
@@ -702,9 +773,9 @@ async function clickContinueWithPasswordFast(page: Page): Promise<boolean> {
 
   if (await clickByTexts(pwdNeedles, true)) return true;
 
-  // 通行密鑰畫面：先「其他選項」
   if (await clickByTexts(otherNeedles)) {
     await sleep(500);
+    if (await clickLeftAuthActionButton(page)) return true;
     if (await clickByTexts(pwdNeedles, true)) return true;
     for (const loc of pageCandidates) {
       const el = loc.first();
@@ -761,58 +832,52 @@ async function signInAppleIdOnOrderPage(
     await pressEnterOnAppleAuthField(page, "email");
     advanced = true;
   }
-  log("已提交電郵，等「繼續使用密碼登入」…");
-  await sleep(700);
+  log("已提交電郵，等左邊「繼續使用密碼登入」…");
+  await sleep(900);
 
-  const pwdDeadline = Date.now() + 45_000;
+  const pwdDeadline = Date.now() + 50_000;
   let sawPassword = false;
   let pwdContinueClicks = 0;
   while (Date.now() < pwdDeadline) {
     await throwIfStopped();
     await syncWindowFlags().catch(() => {});
-    sawPassword = false;
-    for (const fr of [...appleAuthFrames(page), page.mainFrame(), ...page.frames()]) {
-      const n = await fr
-        .locator("#password_text_field, input[type='password'], input[name='password']")
-        .count()
-        .catch(() => 0);
-      if (n > 0) {
-        sawPassword = true;
-        break;
-      }
-    }
-    if (sawPassword) break;
 
-    const clicked = await clickContinueWithPasswordFast(page);
+    if (await hasVisibleApplePasswordField(page)) {
+      sawPassword = true;
+      break;
+    }
+
+    // 唔好再撳右邊 #sign-in；專門撳左邊／密碼掣
+    const clicked =
+      (await clickContinueWithPasswordFast(page)) || (await clickLeftAuthActionButton(page));
     if (clicked) {
       pwdContinueClicks += 1;
-      log(`已撳「繼續使用密碼登入」（第 ${pwdContinueClicks} 次）`);
+      log(`已撳左邊／密碼登入掣（第 ${pwdContinueClicks} 次）`);
       await writeStatus({
         phase: "apple_sign_in",
-        message: "已撳繼續使用密碼登入",
+        message: "已撳繼續使用密碼登入（左邊掣）",
         url: page.url(),
       });
-      await sleep(600);
+      await sleep(700);
     } else {
-      // 有時仲喺電郵步：再提交一次
-      if (pwdContinueClicks === 0 && Date.now() < pwdDeadline - 35_000) {
-        await clickAppleAuthContinue(page).catch(() => false);
-        await pressEnterOnAppleAuthField(page, "email");
-      }
-      await sleep(350);
+      await sleep(400);
     }
   }
 
   if (!sawPassword) {
-    // 最後再猛撳幾次密碼掣
-    for (let i = 0; i < 6; i++) {
-      if (await clickContinueWithPasswordFast(page)) {
-        log("補撳「繼續使用密碼登入」成功");
-        await sleep(800);
+    for (let i = 0; i < 8; i++) {
+      await clickLeftAuthActionButton(page);
+      await clickContinueWithPasswordFast(page);
+      await sleep(500);
+      if (await hasVisibleApplePasswordField(page)) {
+        sawPassword = true;
+        log("補撳左邊掣後已見密碼欄");
         break;
       }
-      await sleep(400);
     }
+  }
+  if (!(await hasVisibleApplePasswordField(page))) {
+    throw new Error("未見到密碼欄 — 請確認已撳左邊「繼續使用密碼登入」");
   }
 
   let passOk = false;
@@ -822,6 +887,7 @@ async function signInAppleIdOnOrderPage(
     passOk = await fillInAppleAuthFrame(page, "password", applePassword);
     if (passOk) break;
     await clickContinueWithPasswordFast(page).catch(() => {});
+    await clickLeftAuthActionButton(page).catch(() => {});
     await sleep(450);
   }
   if (!passOk) throw new Error("揾唔到／填唔入密碼欄（請確認已出現「繼續使用密碼登入」）");
@@ -829,7 +895,29 @@ async function signInAppleIdOnOrderPage(
   await clickAppleAuthContinue(page);
   await pressEnterOnAppleAuthField(page, "password");
   log("已提交密碼（右箭頭／繼續）");
-  await sleep(1500);
+
+  // 確認離開 signIn，唔好假完成
+  const leaveDeadline = Date.now() + 45_000;
+  while (Date.now() < leaveDeadline) {
+    await throwIfStopped();
+    await syncWindowFlags().catch(() => {});
+    const url = page.url();
+    if (!/\/shop\/signIn/i.test(url)) {
+      log(`Apple ID 登入後頁面：${url}`);
+      await writeStatus({ phase: "apple_signed_in", message: "Apple ID 已登入", url });
+      return;
+    }
+    // 可能仲要撳一次繼續
+    if (await hasVisibleApplePasswordField(page)) {
+      await clickAppleAuthContinue(page).catch(() => {});
+    } else {
+      await clickContinueWithPasswordFast(page).catch(() => {});
+    }
+    await sleep(600);
+  }
+  if (/\/shop\/signIn/i.test(page.url())) {
+    throw new Error(`Apple ID 登入後仍停喺 signIn：${page.url()}`);
+  }
 }
 
 function isGmailInboxUrl(url: string): boolean {
