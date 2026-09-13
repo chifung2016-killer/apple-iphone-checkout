@@ -537,14 +537,17 @@
             <button type="button" class="browsers-tab is-active" role="tab" id="tabOpened" data-tab="opened" aria-selected="true">
               Opened browsers<span class="count" id="openedCount">0</span>
             </button>
+            <button type="button" class="browsers-tab" role="tab" id="tabWaiting" data-tab="waiting" aria-selected="false">
+              waiting payment<span class="count" id="waitingCount">0</span>
+            </button>
             <button type="button" class="browsers-tab" role="tab" id="tabFinished" data-tab="finished" aria-selected="false">
               Finished<span class="count" id="finishedCount">0</span>
             </button>
           </div>
-          <p class="hint" id="browsersHint">進行中嘅 task（新開嘅會排喺最底）。付款成功會即時移去 Finished。</p>
+          <p class="hint" id="browsersHint">進行中嘅 task（新開嘅會排喺最底）。步驟做完會即時移去 waiting payment。</p>
         </div>
         <div class="browsers-actions">
-          <button type="button" class="btn-ghost btn-sm" id="btnBrowsersReload" title="重新載入 Opened／Finished">Reload</button>
+          <button type="button" class="btn-ghost btn-sm" id="btnBrowsersReload" title="重新載入 Opened／waiting payment／Finished">Reload</button>
           <button type="button" class="btn-danger btn-sm" id="btnStop">Stop all</button>
           <button type="button" class="btn-ghost btn-sm" id="btnClearAll">Clear all</button>
           <button type="button" class="btn-warn btn-sm" id="btnContinue">Continue all</button>
@@ -831,7 +834,7 @@
       return Date.now() - last >= STUCK_AFTER_MS;
     }
 
-    let browsersTab = "opened"; // "opened" | "finished"
+    let browsersTab = "opened"; // "opened" | "waiting" | "finished"
     let lastBrowsersSnap = [];
 
     function isPaidBrowser(b) {
@@ -841,6 +844,11 @@
         Boolean(c.orderNumber && String(c.orderNumber).trim()) ||
         /payment_succeeded|orders_ready/i.test(String(b?.phase || ""))
       );
+    }
+
+    /** 綠閃／全部步驟做完 → waiting payment */
+    function isWaitingPaymentBrowser(b) {
+      return !isPaidBrowser(b) && /steps_complete/i.test(String(b?.phase || ""));
     }
 
     function browserSortKey(b) {
@@ -860,13 +868,21 @@
     }
 
     function setBrowsersTab(tab) {
-      browsersTab = tab === "finished" ? "finished" : "opened";
+      browsersTab =
+        tab === "finished" ? "finished" : tab === "waiting" ? "waiting" : "opened";
       const openedBtn = $("tabOpened");
+      const waitingBtn = $("tabWaiting");
       const finishedBtn = $("tabFinished");
-      if (openedBtn && finishedBtn) {
+      if (openedBtn) {
         openedBtn.classList.toggle("is-active", browsersTab === "opened");
-        finishedBtn.classList.toggle("is-active", browsersTab === "finished");
         openedBtn.setAttribute("aria-selected", browsersTab === "opened" ? "true" : "false");
+      }
+      if (waitingBtn) {
+        waitingBtn.classList.toggle("is-active", browsersTab === "waiting");
+        waitingBtn.setAttribute("aria-selected", browsersTab === "waiting" ? "true" : "false");
+      }
+      if (finishedBtn) {
+        finishedBtn.classList.toggle("is-active", browsersTab === "finished");
         finishedBtn.setAttribute("aria-selected", browsersTab === "finished" ? "true" : "false");
       }
       const hint = $("browsersHint");
@@ -874,27 +890,43 @@
         hint.textContent =
           browsersTab === "finished"
             ? "已付款成功嘅 task。資料唔齊可撳 Reload 重新由訂單摘要載入。"
-            : "進行中嘅 task（新開嘅會排喺最底）。付款成功會即時移去 Finished。";
+            : browsersTab === "waiting"
+              ? "步驟已全部完成、等付款嘅 task（綠閃）。付款成功會即時移去 Finished。"
+              : "進行中嘅 task（新開嘅會排喺最底）。步驟做完會即時移去 waiting payment。";
       }
       renderBrowsers(lastBrowsersSnap);
     }
 
     function renderBrowsers(browsers) {
       lastBrowsersSnap = Array.isArray(browsers) ? browsers : [];
-      const opened = sortBrowsersOldestFirst(lastBrowsersSnap.filter((b) => !isPaidBrowser(b)));
+      const waiting = sortBrowsersOldestFirst(
+        lastBrowsersSnap.filter((b) => isWaitingPaymentBrowser(b))
+      );
+      const opened = sortBrowsersOldestFirst(
+        lastBrowsersSnap.filter((b) => !isPaidBrowser(b) && !isWaitingPaymentBrowser(b))
+      );
       const finished = sortBrowsersOldestFirst(lastBrowsersSnap.filter((b) => isPaidBrowser(b)));
       const openedCountEl = $("openedCount");
+      const waitingCountEl = $("waitingCount");
       const finishedCountEl = $("finishedCount");
       if (openedCountEl) openedCountEl.textContent = String(opened.length);
+      if (waitingCountEl) waitingCountEl.textContent = String(waiting.length);
       if (finishedCountEl) finishedCountEl.textContent = String(finished.length);
 
-      const list = browsersTab === "finished" ? finished : opened;
+      const list =
+        browsersTab === "finished"
+          ? finished
+          : browsersTab === "waiting"
+            ? waiting
+            : opened;
       const box = $("browsers");
       if (!list.length) {
         box.innerHTML =
           browsersTab === "finished"
             ? '<p class="empty">未有付款成功嘅 task。</p>'
-            : '<p class="empty">未開瀏覽器。上面填好設定後撳 Launch / Add。</p>';
+            : browsersTab === "waiting"
+              ? '<p class="empty">未有等付款嘅 task。</p>'
+              : '<p class="empty">未開瀏覽器。上面填好設定後撳 Launch / Add。</p>';
         return;
       }
       box.innerHTML = list.map((b) => {
@@ -1527,6 +1559,7 @@
     });
 
     $("tabOpened")?.addEventListener("click", () => setBrowsersTab("opened"));
+    $("tabWaiting")?.addEventListener("click", () => setBrowsersTab("waiting"));
     $("tabFinished")?.addEventListener("click", () => setBrowsersTab("finished"));
 
     $("btnBrowsersReload")?.addEventListener("click", async () => {
@@ -1547,7 +1580,7 @@
     });
 
     $("btnClearAll").addEventListener("click", async () => {
-      if (!confirm("Clear all opened tasks？只會清未完成嘅 Opened browsers；Finished 會保留。")) return;
+      if (!confirm("Clear all opened tasks？會清 Opened browsers 同 waiting payment；Finished 會保留。")) return;
       const res = await fetch("/api/clear-all", { method: "POST" });
       applySnapshot((await res.json()).state);
     });
