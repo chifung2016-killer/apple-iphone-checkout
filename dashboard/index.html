@@ -587,7 +587,7 @@
       <div class="card-limits-head">
         <div>
           <h2><span class="live-dot" aria-hidden="true"></span>Live card limits</h2>
-          <p class="hint">同 Order summary 用同一份成功訂單資料（按訂單編號對齊）。Email／Card／Company／Remaining／Amount 與摘要一致。</p>
+          <p class="hint">同 Order summary／Finished tab 對齊（同一訂單編號）。Email／Card／Company／Remaining／Amount 與摘要一致。</p>
         </div>
         <div class="card-limits-tools">
               <input type="search" id="cardLimitSearch" placeholder="搜尋訂單／電郵／產品／卡號／公司" />
@@ -623,9 +623,10 @@
       <div class="orders-head">
         <div>
           <h2>Order summary</h2>
-          <p class="hint">只顯示成功落單（有訂單編號）嘅摘要。右邊可直接開 Google 試算表並寫入資料（唔使下載 CSV）。</p>
+          <p class="hint">只顯示 Finished tab 成功落單（有訂單編號）。同 Live card limits 共用同一份資料。右邊可匯出 Google 試算表。</p>
         </div>
         <div class="orders-actions">
+          <button type="button" class="btn-ghost btn-sm" id="btnOrdersRefresh" title="由 Finished tasks 重新對齊 Order summary／Live card limits">Refresh</button>
           <button type="button" class="btn-ghost btn-sm" id="btnExportOrders" disabled title="有成功訂單先可以匯出">匯出 Google 試算表</button>
         </div>
       </div>
@@ -1190,6 +1191,13 @@
         if (o?.remainingCreditCardLimit || o?.remainingLimit) s += 2;
         if (o?.cardLimit) s += 1;
         if (o?.amountSpent || o?.total) s += 1;
+        if (orderContactEmail(o)) s += 2;
+        const phone =
+          o?.shippingDetails?.phone ||
+          o?.checkoutContactUsed?.phone ||
+          o?.confirmationPageShipping?.phone ||
+          o?.phone;
+        if (phone && String(phone).trim() && String(phone).trim() !== "—") s += 1;
         return s;
       };
       const push = (o) => {
@@ -1200,9 +1208,26 @@
         if (prev && richness(o) <= richness(prev)) return;
         byKey.set(key, o);
       };
+
+      // 以 Finished tab（已付款／有訂單編號）為準
+      const finished = (snap?.browsers || []).filter((b) => isPaidBrowser(b));
+      const finishedOrderNums = new Set();
+      for (const b of finished) {
+        const n = String(b?.card?.orderNumber || "").trim();
+        if (n) finishedOrderNums.add(n);
+      }
+
       const list = Array.isArray(snap?.orders) ? snap.orders : snap?.orders ? [snap.orders] : [];
-      for (const o of list) push(o);
-      for (const b of snap?.browsers || []) {
+      // 先放入與 Finished 對應嘅 order-summary 記錄（資料通常較齊）
+      for (const o of list) {
+        const key = String(o?.orderNumber || "").trim();
+        if (!key) continue;
+        if (finishedOrderNums.size && !finishedOrderNums.has(key)) continue;
+        push(o);
+      }
+
+      // 再用 Finished browser card 補齊／蓋寫
+      for (const b of finished) {
         const c = b.card || {};
         if (!hasOrderNumber(c)) continue;
         push({
@@ -1261,9 +1286,24 @@
           confirmationPageShipping: c.deliveryDetails || {},
         });
       }
+
+      // Finished 空但有 orders 檔（極少）：fallback 顯示全部成功單
+      if (!byKey.size) {
+        for (const o of list) push(o);
+      }
+
       return [...byKey.values()].sort((a, b) =>
         String(b.orderPlacedAt || "").localeCompare(String(a.orderPlacedAt || ""))
       );
+    }
+
+    /** 同時刷新 Order summary + Live card limits（以 Finished 為準） */
+    function syncOrdersAndCardLimitsFromSnap(snap) {
+      if (!snap) return [];
+      const orders = collectSuccessfulOrders(snap);
+      renderOrders(orders);
+      renderCardLimitsFromOrders(orders);
+      return orders;
     }
 
     let lastSuccessfulOrders = [];
@@ -1275,7 +1315,7 @@
       lastSuccessfulOrders = list;
       if (btn) btn.disabled = list.length === 0;
       if (!list.length) {
-        box.innerHTML = '<p class="empty">未有成功落單。任務出現訂單編號後先會喺呢度顯示。</p>';
+        box.innerHTML = '<p class="empty">未有成功落單。Finished tab 出現訂單編號後先會喺呢度顯示。</p>';
         return;
       }
       box.innerHTML = list.map((o) => {
@@ -1385,14 +1425,14 @@
       if (meta) {
         const withAmt = rows.filter((r) => r.amountSpent && r.amountSpent !== "—").length;
         const updated = new Date().toLocaleTimeString("zh-HK", { hour12: false });
-        meta.innerHTML = `Live · 同 Order summary 對齊 · 成功訂單 <b>${rows.length}</b> · 有金額 ${withAmt} · 顯示 ${filtered.length} · 更新 ${esc(updated)}`;
+        meta.innerHTML = `Live · 同 Order summary／Finished 對齊 · 成功訂單 <b>${rows.length}</b> · 有金額 ${withAmt} · 顯示 ${filtered.length} · 更新 ${esc(updated)}`;
       }
 
       if (!filtered.length) {
         body.innerHTML = `<tr><td colspan="10" class="empty">${
           cardOnly
             ? "未有非 Apple Pay 嘅成功訂單。"
-            : "未有成功訂單。Order summary 出現訂單編號後會即時顯示喺呢度。"
+            : "未有成功訂單。Finished tab 出現訂單編號後會即時顯示喺呢度。"
         }</td></tr>`;
         return;
       }
@@ -1436,9 +1476,8 @@
       $("totalBrowsers").textContent = String(snap.totalBrowsers ?? 0);
       if (snap.config) fillForm(snap.config);
       renderBrowsers(snap.browsers || []);
-      const orders = collectSuccessfulOrders(snap);
-      renderOrders(orders);
-      renderCardLimitsFromOrders(orders);
+      // Order summary + Live card limits：以 Finished tab 對齊
+      syncOrdersAndCardLimitsFromSnap(snap);
       applyMonitorUI(snap.monitor);
 
       const key = "all";
@@ -1808,6 +1847,30 @@
       }
       try {
         await refresh();
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = prev;
+        }
+      }
+    });
+
+    $("btnOrdersRefresh")?.addEventListener("click", async () => {
+      const btn = $("btnOrdersRefresh");
+      const prev = btn?.textContent || "Refresh";
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "Refreshing…";
+      }
+      try {
+        // 重新拉 snapshot，用 Finished tab 對齊 Order summary + Live card limits
+        const res = await fetch("/api/snapshot");
+        const snap = await res.json();
+        if (snap?.browsers) lastBrowsersSnap = snap.browsers;
+        renderBrowsers(snap?.browsers || lastBrowsersSnap || []);
+        syncOrdersAndCardLimitsFromSnap(snap);
+      } catch (err) {
+        alert(err instanceof Error ? err.message : String(err));
       } finally {
         if (btn) {
           btn.disabled = false;
