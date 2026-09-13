@@ -1603,25 +1603,56 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     });
   }
 
-  if (pathname === "/api/add-order-apple-ac/stop" && req.method === "POST") {
-    const child = addOrderJob.child;
-    if (child && !child.killed) {
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        /* ignore */
-      }
-      if (process.platform === "win32" && child.pid) {
-        try {
-          spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
-            stdio: "ignore",
-            windowsHide: true,
-          });
-        } catch {
-          /* ignore */
-        }
-      }
+  const gmailAccountsFile = path.join(RUNTIME_DIR, "gmail-accounts-saved.txt");
+
+  if (pathname === "/api/add-order-apple-ac/accounts" && req.method === "GET") {
+    await ensureRuntimeDir();
+    let text = "";
+    try {
+      text = await fs.readFile(gmailAccountsFile, "utf8");
+    } catch {
+      text = "";
     }
+    return sendJson(res, 200, { ok: true, text });
+  }
+
+  if (pathname === "/api/add-order-apple-ac/accounts/save" && req.method === "POST") {
+    await ensureRuntimeDir();
+    let body: { text?: string } = {};
+    try {
+      body = JSON.parse(await readBody(req)) as typeof body;
+    } catch {
+      return sendJson(res, 400, { ok: false, error: "invalid JSON" });
+    }
+    const text = String(body.text ?? "");
+    await fs.writeFile(gmailAccountsFile, text, "utf8");
+    return sendJson(res, 200, { ok: true });
+  }
+
+  if (pathname === "/api/add-order-apple-ac/accounts/clear" && req.method === "POST") {
+    await ensureRuntimeDir();
+    await fs.writeFile(gmailAccountsFile, "", "utf8");
+    return sendJson(res, 200, { ok: true });
+  }
+
+  if (pathname === "/api/add-order-apple-ac/stop" && req.method === "POST") {
+    await ensureRuntimeDir();
+    const stopFlag = path.join(RUNTIME_DIR, "add-order-stop.flag");
+    await fs.writeFile(stopFlag, new Date().toISOString(), "utf8");
+    const child = addOrderJob.child;
+    const pid = child?.pid || addOrderJob.pid;
+    if (child) {
+      killProc(child);
+    } else if (process.platform === "win32" && pid) {
+      spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+        stdio: "ignore",
+        shell: true,
+      });
+    }
+    addOrderJob.running = false;
+    addOrderJob.child = null;
+    addOrderJob.pid = null;
+    addOrderJob.lastExitCode = addOrderJob.lastExitCode ?? 1;
     addOrderJob.logs.push(`[dashboard] stop requested @ ${new Date().toISOString()}`);
     return sendJson(res, 200, { ok: true });
   }
@@ -1656,6 +1687,8 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     }
 
     await ensureRuntimeDir();
+    const stopFlag = path.join(RUNTIME_DIR, "add-order-stop.flag");
+    await fs.unlink(stopFlag).catch(() => {});
     const configPath = path.join(RUNTIME_DIR, "add-order-apple-ac.json");
     await fs.writeFile(
       configPath,
@@ -1674,6 +1707,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
       cwd: ROOT,
       env: envForCheckoutChild({
         ADD_ORDER_CONFIG_PATH: configPath,
+        ADD_ORDER_STOP_FLAG: stopFlag,
       }),
       stdio: ["ignore", "pipe", "pipe"],
     });

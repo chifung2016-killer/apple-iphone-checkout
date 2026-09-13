@@ -7,6 +7,9 @@
  * }
  */
 import fs from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
 import { chromium, type Browser, type BrowserContext, type Frame, type Page } from "playwright";
 
 type Account = { email: string; password: string };
@@ -17,14 +20,37 @@ type JobConfig = {
   applePassword: string;
 };
 
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CONFIG_PATH =
   process.env.ADD_ORDER_CONFIG_PATH ||
   process.env.CHECKOUT_CONFIG_PATH ||
   "";
+const STOP_FLAG =
+  process.env.ADD_ORDER_STOP_FLAG ||
+  path.join(ROOT, "runtime", "add-order-stop.flag");
+
+class StopRequestedError extends Error {
+  constructor() {
+    super("已收到 Stop");
+    this.name = "StopRequestedError";
+  }
+}
 
 function log(msg: string) {
-  const line = `[add-order] ${msg}`;
-  console.log(line);
+  console.log(`[add-order] ${msg}`);
+}
+
+async function stopRequested(): Promise<boolean> {
+  try {
+    await fs.access(STOP_FLAG);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function throwIfStopped(): Promise<void> {
+  if (await stopRequested()) throw new StopRequestedError();
 }
 
 async function loadConfig(): Promise<JobConfig> {
@@ -48,7 +74,40 @@ async function loadConfig(): Promise<JobConfig> {
 }
 
 async function sleep(ms: number) {
-  await new Promise((r) => setTimeout(r, ms));
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    await throwIfStopped();
+    await new Promise((r) => setTimeout(r, Math.min(250, end - Date.now())));
+  }
+}
+
+/** 同 dashboard：視窗一開就 minimize 隱藏 */
+async function minimizeBrowserWindow(page: Page, browser: Browser): Promise<void> {
+  try {
+    const cdp = await page.context().newCDPSession(page);
+    const { windowId } = (await cdp.send("Browser.getWindowForTarget")) as {
+      windowId: number;
+    };
+    await cdp.send("Browser.setWindowBounds", {
+      windowId,
+      bounds: { windowState: "minimized" },
+    });
+    await cdp.detach().catch(() => {});
+  } catch {
+    /* ignore CDP fail */
+  }
+  if (process.platform === "win32") {
+    const proc = (browser as unknown as { process?: () => { pid?: number } | null }).process?.();
+    const pid = proc?.pid;
+    if (pid) {
+      // 6 = SW_MINIMIZE
+      const ps = `Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class W{[DllImport("user32.dll")]public static extern bool ShowWindowAsync(IntPtr h,int n);}' -ErrorAction SilentlyContinue; $p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if($p -and $p.MainWindowHandle -ne 0){[void][W]::ShowWindowAsync($p.MainWindowHandle,6)}`;
+      spawn("powershell", ["-NoProfile", "-Command", ps], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    }
+  }
 }
 
 const APPLE_AUTH_IFRAME_SELS = [
@@ -632,6 +691,7 @@ async function processOneAccount(
   appleEmail: string,
   applePassword: string
 ): Promise<void> {
+  await throwIfStopped();
   log(`======== 開始處理 ${account.email} ========`);
   const context = await browser.newContext({
     locale: "zh-HK",
@@ -643,16 +703,20 @@ async function processOneAccount(
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
   });
   const page = await context.newPage();
+  // 同 dashboard：一開就 minimize，全程保持隱藏
+  await minimizeBrowserWindow(page, browser);
+  log("瀏覽器已隱藏（minimized）");
   try {
     await gmailLogin(page, account.email, account.password);
+    await minimizeBrowserWindow(page, browser);
     await gmailSearchAndOpenOrderEmail(page);
     const orderPage = await clickOrderStatusInEmail(page, context);
+    await minimizeBrowserWindow(orderPage, browser);
     await waitForAppleOrderGuestPage(orderPage);
     await clickAddToAppleIdOnce(orderPage);
     await signInAppleIdOnOrderPage(orderPage, appleEmail, applePassword);
     log(`完成：${account.email} → 已嘗試加入 Apple ID`);
-    // 保持瀏覽器一陣方便人手確認
-    await sleep(4000);
+    await sleep(2000);
   } finally {
     await context.close().catch(() => {});
   }
@@ -664,10 +728,10 @@ async function launchBrowser(): Promise<Browser> {
     args: [
       "--disable-blink-features=AutomationControlled",
       "--disable-features=IsolateOrigins,site-per-process",
+      "--start-minimized",
     ],
     ignoreDefaultArgs: ["--enable-automation"] as string[],
   };
-  // 優先用本機 Chrome（Google 較少擋）
   try {
     return await chromium.launch({ ...common, channel: "chrome" });
   } catch {
@@ -677,21 +741,39 @@ async function launchBrowser(): Promise<Browser> {
 }
 
 async function main() {
+  await fs.unlink(STOP_FLAG).catch(() => {});
   const cfg = await loadConfig();
   log(`共 ${cfg.accounts.length} 個 Gmail；Apple ID=${cfg.appleEmail}`);
 
   const browser = await launchBrowser();
 
+  const onSignal = () => {
+    log("收到中止訊號，準備停止…");
+    void fs.writeFile(STOP_FLAG, new Date().toISOString(), "utf8").catch(() => {});
+  };
+  process.on("SIGTERM", onSignal);
+  process.on("SIGINT", onSignal);
+
   try {
     for (const acc of cfg.accounts) {
+      await throwIfStopped();
       try {
         await processOneAccount(browser, acc, cfg.appleEmail, cfg.applePassword);
       } catch (err) {
+        if (err instanceof StopRequestedError) throw err;
         log(`失敗 ${acc.email}：${err instanceof Error ? err.message : String(err)}`);
       }
     }
+  } catch (err) {
+    if (err instanceof StopRequestedError) {
+      log("已停止（Stop）");
+    } else {
+      throw err;
+    }
   } finally {
     await browser.close().catch(() => {});
+    process.off("SIGTERM", onSignal);
+    process.off("SIGINT", onSignal);
   }
   log("全部帳號處理完");
 }

@@ -116,7 +116,11 @@
       <div class="field">
         <label for="accounts">每行一個：email password（空格或 : 或 , 分隔）</label>
         <textarea id="accounts" placeholder="chifung2016@gmail.com myGmailPassword&#10;other@gmail.com otherPassword"></textarea>
-        <p class="hint">會逐個自動登入 Gmail，搜尋含「apple store」或「出貨」嘅郵件，撳「訂單狀態」一次。</p>
+        <div class="actions" style="margin-top:10px">
+          <button type="button" class="btn-primary" id="btnSaveAccounts">Save</button>
+          <button type="button" class="btn-danger" id="btnClearAccounts">Clear all</button>
+        </div>
+        <p class="hint">會逐個自動登入 Gmail，搜尋含「apple store」或「出貨」嘅郵件，撳「訂單狀態」一次。撳 Save 會存去 server，之後更新頁面都唔會清走。</p>
       </div>
     </section>
 
@@ -261,14 +265,62 @@
     });
 
     $("btnStop").addEventListener("click", async () => {
-      await fetch("/api/add-order-apple-ac/stop", { method: "POST" });
-      refreshStatus();
+      $("btnStop").disabled = true;
+      $("btnStop").textContent = "Stopping…";
+      setStatus("Stopping…", "err");
+      try {
+        await fetch("/api/add-order-apple-ac/stop", { method: "POST" });
+      } catch {
+        /* ignore */
+      }
+      startPolling();
+      setTimeout(() => {
+        $("btnStop").textContent = "Stop";
+        refreshStatus();
+      }, 800);
     });
 
     $("btnClearLogs").addEventListener("click", () => {
       logsEl.textContent = "";
     });
 
+    $("btnSaveAccounts").addEventListener("click", async () => {
+      const text = $("accounts").value;
+      const res = await fetch("/api/add-order-apple-ac/accounts/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        alert(data.error || "Save failed");
+        return;
+      }
+      const btn = $("btnSaveAccounts");
+      const prev = btn.textContent;
+      btn.textContent = "Saved";
+      setTimeout(() => { btn.textContent = prev || "Save"; }, 1200);
+    });
+
+    $("btnClearAccounts").addEventListener("click", async () => {
+      if (!confirm("Clear all saved Gmail accounts？")) return;
+      $("accounts").value = "";
+      await fetch("/api/add-order-apple-ac/accounts/clear", { method: "POST" });
+    });
+
+    async function loadSavedAccounts() {
+      try {
+        const res = await fetch("/api/add-order-apple-ac/accounts");
+        const data = await res.json();
+        if (data.ok && typeof data.text === "string" && data.text.trim()) {
+          $("accounts").value = data.text;
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
+    loadSavedAccounts();
     refreshStatus();
   </script>
 </body>
