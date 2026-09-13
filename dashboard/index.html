@@ -67,12 +67,19 @@
     }
     label { display: block; font-size: 0.8rem; color: var(--muted); margin: 0 0 6px; }
     .field { margin-bottom: 12px; }
-    input, select {
+    input, select, textarea {
       width: 100%; border: 1px solid var(--line); background: var(--field);
       color: var(--text); border-radius: 10px; padding: 10px 12px; font: inherit; outline: none;
     }
-    input:focus, select:focus {
+    input:focus, select:focus, textarea:focus {
       border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+    }
+    textarea {
+      min-height: 72px;
+      resize: vertical;
+      font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+      font-size: 0.86rem;
+      line-height: 1.45;
     }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
@@ -479,15 +486,15 @@
             </div>
           </div>
           <div class="field">
-            <label for="proxy">Proxy / IP（可選，每個 task 可填唔同）</label>
-            <input
+            <label for="proxy">Proxy / IP（可選，可填多個）</label>
+            <textarea
               id="proxy"
               name="proxy"
-              placeholder="例如 1.2.3.4:8080 或 http://user:pass@host:port 或 socks5://host:1080（留空＝本機 IP）"
+              placeholder="每行一個，或用逗號分隔&#10;例如：&#10;1.2.3.4:8080&#10;http://user:pass@host:port&#10;socks5://host:1080&#10;留空＝本機 IP"
               autocomplete="off"
               spellcheck="false"
-            />
-            <p class="hint" style="margin:6px 0 0">之後用嚟轉 IP。留空就唔用 proxy。</p>
+            ></textarea>
+            <p class="hint" style="margin:6px 0 0">可填多個 proxy：每個新 task 會<strong>隨機揀一個</strong>專用。若該 task 未能成功結帳，呢個 proxy 會入黑名單，之後唔再使用。留空就用本機 IP。</p>
           </div>
           <div class="field">
             <label for="productPollIntervalMs">Refresh interval (ms)</label>
@@ -535,6 +542,7 @@
           <p class="hint" id="browsersHint">進行中嘅 task（新開嘅會排喺最底）。付款成功會即時移去 Finished。</p>
         </div>
         <div class="browsers-actions">
+          <button type="button" class="btn-ghost btn-sm" id="btnBrowsersReload" title="重新載入 Opened／Finished">Reload</button>
           <button type="button" class="btn-danger btn-sm" id="btnStop">Stop all</button>
           <button type="button" class="btn-ghost btn-sm" id="btnClearAll">Clear all</button>
           <button type="button" class="btn-warn btn-sm" id="btnContinue">Continue all</button>
@@ -562,6 +570,7 @@
             <tr>
               <th>Order</th>
               <th>Placed</th>
+              <th>Delivery method</th>
               <th>Product</th>
               <th>Qty</th>
               <th>Amount spent</th>
@@ -571,7 +580,7 @@
             </tr>
           </thead>
           <tbody id="cardLimitsBody">
-            <tr><td colspan="8" class="empty">載入訂單／卡額資料中…</td></tr>
+            <tr><td colspan="9" class="empty">載入訂單／卡額資料中…</td></tr>
           </tbody>
         </table>
       </div>
@@ -862,7 +871,7 @@
       if (hint) {
         hint.textContent =
           browsersTab === "finished"
-            ? "已付款成功嘅 task（即時由 Opened browsers 移入）。"
+            ? "已付款成功嘅 task。資料唔齊可撳 Reload 重新由訂單摘要載入。"
             : "進行中嘅 task（新開嘅會排喺最底）。付款成功會即時移去 Finished。";
       }
       renderBrowsers(lastBrowsersSnap);
@@ -888,7 +897,12 @@
       }
       box.innerHTML = list.map((b) => {
         const c = b.card || {};
-        const fulfillment = c.fulfillmentMode || b.config?.fulfillmentPreference || "—";
+        const fulfillment = resolveDeliveryMethod(
+          c.deliveryMethod,
+          c.fulfillmentPreference,
+          b.config?.fulfillmentPreference,
+          c.fulfillmentMode
+        );
         const paid = isPaidBrowser(b);
         const waitingPay =
           !paid &&
@@ -925,7 +939,7 @@
         const amount = c.total || "—";
         const cardShow = c.cardNumber
           ? displayCardNumber(c.cardNumber)
-          : /apple_pay/i.test(String(fulfillment))
+          : /apple\s*pay/i.test(String(fulfillment))
             ? "Apple Pay"
             : "—";
         const companyShow =
@@ -965,7 +979,7 @@
             <span><b>Colour</b>${esc(colour)}</span>
             <span><b>Storage</b>${esc(storage)}</span>
             <span><b>Qty</b>${esc(qty)}</span>
-            <span><b>Fulfill</b>${esc(fulfillment)}</span>
+            <span><b>Delivery method</b>${esc(fulfillment)}</span>
             <span><b>Amount</b>${esc(amount)}</span>
             <span><b>Order</b>${esc(orderNoShow)}</span>
             <span><b>Card</b>${esc(cardShow)}</span>
@@ -979,6 +993,7 @@
             <span><b>Address</b>${esc(addrShow)}</span>
             <span><b>Building</b>${esc(buildingShow)}</span>
             <span><b>ETA</b>${esc(etaShow)}</span>
+            ${c.proxy ? `<span class="wide"><b>Proxy</b>${esc(c.proxy)}</span>` : ""}
             ${msgShow ? `<span class="wide"><b>Status</b>${esc(msgShow)}</span>` : ""}
             ${urlShow && urlShow !== "—" ? `<span class="wide"><b>URL</b>${esc(urlShow)}</span>` : ""}
           </div>
@@ -1005,6 +1020,39 @@
       return s;
     }
 
+    /** 同 Run configuration「Delivery method」選項字眼一致 */
+    function deliveryMethodLabel(pref) {
+      const p = String(pref || "").trim();
+      if (!p || p === "—") return "—";
+      switch (p) {
+        case "pickup":
+          return "pickup credit card訪客模式";
+        case "delivery":
+          return "delivery credit card訪客模式";
+        case "pickup_apple_pay":
+          return "pickup apple pay";
+        case "delivery_apple_pay":
+          return "delivery apple pay";
+        case "pickup_apple_ac_apple_pay":
+          return "pickup apple ac apple pay";
+        case "delivery_apple_ac_apple_pay":
+          return "delivery apple ac apple pay";
+        case "auto":
+          return "Auto（先取貨，失敗改送貨）";
+        default:
+          return p;
+      }
+    }
+
+    function resolveDeliveryMethod(...candidates) {
+      for (const c of candidates) {
+        const s = String(c ?? "").trim();
+        if (!s || s === "—") continue;
+        return deliveryMethodLabel(s);
+      }
+      return "—";
+    }
+
     /** Order summary ↔ Live card limits 共用（同一訂單編號必須一致） */
     function orderDisplayFields(o) {
       const ship = o.confirmationPageShipping || {};
@@ -1026,6 +1074,12 @@
         remainingLimit: isApplePay
           ? "—"
           : o.remainingCreditCardLimit || o.remainingLimit || "—",
+        deliveryMethod: resolveDeliveryMethod(
+          o.deliveryMethod,
+          o.fulfillmentPreference,
+          o.fulfillmentMode,
+          o.checkoutContactUsed?.mode
+        ),
       };
     }
 
@@ -1075,8 +1129,15 @@
           remainingCreditCardLimit: c.remainingCreditCardLimit || c.remainingLimit,
           remainingLimit: c.remainingLimit || c.remainingCreditCardLimit,
           orderPlacedAt: c.orderPlacedAt,
-          deliveryMethod: c.deliveryMethod || c.fulfillmentMode || b.config?.fulfillmentPreference,
+          deliveryMethod: resolveDeliveryMethod(
+            c.deliveryMethod,
+            c.fulfillmentPreference,
+            c.fulfillmentMode,
+            b.config?.fulfillmentPreference
+          ),
           fulfillmentMode: c.fulfillmentMode,
+          fulfillmentPreference: c.fulfillmentPreference || b.config?.fulfillmentPreference,
+          proxy: c.proxy || b.config?.proxy || "",
           estimatedDelivery: c.estimatedDelivery || c.deliveryDetails?.estimatedDelivery,
           deliveryShippingBoxes: {
             lastName: c.lastName || c.deliveryDetails?.lastName,
@@ -1131,7 +1192,12 @@
         const sd = o.shippingDetails || {};
         const boxes = o.deliveryShippingBoxes || {};
         const identity = o.identity || {};
-        const deliveryMethod = o.deliveryMethod || o.fulfillmentMode || contact.mode || "—";
+        const deliveryMethod = resolveDeliveryMethod(
+          o.deliveryMethod,
+          o.fulfillmentPreference,
+          o.fulfillmentMode,
+          contact.mode
+        );
         const lastName = boxes.lastName || sd.lastName || contact.lastName || identity.lastName || "";
         const firstName = boxes.firstName || sd.firstName || contact.firstName || identity.firstName || "";
         const areaDistrictStreet =
@@ -1219,7 +1285,7 @@
       const filtered = rows.filter((r) => {
         if (cardOnly && /apple\s*pay/i.test(String(r.cardNumber))) return false;
         if (!q) return true;
-        const hay = `${r.orderNumber} ${r.product} ${r.color} ${r.storage} ${r.cardNumber} ${r.cardCompany} ${r.browser} ${r.amountSpent}`.toLowerCase();
+        const hay = `${r.orderNumber} ${r.product} ${r.color} ${r.storage} ${r.cardNumber} ${r.cardCompany} ${r.browser} ${r.amountSpent} ${r.deliveryMethod}`.toLowerCase();
         return hay.includes(q);
       });
 
@@ -1230,7 +1296,7 @@
       }
 
       if (!filtered.length) {
-        body.innerHTML = `<tr><td colspan="8" class="empty">${
+        body.innerHTML = `<tr><td colspan="9" class="empty">${
           cardOnly
             ? "未有非 Apple Pay 嘅成功訂單。"
             : "未有成功訂單。Order summary 出現訂單編號後會即時顯示喺呢度。"
@@ -1253,6 +1319,7 @@
           return `<tr class="${cls}" data-order="${esc(r.orderNumber)}">
             <td>${esc(r.orderNumber)}</td>
             <td>${esc(r.orderPlacedAt)}</td>
+            <td>${esc(r.deliveryMethod || "—")}</td>
             <td>${esc(product || "—")}</td>
             <td class="num">${esc(r.quantity)}</td>
             <td class="num">${esc(r.amountSpent)}</td>
@@ -1450,6 +1517,23 @@
 
     $("tabOpened")?.addEventListener("click", () => setBrowsersTab("opened"));
     $("tabFinished")?.addEventListener("click", () => setBrowsersTab("finished"));
+
+    $("btnBrowsersReload")?.addEventListener("click", async () => {
+      const btn = $("btnBrowsersReload");
+      const prev = btn?.textContent || "Reload";
+      try {
+        if (btn) {
+          btn.disabled = true;
+          btn.textContent = "Reloading…";
+        }
+        await refresh();
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = prev;
+        }
+      }
+    });
 
     $("btnClearAll").addEventListener("click", async () => {
       if (!confirm("Clear all opened tasks？只會清未完成嘅 Opened browsers；Finished 會保留。")) return;

@@ -15,6 +15,10 @@ import {
   peekCardLimitInfo,
   resolveOrderAmountSpent,
 } from "./credit-card-pool.js";
+import {
+  fulfillmentLabelFromPreference,
+  resolveDeliveryMethodLabel,
+} from "./fulfillment-label.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PUBLIC = path.join(ROOT, "dashboard");
@@ -22,6 +26,7 @@ const RUNTIME_DIR = path.join(ROOT, "runtime");
 const RUNTIME_CONFIG = path.join(ROOT, "runtime-config.json");
 const ORDERS_FILE = path.join(ROOT, "order-summary.json");
 const CONTINUE_ALL_FLAG = path.join(ROOT, "dashboard-continue.flag");
+const PROXY_BLACKLIST_FILE = path.join(RUNTIME_DIR, "proxy-blacklist.json");
 const PORT = Number(process.env.DASHBOARD_PORT || 8787);
 
 type BrowserSession = {
@@ -218,6 +223,76 @@ async function clearLaunchFlags(id: string): Promise<void> {
   ]) {
     await fs.unlink(path.join(RUNTIME_DIR, name)).catch(() => {});
   }
+}
+
+/** 將 Proxy 欄（多行／逗號分隔）拆成列表 */
+function parseProxyPool(raw: unknown): string[] {
+  const s = String(raw || "").trim();
+  if (!s) return [];
+  return s
+    .split(/[\n\r,;]+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+function normalizeProxyKey(proxy: string): string {
+  return String(proxy || "").trim().toLowerCase();
+}
+
+async function loadProxyBlacklist(): Promise<Set<string>> {
+  try {
+    const raw = await fs.readFile(PROXY_BLACKLIST_FILE, "utf8");
+    const parsed = JSON.parse(raw) as { proxies?: string[] } | string[];
+    const list = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(parsed.proxies)
+        ? parsed.proxies
+        : [];
+    return new Set(list.map(normalizeProxyKey).filter(Boolean));
+  } catch {
+    return new Set();
+  }
+}
+
+async function blacklistProxy(proxy: string, reason: string): Promise<void> {
+  const key = normalizeProxyKey(proxy);
+  if (!key) return;
+  await ensureRuntimeDir();
+  const set = await loadProxyBlacklist();
+  if (set.has(key)) return;
+  set.add(key);
+  const proxies = [...set];
+  await fs.writeFile(
+    PROXY_BLACKLIST_FILE,
+    JSON.stringify(
+      { updatedAt: new Date().toISOString(), reason, lastAdded: proxy, proxies },
+      null,
+      2
+    ),
+    "utf8"
+  );
+  console.log(`[proxy] 已加入黑名單（之後唔再用）：${proxy}｜${reason}`);
+}
+
+/** 每個新 task 隨機揀一個未禁用、盡量未用緊嘅 proxy */
+async function pickProxyForNewTask(poolRaw: unknown): Promise<string> {
+  const pool = parseProxyPool(poolRaw);
+  if (!pool.length) return "";
+  const banned = await loadProxyBlacklist();
+  const inUse = new Set<string>();
+  for (const s of sessions.values()) {
+    if (!s.running) continue;
+    const p = normalizeProxyKey(String(s.config?.proxy || ""));
+    if (p) inUse.add(p);
+  }
+  const available = pool.filter((p) => !banned.has(normalizeProxyKey(p)));
+  const preferred = available.filter((p) => !inUse.has(normalizeProxyKey(p)));
+  const candidates = preferred.length ? preferred : available;
+  if (!candidates.length) {
+    console.warn("[proxy] 池入面可用 proxy 已用盡／全被禁用，呢個 task 改用本機 IP");
+    return "";
+  }
+  return candidates[Math.floor(Math.random() * candidates.length)]!;
 }
 
 /** 由 Opened browsers 移除卡片（保留 order-*.json 畀 Order summary） */
@@ -417,6 +492,12 @@ async function spawnOneBrowser(
     _windowIndexHint?: number;
   };
   const sessionConfig = { ...cleanConfig, browserCount: 1 };
+  // 多個 proxy：每個新 task 隨機揀一個（失敗會入黑名單，之後唔再用）
+  const assignedProxy = await pickProxyForNewTask(cleanConfig.proxy);
+  sessionConfig.proxy = assignedProxy;
+  if (assignedProxy) {
+    console.log(`[proxy] ${id} 分配：${assignedProxy}`);
+  }
   const configPath = path.join(RUNTIME_DIR, `config-${id}.json`);
   await fs.writeFile(configPath, JSON.stringify(sessionConfig, null, 2), "utf8");
   await fs.writeFile(RUNTIME_CONFIG, JSON.stringify({ ...cleanConfig }, null, 2), "utf8");
@@ -479,6 +560,22 @@ async function spawnOneBrowser(
     session.pid = null;
     session.child = null;
     pushSessionLog(session, `[dashboard] 進程結束 exit=${code}`);
+    // 用咗 proxy 但未成功付款／落單 → 加入黑名單，之後唔再分配
+    const usedProxy = String(session.config?.proxy || "").trim();
+    if (usedProxy) {
+      const paid = await isPaidBrowserSession(session.id);
+      const st = await readSessionStatus(session.id);
+      const phase = String(st?.phase || "");
+      const failed =
+        !paid &&
+        (code !== 0 || /error|fail/i.test(phase));
+      if (failed) {
+        await blacklistProxy(
+          usedProxy,
+          `session=${session.id} exit=${code} phase=${phase || "—"}`
+        ).catch(() => {});
+      }
+    }
     broadcast({ type: "status", state: await snapshot() });
   });
 
@@ -492,8 +589,9 @@ async function writeInitialOpenedBrowserStatus(
   pid: number | null
 ): Promise<void> {
   const qty = Math.max(1, Number(config.quantity) || 1);
-  const fulfill = String(config.fulfillmentPreference || "pickup");
-  const applePay = /apple_pay/i.test(fulfill);
+  const fulfillPref = String(config.fulfillmentPreference || "pickup");
+  const deliveryMethod = fulfillmentLabelFromPreference(fulfillPref);
+  const applePay = /apple_pay/i.test(fulfillPref);
   const amt = resolveOrderAmountSpent({
     model: String(config.model || ""),
     storage: String(config.storage || ""),
@@ -513,7 +611,7 @@ async function writeInitialOpenedBrowserStatus(
       color: config.color,
       storage: config.storage,
       quantity: qty,
-      fulfillmentPreference: fulfill,
+      fulfillmentPreference: fulfillPref,
       buyUrl: config.buyUrl,
       proxy: config.proxy || "",
     },
@@ -522,8 +620,9 @@ async function writeInitialOpenedBrowserStatus(
       color: config.color ?? null,
       storage: config.storage ?? null,
       quantity: qty,
-      fulfillmentMode: fulfill,
-      deliveryMethod: fulfill,
+      fulfillmentMode: fulfillPref,
+      fulfillmentPreference: fulfillPref,
+      deliveryMethod,
       total: amt.label || null,
       orderNumber: null,
       email: null,
@@ -923,6 +1022,96 @@ async function snapshot() {
           peek?.remainingLabel
         ) || null;
 
+    const sd = (order?.shippingDetails || {}) as Record<string, unknown>;
+    const contact = (order?.checkoutContactUsed || {}) as Record<string, unknown>;
+    const boxes = (order?.deliveryShippingBoxes || {}) as Record<string, unknown>;
+    const identity = (order?.identity || {}) as Record<string, unknown>;
+    const confShip = (order?.confirmationPageShipping || {}) as Record<string, unknown>;
+    const deliveryDetails =
+      (card.deliveryDetails as Record<string, unknown> | null | undefined) || null;
+
+    const lastName =
+      pickNonEmpty(
+        card.lastName,
+        boxes.lastName,
+        sd.lastName,
+        contact.lastName,
+        identity.lastName,
+        deliveryDetails?.lastName
+      ) || null;
+    const firstName =
+      pickNonEmpty(
+        card.firstName,
+        boxes.firstName,
+        sd.firstName,
+        contact.firstName,
+        identity.firstName,
+        deliveryDetails?.firstName
+      ) || null;
+    const email =
+      pickNonEmpty(
+        card.email,
+        sd.email,
+        contact.email,
+        confShip.email,
+        identity.email,
+        deliveryDetails?.email
+      ) || null;
+    const phone =
+      pickNonEmpty(
+        card.phone,
+        sd.phone,
+        contact.phone,
+        confShip.phone,
+        identity.phone,
+        deliveryDetails?.phone
+      ) || null;
+    const address =
+      pickNonEmpty(
+        card.address,
+        sd.address,
+        contact.address,
+        confShip.address,
+        confShip.pickupStore,
+        sd.pickupStore,
+        deliveryDetails?.address
+      ) || null;
+    const name =
+      pickNonEmpty(
+        card.name,
+        sd.name,
+        deliveryDetails?.name,
+        [lastName, firstName].filter(Boolean).join(" ")
+      ) || null;
+    const areaDistrictStreet =
+      pickNonEmpty(
+        card.areaDistrictStreet,
+        boxes.areaDistrictStreet,
+        sd.areaDistrictStreet,
+        contact.areaDistrictStreet,
+        deliveryDetails?.areaDistrictStreet,
+        [identity.area, identity.district, identity.street].filter(Boolean).join(" ")
+      ) || null;
+    const buildingFloorUnit =
+      pickNonEmpty(
+        card.buildingFloorUnit,
+        boxes.buildingFloorUnit,
+        sd.buildingFloorUnit,
+        contact.buildingFloorUnit,
+        identity.buildingLine,
+        deliveryDetails?.buildingFloorUnit
+      ) || null;
+
+    const deliveryMethod = resolveDeliveryMethodLabel(
+      card.deliveryMethod,
+      order?.deliveryMethod,
+      order?.fulfillmentPreference,
+      card.fulfillmentPreference,
+      s.config.fulfillmentPreference,
+      card.fulfillmentMode,
+      order?.fulfillmentMode
+    );
+
     browsers.push({
       id: s.id,
       index: s.index,
@@ -952,18 +1141,17 @@ async function snapshot() {
           null,
         fulfillmentMode:
           card.fulfillmentMode ?? order?.fulfillmentMode ?? s.config.fulfillmentPreference,
+        fulfillmentPreference:
+          card.fulfillmentPreference ??
+          order?.fulfillmentPreference ??
+          s.config.fulfillmentPreference,
+        deliveryMethod,
         orderNumber,
-        email:
-          card.email ??
-          (order?.identity as { email?: string } | undefined)?.email ??
-          null,
-        phone:
-          card.phone ??
-          (order?.identity as { phone?: string } | undefined)?.phone ??
-          null,
-        address: card.address ?? null,
-        name: card.name ?? null,
-        proxy: card.proxy ?? s.config.proxy ?? null,
+        email,
+        phone,
+        address,
+        name,
+        proxy: card.proxy ?? order?.proxy ?? s.config.proxy ?? null,
         cardNumber,
         cardType: isApplePay
           ? pickNonEmpty(card.cardType, order?.cardType) || "Apple Pay"
@@ -979,14 +1167,20 @@ async function snapshot() {
         remainingCreditCardLimit: remaining,
         remainingLimit: remaining,
         orderPlacedAt: card.orderPlacedAt ?? order?.orderPlacedAt ?? null,
-        deliveryDetails: card.deliveryDetails ?? null,
-        estimatedDelivery: card.estimatedDelivery ?? order?.estimatedDelivery ?? null,
+        deliveryDetails: deliveryDetails || (Object.keys(sd).length ? sd : null),
+        estimatedDelivery:
+          pickNonEmpty(
+            card.estimatedDelivery,
+            order?.estimatedDelivery,
+            sd.estimatedDelivery,
+            deliveryDetails?.estimatedDelivery
+          ) || null,
         paymentSucceeded,
-        url: card.url ?? null,
-        lastName: card.lastName ?? null,
-        firstName: card.firstName ?? null,
-        areaDistrictStreet: card.areaDistrictStreet ?? null,
-        buildingFloorUnit: card.buildingFloorUnit ?? null,
+        url: card.url ?? order?.url ?? null,
+        lastName,
+        firstName,
+        areaDistrictStreet,
+        buildingFloorUnit,
         message: runtimeStatus?.message ?? (paymentSucceeded ? "payment succeeded" : null),
       },
     });
@@ -1051,8 +1245,9 @@ async function snapshot() {
           storage: o.storage || lastFormConfig.storage,
           quantity: o.quantity || lastFormConfig.quantity || 1,
           fulfillmentPreference:
-            o.fulfillmentMode ||
             o.fulfillmentPreference ||
+            o.deliveryMethod ||
+            o.fulfillmentMode ||
             lastFormConfig.fulfillmentPreference,
           proxy: o.proxy || "",
         },

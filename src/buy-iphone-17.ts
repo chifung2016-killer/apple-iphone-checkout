@@ -22,6 +22,7 @@ import {
   lookupCardMeta,
   resolveOrderAmountSpent,
 } from "./credit-card-pool.js";
+import { fulfillmentLabelFromPreference } from "./fulfillment-label.js";
 
 // =============================================================================
 // 請喺呢度改你自己嘅選項（Dashboard 會用 runtime-config.json 覆寫）
@@ -1037,22 +1038,7 @@ function isCheckoutFlowPage(url: string): boolean {
 }
 
 function fulfillmentLabel(): string {
-  switch (CONFIG.fulfillmentPreference) {
-    case "pickup":
-      return "pickup credit card訪客模式";
-    case "delivery":
-      return "delivery credit card訪客模式";
-    case "pickup_apple_pay":
-      return "pickup apple pay";
-    case "delivery_apple_pay":
-      return "delivery apple pay";
-    case "pickup_apple_ac_apple_pay":
-      return "pickup apple ac apple pay";
-    case "delivery_apple_ac_apple_pay":
-      return "delivery apple ac apple pay";
-    default:
-      return CONFIG.fulfillmentPreference;
-  }
+  return fulfillmentLabelFromPreference(CONFIG.fulfillmentPreference);
 }
 
 async function clickFirstVisible(
@@ -7609,6 +7595,7 @@ async function persistOrderSummaryPartial(
     deliveryMethod: fulfillmentLabel(),
     fulfillmentMode: session.fulfillmentMode ?? "delivery",
     fulfillmentPreference: CONFIG.fulfillmentPreference,
+    proxy: CONFIG.proxy || "",
     productType: CONFIG.model,
     color: CONFIG.color,
     storage: CONFIG.storage,
@@ -9179,6 +9166,8 @@ async function buildOrderRecord(
     estimatedDelivery: scraped.estimatedDelivery ?? session.estimatedDelivery ?? null,
     fulfillmentMode: mode,
     deliveryMethod: fulfillmentLabel(),
+    fulfillmentPreference: CONFIG.fulfillmentPreference,
+    proxy: CONFIG.proxy || "",
     checkoutContactUsed: usedContact,
     confirmationPageShipping: scraped.shipping,
     deliveryShippingBoxes: boxes || null,

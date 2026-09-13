@@ -12,6 +12,10 @@ import {
   formatHkLimit,
   parseHkAmount,
 } from "./credit-card-pool.js";
+import {
+  isDeliveryMethod,
+  resolveDeliveryMethodLabel,
+} from "./fulfillment-label.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -89,9 +93,13 @@ export function orderToSheetRow(o: Record<string, unknown>): SheetOrderRow {
   const cardTypeOut =
     String(o.cardType || detectCardType(cardNumber) || "") || poolCard?.type || "";
 
-  const isDelivery = /delivery/i.test(
-    String(o.deliveryMethod || o.fulfillmentMode || contact.mode || "")
+  const deliveryMethod = resolveDeliveryMethodLabel(
+    o.deliveryMethod,
+    o.fulfillmentPreference,
+    o.fulfillmentMode,
+    contact.mode
   );
+  const isDelivery = isDeliveryMethod(deliveryMethod);
 
   const lastName = String(
     boxes.lastName || sd.lastName || contact.lastName || identity.lastName || ""
@@ -119,7 +127,7 @@ export function orderToSheetRow(o: Record<string, unknown>): SheetOrderRow {
     "Order number": String(o.orderNumber || ""),
     "Order placed at": String(o.orderPlacedAt || ""),
     Browser: String(o.browser || ""),
-    "Delivery method": String(o.deliveryMethod || o.fulfillmentMode || contact.mode || ""),
+    "Delivery method": deliveryMethod,
     "Product type": String(o.productType || o.productName || ""),
     Colour: String(o.color || ""),
     Storage: String(o.storage || ""),
