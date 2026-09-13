@@ -9,7 +9,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcess } from "node:child_process";
 import { exportOrdersToGoogleSheet } from "./export-google-sheet.js";
-import { getLiveCardLimits } from "./credit-card-pool.js";
+import {
+  getLiveCardLimits,
+  lookupCardMeta,
+  peekCardLimitInfo,
+  resolveOrderAmountSpent,
+} from "./credit-card-pool.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PUBLIC = path.join(ROOT, "dashboard");
@@ -112,23 +117,153 @@ function killProc(proc: ChildProcess) {
   }
 }
 
+async function isDismissedBrowser(id: string): Promise<boolean> {
+  const nid = normalizeBrowserId(id);
+  try {
+    await fs.access(path.join(RUNTIME_DIR, `dismissed-${nid}.flag`));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeBrowserId(id: string): string {
+  return String(id || "").trim().toLowerCase();
+}
+
+/** 由訂單嘅 browser 欄位抽出 b123 */
+function browserIdFromOrderTag(raw: unknown): string | null {
+  const m = /\b(b\d+)\b/i.exec(String(raw || ""));
+  return m ? m[1]!.toLowerCase() : null;
+}
+
+async function lookupOrderForBrowser(
+  id: string,
+  orders?: Record<string, unknown>[]
+): Promise<Record<string, unknown> | null> {
+  const nid = normalizeBrowserId(id);
+  const fromFile = await readSessionOrder(nid);
+  if (fromFile?.orderNumber) return fromFile;
+  const list = orders || ((await collectOrders()) as Record<string, unknown>[]);
+  let best: Record<string, unknown> | null = null;
+  for (const o of list) {
+    if (!o || typeof o !== "object") continue;
+    if (browserIdFromOrderTag(o.browser) !== nid) continue;
+    if (!String(o.orderNumber || "").trim()) continue;
+    if (!best || orderFieldRichness(o) > orderFieldRichness(best)) best = o;
+  }
+  return best || fromFile;
+}
+
+async function isPaidBrowserSession(id: string): Promise<boolean> {
+  const nid = normalizeBrowserId(id);
+  const st = await readSessionStatus(nid);
+  const card = (st?.card as Record<string, unknown> | undefined) || {};
+  if (card.paymentSucceeded || String(card.orderNumber || "").trim()) return true;
+  if (/payment_succeeded|orders_ready/i.test(String(st?.phase || ""))) return true;
+  const order = await lookupOrderForBrowser(nid);
+  return Boolean(order && String(order.orderNumber || "").trim());
+}
+
+/** 唔好繼承 Cursor sandbox 嘅 PLAYWRIGHT_BROWSERS_PATH（入面未必有 chromium） */
+function envForCheckoutChild(extra: Record<string, string>): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...extra };
+  const browsersPath = String(env.PLAYWRIGHT_BROWSERS_PATH || "");
+  if (!browsersPath) return env;
+  if (/cursor-sandbox-cache/i.test(browsersPath)) {
+    delete env.PLAYWRIGHT_BROWSERS_PATH;
+    return env;
+  }
+  const chromeWin = path.join(
+    browsersPath,
+    "chromium-1243",
+    "chrome-win64",
+    "chrome.exe"
+  );
+  if (!existsSync(chromeWin)) {
+    delete env.PLAYWRIGHT_BROWSERS_PATH;
+  }
+  return env;
+}
+
+/** 唔好重用舊 id（尤其係已 dismissed），否則新 task 會即刻被隱藏 */
+async function refreshNextIndexFromDisk(): Promise<void> {
+  let maxN = 0;
+  for (const id of sessions.keys()) {
+    const m = /^b(\d+)$/i.exec(id);
+    if (m) maxN = Math.max(maxN, Number(m[1]));
+  }
+  try {
+    const files = await fs.readdir(RUNTIME_DIR);
+    for (const f of files) {
+      const m = /-b(\d+)\.(?:json|flag)$/i.exec(f);
+      if (m) maxN = Math.max(maxN, Number(m[1]));
+    }
+  } catch {
+    /* empty */
+  }
+  if (maxN > nextIndex) nextIndex = maxN;
+}
+
+async function clearLaunchFlags(id: string): Promise<void> {
+  const nid = normalizeBrowserId(id);
+  for (const name of [
+    `close-${nid}.flag`,
+    `release-${nid}.flag`,
+    `dismissed-${nid}.flag`,
+    `show-${nid}.flag`,
+    `hide-${nid}.flag`,
+    `continue-${nid}.flag`,
+    `stock-resume-${nid}.flag`,
+  ]) {
+    await fs.unlink(path.join(RUNTIME_DIR, name)).catch(() => {});
+  }
+}
+
+/** 由 Opened browsers 移除卡片（保留 order-*.json 畀 Order summary） */
+async function dismissBrowserCard(id: string): Promise<void> {
+  const nid = normalizeBrowserId(id);
+  await ensureRuntimeDir();
+  await fs.writeFile(
+    path.join(RUNTIME_DIR, `dismissed-${nid}.flag`),
+    new Date().toISOString(),
+    "utf8"
+  );
+  await fs.unlink(path.join(RUNTIME_DIR, `status-${nid}.json`)).catch(() => {});
+  await fs.unlink(path.join(RUNTIME_DIR, `release-${nid}.flag`)).catch(() => {});
+  await fs.unlink(path.join(RUNTIME_DIR, `show-${nid}.flag`)).catch(() => {});
+  await fs.unlink(path.join(RUNTIME_DIR, `hide-${nid}.flag`)).catch(() => {});
+  await fs.unlink(path.join(RUNTIME_DIR, `continue-${nid}.flag`)).catch(() => {});
+  // close flag 留低，等仲喺跑嘅 script 自己 exit
+  await fs.writeFile(
+    path.join(RUNTIME_DIR, `close-${nid}.flag`),
+    new Date().toISOString(),
+    "utf8"
+  ).catch(() => {});
+}
+
 async function stopSession(
   id: string,
   mode: "release" | "force" = "release",
   opts?: { silent?: boolean }
 ) {
-  const session = sessions.get(id);
-  if (!session) return;
+  const nid = normalizeBrowserId(id);
+  const session = sessions.get(nid) || sessions.get(id);
   await ensureRuntimeDir();
 
-  if (mode === "release" && session.running && session.child) {
+  if (mode === "release") {
+    // 冇 live process：Stop 無用，淨係 Close 可清卡片
+    if (!session?.running || !session.child) {
+      broadcast({ type: "status", state: await snapshot() });
+      return;
+    }
     // 停自動化、保留瀏覽器；silent=Stop all（唔開窗）
     const payload = opts?.silent
       ? `stop-all\n${new Date().toISOString()}`
       : `takeover\n${new Date().toISOString()}`;
-    await fs.writeFile(path.join(RUNTIME_DIR, `release-${id}.flag`), payload, "utf8");
+    await fs.writeFile(path.join(RUNTIME_DIR, `release-${nid}.flag`), payload, "utf8");
     // 即刻更新 status，等 script 進入 manual_control
-    const stPath = path.join(RUNTIME_DIR, `status-${id}.json`);
+    const stPath = path.join(RUNTIME_DIR, `status-${nid}.json`);
     try {
       const prev = JSON.parse(await fs.readFile(stPath, "utf8")) as Record<string, unknown>;
       await fs.writeFile(
@@ -162,7 +297,7 @@ async function stopSession(
     void (async () => {
       for (let i = 0; i < 80; i++) {
         await new Promise((r) => setTimeout(r, 250));
-        const st = await readSessionStatus(id);
+        const st = await readSessionStatus(nid);
         if (st?.phase === "manual_control" || !session.running) {
           broadcast({ type: "status", state: await snapshot() });
           break;
@@ -172,39 +307,55 @@ async function stopSession(
     return;
   }
 
-  // force close：先寫 close flag，再即刻殺 process，並由 dashboard 移除卡片
-  await fs.writeFile(
-    path.join(RUNTIME_DIR, `close-${id}.flag`),
-    new Date().toISOString(),
-    "utf8"
-  );
-  // 唔再同時寫 release（避免同 close 搶旗導致卡喺 manual_control）
-  const child = session.child;
-  const pid = session.pid ?? child?.pid ?? null;
-  pushSessionLog(session, "[dashboard] 正在關閉呢個瀏覽器…");
-  if (child) {
-    killProc(child);
-    session.child = null;
-  } else if (pid) {
-    spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
-      stdio: "ignore",
-      shell: true,
-    });
+  // force close：opened task 先 dismiss；已付款／Finished 只殺 process，保留卡片
+  const stBefore = await readSessionStatus(nid).catch(() => null);
+  const child = session?.child ?? null;
+  const pid =
+    session?.pid ??
+    child?.pid ??
+    (typeof stBefore?.pid === "number" ? stBefore.pid : Number(stBefore?.pid) || null);
+
+  const paid = await isPaidBrowserSession(nid);
+  if (!paid) {
+    await dismissBrowserCard(nid);
+  } else {
+    // Finished：唔刪 status／唔寫 dismissed；只要求 process 結束
+    await fs.writeFile(
+      path.join(RUNTIME_DIR, `close-${nid}.flag`),
+      new Date().toISOString(),
+      "utf8"
+    ).catch(() => {});
   }
-  // 再補一刀：短延遲後若仲在就再 kill
-  await new Promise((r) => setTimeout(r, 300));
-  if (pid) {
-    spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
-      stdio: "ignore",
-      shell: true,
-    });
-  }
-  session.running = false;
-  session.pid = null;
+  sessions.delete(nid);
   sessions.delete(id);
-  await fs.unlink(path.join(RUNTIME_DIR, `status-${id}.json`)).catch(() => {});
-  await fs.unlink(path.join(RUNTIME_DIR, `release-${id}.flag`)).catch(() => {});
-  // close flag 留低畀 script 自行收尾；下次 launch 會覆蓋
+
+  if (session) {
+    pushSessionLog(
+      session,
+      paid
+        ? "[dashboard] Finished task：關閉 process，保留 Finished 卡片"
+        : "[dashboard] 正在關閉呢個瀏覽器…"
+    );
+  }
+  try {
+    if (child) {
+      killProc(child);
+      session!.child = null;
+    } else if (pid) {
+      spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+        stdio: "ignore",
+        shell: true,
+      });
+    }
+  } catch {
+    /* ignore kill errors */
+  }
+
+  if (session) {
+    session.running = false;
+    session.pid = null;
+  }
+
   broadcast({ type: "status", state: await snapshot() });
 }
 
@@ -224,10 +375,25 @@ async function stopAll() {
 }
 
 async function closeAll() {
-  for (const id of [...sessions.keys()]) {
+  // 只清 Opened（未付款）；Finished／已付款一律保留
+  const ids = new Set<string>([...sessions.keys()]);
+  for (const id of await listPersistedSessionIds()) {
+    if (!(await isDismissedBrowser(id))) ids.add(id);
+  }
+  for (const id of ids) {
+    if (await isPaidBrowserSession(id)) {
+      const session = sessions.get(normalizeBrowserId(id)) || sessions.get(id);
+      if (session?.running) {
+        await stopSession(id, "force");
+      }
+      continue;
+    }
     await stopSession(id, "force");
   }
-  sessions.clear();
+  // 唔好 sessions.clear() 掉已付款記憶體項；逐個 force 已處理
+  for (const id of [...sessions.keys()]) {
+    if (!(await isPaidBrowserSession(id))) sessions.delete(id);
+  }
   await fs.unlink(CONTINUE_ALL_FLAG).catch(() => {});
   broadcast({ type: "status", state: await snapshot() });
 }
@@ -237,6 +403,9 @@ async function spawnOneBrowser(
   opts?: { windowTotal?: number }
 ): Promise<BrowserSession> {
   await ensureRuntimeDir();
+  // 輕微 jitter，減少多個 Add 同一刻打中 Apple
+  await new Promise((r) => setTimeout(r, 80 + Math.floor(Math.random() * 280)));
+  await refreshNextIndexFromDisk();
   const index = nextIndex++;
   const id = `b${index + 1}`;
   const {
@@ -251,9 +420,8 @@ async function spawnOneBrowser(
   const configPath = path.join(RUNTIME_DIR, `config-${id}.json`);
   await fs.writeFile(configPath, JSON.stringify(sessionConfig, null, 2), "utf8");
   await fs.writeFile(RUNTIME_CONFIG, JSON.stringify({ ...cleanConfig }, null, 2), "utf8");
-  // 清走舊 stop／close flag，避免新 session 即刻被殺
-  await fs.unlink(path.join(RUNTIME_DIR, `close-${id}.flag`)).catch(() => {});
-  await fs.unlink(path.join(RUNTIME_DIR, `release-${id}.flag`)).catch(() => {});
+  // 清走舊 stop／close／dismiss flag，避免新 session 即刻被殺或唔顯示
+  await clearLaunchFlags(id);
   await fs.unlink(path.join(RUNTIME_DIR, "stop-all.flag")).catch(() => {});
 
   const session: BrowserSession = {
@@ -280,18 +448,18 @@ async function spawnOneBrowser(
   const script = path.join(ROOT, "src", "buy-iphone-17.ts");
   const proc = spawn(process.execPath, [tsxCli, script], {
     cwd: ROOT,
-    env: {
-      ...process.env,
+    env: envForCheckoutChild({
       CHECKOUT_DASHBOARD: "1",
       CHECKOUT_CONFIG_PATH: configPath,
       CHECKOUT_SESSION_ID: id,
       CHECKOUT_WINDOW_INDEX: String(index),
       CHECKOUT_WINDOW_TOTAL: String(windowTotal),
-    },
+    }),
     stdio: ["ignore", "pipe", "pipe"],
   });
   session.child = proc;
   session.pid = proc.pid ?? null;
+  await writeInitialOpenedBrowserStatus(id, sessionConfig, session.pid);
   pushSessionLog(
     session,
     `[dashboard] 已啟動 pid=${session.pid} windowIndex=${index}/${windowTotal}`
@@ -315,6 +483,67 @@ async function spawnOneBrowser(
   });
 
   return session;
+}
+
+/** 一開 task 即寫 status，Opened browsers 即刻有齊產品／金額／fulfill 等 */
+async function writeInitialOpenedBrowserStatus(
+  id: string,
+  config: Record<string, unknown>,
+  pid: number | null
+): Promise<void> {
+  const qty = Math.max(1, Number(config.quantity) || 1);
+  const fulfill = String(config.fulfillmentPreference || "pickup");
+  const applePay = /apple_pay/i.test(fulfill);
+  const amt = resolveOrderAmountSpent({
+    model: String(config.model || ""),
+    storage: String(config.storage || ""),
+    quantity: qty,
+  });
+  const status = {
+    sessionId: id,
+    phase: "starting",
+    pid,
+    windowHidden: true,
+    windowState: "minimized",
+    updatedAt: new Date().toISOString(),
+    lastProgressAt: new Date().toISOString(),
+    stuck: false,
+    config: {
+      model: config.model,
+      color: config.color,
+      storage: config.storage,
+      quantity: qty,
+      fulfillmentPreference: fulfill,
+      buyUrl: config.buyUrl,
+      proxy: config.proxy || "",
+    },
+    card: {
+      productType: config.model ?? null,
+      color: config.color ?? null,
+      storage: config.storage ?? null,
+      quantity: qty,
+      fulfillmentMode: fulfill,
+      deliveryMethod: fulfill,
+      total: amt.label || null,
+      orderNumber: null,
+      email: null,
+      phone: null,
+      name: null,
+      cardNumber: applePay ? "Apple Pay" : null,
+      cardType: applePay ? "Apple Pay" : null,
+      cardCompany: applePay ? "Apple Pay" : null,
+      cardLimit: null,
+      remainingCreditCardLimit: null,
+      remainingLimit: null,
+      paymentSucceeded: false,
+      proxy: config.proxy || "",
+    },
+  };
+  await fs.writeFile(
+    path.join(RUNTIME_DIR, `status-${id}.json`),
+    JSON.stringify(status, null, 2),
+    "utf8"
+  ).catch(() => {});
 }
 
 async function pushMonitorLog(line: string) {
@@ -354,6 +583,7 @@ async function startStockMonitor(opts?: {
   }
   await ensureRuntimeDir();
   await fs.unlink(path.join(RUNTIME_DIR, "stop-all.flag")).catch(() => {});
+  await fs.unlink(path.join(RUNTIME_DIR, "stock-resume-all.flag")).catch(() => {});
 
   const tsxCli = path.join(ROOT, "node_modules", "tsx", "dist", "cli.mjs");
   const script = path.join(ROOT, "src", "stock-monitor", "monitor.ts");
@@ -367,15 +597,14 @@ async function startStockMonitor(opts?: {
 
   const proc = spawn(process.execPath, [tsxCli, script], {
     cwd: ROOT,
-    env: {
-      ...process.env,
+    env: envForCheckoutChild({
       MONITOR_AUTO_CHECKOUT: autoBuy ? "1" : "0",
       MONITOR_FROM_DASHBOARD: "1",
       MONITOR_QUANTITY: String(quantity),
       MONITOR_FULFILLMENT: fulfillment,
       MONITOR_PICKUP_SEARCH: pickupSearch,
       DASHBOARD_PORT: String(PORT),
-    },
+    }),
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: false,
   });
@@ -411,14 +640,17 @@ async function startStockMonitor(opts?: {
 }
 
 async function launchBrowsers(config: Record<string, unknown>, count: number) {
-  const n = Math.max(1, Math.min(8, Number(count) || 1));
+  const n = Math.max(1, Math.min(20, Number(count) || 1));
   lastFormConfig = { ...config, browserCount: n };
   await ensureRuntimeDir();
+  await refreshNextIndexFromDisk();
   await fs.unlink(path.join(RUNTIME_DIR, "stop-all.flag")).catch(() => {});
   await fs.unlink(CONTINUE_ALL_FLAG).catch(() => {});
   const created = [];
   const plannedTotal = nextIndex + n;
   for (let i = 0; i < n; i++) {
+    // 錯開啟動，降低開賣高峰同一秒打爆 Apple → /shop/404
+    if (i > 0) await new Promise((r) => setTimeout(r, 400));
     created.push(await spawnOneBrowser(config, { windowTotal: plannedTotal }));
   }
   broadcast({ type: "status", state: await snapshot() });
@@ -442,17 +674,136 @@ async function collectOrders(): Promise<unknown[]> {
     /* empty */
   }
 
-  // de-dupe by session+orderNumber+scrapedAt roughly
-  const seen = new Set<string>();
-  const out: unknown[] = [];
-  for (const item of merged) {
-    const o = item as Record<string, unknown>;
-    const key = `${o.browser || ""}|${o.orderNumber || ""}|${o.scrapedAt || ""}|${JSON.stringify(o.identity || {})}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(item);
+  // 用 status-*.json 補齊卡號／公司／剩餘額度
+  const byBrowser = new Map<string, Record<string, unknown>>();
+  try {
+    const files = await fs.readdir(RUNTIME_DIR);
+    for (const f of files) {
+      const m = /^status-(b\d+)\.json$/i.exec(f);
+      if (!m) continue;
+      const st = await readJson(path.join(RUNTIME_DIR, f));
+      if (st && typeof st === "object") {
+        byBrowser.set(m[1]!.toLowerCase(), st as Record<string, unknown>);
+      }
+    }
+  } catch {
+    /* empty */
   }
-  return out;
+
+  const enriched: Record<string, unknown>[] = [];
+  for (const item of merged) {
+    if (!item || typeof item !== "object") continue;
+    const o = { ...(item as Record<string, unknown>) };
+    const browser = String(o.browser || "").toLowerCase();
+    const st = byBrowser.get(browser);
+    const card = (st?.card as Record<string, unknown> | undefined) || {};
+    const ship =
+      (o.confirmationPageShipping as Record<string, unknown> | undefined) || {};
+
+    const cardNumber = cardNumberOrApplePay(
+      o.cardNumber,
+      card.cardNumber,
+      ship.cardNumber
+    );
+    o.cardNumber = cardNumber;
+
+    if (/apple\s*pay/i.test(cardNumber)) {
+      o.cardCompany = pickNonEmpty(o.cardCompany, card.cardCompany) || "Apple Pay";
+      o.cardType = pickNonEmpty(o.cardType, card.cardType) || "Apple Pay";
+      enriched.push(o);
+      continue;
+    }
+
+    const meta = lookupCardMeta(String(cardNumber || ""));
+    const peek = cardNumber
+      ? await peekCardLimitInfo(ROOT, String(cardNumber), o.amountSpent ?? o.total)
+      : null;
+
+    o.cardCompany =
+      pickNonEmpty(o.cardCompany, card.cardCompany, peek?.company, meta?.company) ||
+      o.cardCompany ||
+      "";
+    o.cardType =
+      pickNonEmpty(o.cardType, card.cardType, peek?.type, meta?.type) ||
+      o.cardType ||
+      "";
+    o.cardLimit =
+      pickNonEmpty(o.cardLimit, card.cardLimit, peek?.cardLimit, meta?.limit) ||
+      o.cardLimit ||
+      "";
+    const rem =
+      pickNonEmpty(
+        o.remainingCreditCardLimit,
+        o.remainingLimit,
+        card.remainingCreditCardLimit,
+        card.remainingLimit,
+        peek?.remainingLabel
+      ) || "";
+    if (rem) {
+      o.remainingCreditCardLimit = rem;
+      o.remainingLimit = rem;
+    }
+    enriched.push(o);
+  }
+
+  // de-dupe：同一訂單編號保留資料較齊嗰條
+  const byOrder = new Map<string, Record<string, unknown>>();
+  const noOrder: Record<string, unknown>[] = [];
+  for (const o of enriched) {
+    const n = String(o.orderNumber || "").trim();
+    if (!n) {
+      noOrder.push(o);
+      continue;
+    }
+    const prev = byOrder.get(n);
+    if (!prev || orderFieldRichness(o) > orderFieldRichness(prev)) {
+      byOrder.set(n, o);
+    }
+  }
+  return [...byOrder.values(), ...noOrder];
+}
+
+function pickNonEmpty(
+  ...vals: unknown[]
+): string | null {
+  for (const v of vals) {
+    if (v == null) continue;
+    const s = String(v).trim();
+    if (!s || s === "—" || /人手填/.test(s)) continue;
+    return s;
+  }
+  return null;
+}
+
+/** 有可追蹤卡號（≥4 位數字）；否則 dashboard 標 Apple Pay */
+function hasTrackableCardNumber(v: unknown): boolean {
+  const s = String(v ?? "").trim();
+  if (!s || s === "—" || /人手填/.test(s)) return false;
+  if (/apple\s*pay/i.test(s)) return true;
+  return s.replace(/\D/g, "").length >= 4;
+}
+
+function cardNumberOrApplePay(...vals: unknown[]): string {
+  for (const v of vals) {
+    const s = pickNonEmpty(v);
+    if (!s) continue;
+    if (/apple\s*pay/i.test(s)) return "Apple Pay";
+    if (hasTrackableCardNumber(s)) return s;
+  }
+  return "Apple Pay";
+}
+
+function orderFieldRichness(o: Record<string, unknown>): number {
+  let score = 0;
+  if (hasTrackableCardNumber(o.cardNumber) && !/apple\s*pay/i.test(String(o.cardNumber))) {
+    score += 4;
+  }
+  if (pickNonEmpty(o.cardCompany)) score += 2;
+  if (pickNonEmpty(o.remainingCreditCardLimit, o.remainingLimit)) score += 2;
+  if (pickNonEmpty(o.cardLimit)) score += 1;
+  if (pickNonEmpty(o.amountSpent, o.total)) score += 1;
+  if (pickNonEmpty(o.orderPlacedAt)) score += 1;
+  return score;
 }
 
 async function readSessionStatus(id: string): Promise<Record<string, unknown> | null> {
@@ -460,11 +811,118 @@ async function readSessionStatus(id: string): Promise<Record<string, unknown> | 
   return data && typeof data === "object" ? (data as Record<string, unknown>) : null;
 }
 
+async function readSessionOrder(id: string): Promise<Record<string, unknown> | null> {
+  const data = await readJson(path.join(RUNTIME_DIR, `order-${id}.json`));
+  if (Array.isArray(data) && data[0] && typeof data[0] === "object") {
+    return data[0] as Record<string, unknown>;
+  }
+  if (data && typeof data === "object") return data as Record<string, unknown>;
+  return null;
+}
+
+async function listPersistedSessionIds(): Promise<string[]> {
+  try {
+    const files = await fs.readdir(RUNTIME_DIR);
+    const ids = new Set<string>();
+    for (const f of files) {
+      const m = /^(?:status|order)-(b\d+)\.json$/i.exec(f);
+      if (m?.[1]) ids.add(m[1].toLowerCase());
+    }
+    return [...ids];
+  } catch {
+    return [];
+  }
+}
+
+function browserIndexFromId(id: string): number {
+  const m = /^b(\d+)$/i.exec(id);
+  return m ? Math.max(0, Number(m[1]) - 1) : 0;
+}
+
 async function snapshot() {
-  const browsers = [];
-  for (const s of sessions.values()) {
+  const browsers: Array<Record<string, unknown>> = [];
+  const seen = new Set<string>();
+  const shownOrderNumbers = new Set<string>();
+  const allOrders = (await collectOrders()) as Record<string, unknown>[];
+
+  const pushBrowser = async (
+    s: {
+      id: string;
+      index: number;
+      pid: number | null;
+      running: boolean;
+      exitCode: number | null;
+      startedAt: string;
+      config: Record<string, unknown>;
+      logs: string[];
+    },
+    orderHint?: Record<string, unknown> | null
+  ) => {
+    if (seen.has(s.id)) return;
+    seen.add(s.id);
     const runtimeStatus = await readSessionStatus(s.id);
+    const order =
+      orderHint ||
+      (await lookupOrderForBrowser(s.id, allOrders)) ||
+      (await readSessionOrder(s.id));
     const card = (runtimeStatus?.card as Record<string, unknown> | undefined) || {};
+    const orderNumber =
+      (typeof card.orderNumber === "string" && card.orderNumber.trim()) ||
+      (typeof order?.orderNumber === "string" && order.orderNumber.trim()) ||
+      null;
+    const paymentSucceeded =
+      Boolean(card.paymentSucceeded) || Boolean(orderNumber);
+    if (!s.running && !orderNumber && !runtimeStatus?.phase && !runtimeStatus?.card) {
+      return;
+    }
+    if (orderNumber) shownOrderNumbers.add(orderNumber);
+    const phase = paymentSucceeded
+      ? "payment_succeeded"
+      : String(runtimeStatus?.phase || "") ||
+        (s.running ? "running" : s.exitCode == null ? "idle" : "exited");
+
+    const fulfillApplePay = /apple_pay/i.test(
+      String(
+        s.config.fulfillmentPreference ||
+          card.fulfillmentMode ||
+          order?.fulfillmentMode ||
+          ""
+      )
+    );
+    const rawCard = pickNonEmpty(card.cardNumber, order?.cardNumber);
+    const cardNumber = rawCard
+      ? cardNumberOrApplePay(rawCard)
+      : fulfillApplePay
+        ? "Apple Pay"
+        : null;
+    const isApplePay = Boolean(cardNumber && /apple\s*pay/i.test(String(cardNumber)));
+    const estimatedTotal = resolveOrderAmountSpent({
+      scrapedAmount: card.total ?? order?.amountSpent ?? order?.total,
+      model: String(
+        card.productType ?? order?.productType ?? order?.productName ?? s.config.model ?? ""
+      ),
+      storage: String(card.storage ?? order?.storage ?? s.config.storage ?? ""),
+      quantity: Number(card.quantity ?? order?.quantity ?? s.config.quantity) || 1,
+    });
+    const peek =
+      cardNumber && !isApplePay
+        ? await peekCardLimitInfo(
+            ROOT,
+            cardNumber,
+            card.total ?? order?.amountSpent ?? order?.total ?? estimatedTotal.label
+          )
+        : null;
+    const meta = cardNumber && !isApplePay ? lookupCardMeta(cardNumber) : null;
+    const remaining = isApplePay
+      ? null
+      : pickNonEmpty(
+          card.remainingCreditCardLimit,
+          card.remainingLimit,
+          order?.remainingCreditCardLimit,
+          order?.remainingLimit,
+          peek?.remainingLabel
+        ) || null;
+
     browsers.push({
       id: s.id,
       index: s.index,
@@ -474,36 +932,142 @@ async function snapshot() {
       startedAt: s.startedAt,
       config: s.config,
       logs: s.logs.slice(-40),
-      phase:
-        runtimeStatus?.phase ??
-        (s.running ? "running" : s.exitCode == null ? "idle" : "exited"),
+      phase,
       windowHidden: Boolean(runtimeStatus?.windowHidden),
       windowState: runtimeStatus?.windowState ?? null,
+      updatedAt: runtimeStatus?.updatedAt ?? null,
+      lastProgressAt: runtimeStatus?.lastProgressAt ?? runtimeStatus?.updatedAt ?? null,
+      stuck: Boolean(runtimeStatus?.stuck),
+      stuckSince: runtimeStatus?.stuckSince ?? null,
+      error: runtimeStatus?.error ?? null,
       runtimeStatus,
       card: {
-        productType: card.productType ?? s.config.model,
-        color: card.color ?? s.config.color,
-        storage: card.storage ?? s.config.storage,
-        quantity: card.quantity ?? s.config.quantity,
-        total: card.total ?? null,
-        fulfillmentMode: card.fulfillmentMode ?? s.config.fulfillmentPreference,
-        orderNumber: card.orderNumber ?? null,
-        email: card.email ?? null,
-        phone: card.phone ?? null,
+        productType:
+          card.productType ?? order?.productType ?? order?.productName ?? s.config.model,
+        color: card.color ?? order?.color ?? s.config.color,
+        storage: card.storage ?? order?.storage ?? s.config.storage,
+        quantity: card.quantity ?? order?.quantity ?? s.config.quantity,
+        total:
+          pickNonEmpty(card.total, order?.amountSpent, order?.total, estimatedTotal.label) ||
+          null,
+        fulfillmentMode:
+          card.fulfillmentMode ?? order?.fulfillmentMode ?? s.config.fulfillmentPreference,
+        orderNumber,
+        email:
+          card.email ??
+          (order?.identity as { email?: string } | undefined)?.email ??
+          null,
+        phone:
+          card.phone ??
+          (order?.identity as { phone?: string } | undefined)?.phone ??
+          null,
         address: card.address ?? null,
         name: card.name ?? null,
-        cardNumber: card.cardNumber ?? null,
+        proxy: card.proxy ?? s.config.proxy ?? null,
+        cardNumber,
+        cardType: isApplePay
+          ? pickNonEmpty(card.cardType, order?.cardType) || "Apple Pay"
+          : pickNonEmpty(card.cardType, order?.cardType, peek?.type, meta?.type) || null,
+        cardCompany: isApplePay
+          ? pickNonEmpty(card.cardCompany, order?.cardCompany) || "Apple Pay"
+          : pickNonEmpty(card.cardCompany, order?.cardCompany, peek?.company, meta?.company) ||
+            null,
+        cardLimit: isApplePay
+          ? null
+          : pickNonEmpty(card.cardLimit, order?.cardLimit, peek?.cardLimit, meta?.limit) ||
+            null,
+        remainingCreditCardLimit: remaining,
+        remainingLimit: remaining,
+        orderPlacedAt: card.orderPlacedAt ?? order?.orderPlacedAt ?? null,
         deliveryDetails: card.deliveryDetails ?? null,
-        estimatedDelivery: card.estimatedDelivery ?? null,
-        paymentSucceeded: Boolean(card.paymentSucceeded) || Boolean(card.orderNumber),
+        estimatedDelivery: card.estimatedDelivery ?? order?.estimatedDelivery ?? null,
+        paymentSucceeded,
+        url: card.url ?? null,
+        lastName: card.lastName ?? null,
+        firstName: card.firstName ?? null,
+        areaDistrictStreet: card.areaDistrictStreet ?? null,
+        buildingFloorUnit: card.buildingFloorUnit ?? null,
+        message: runtimeStatus?.message ?? (paymentSucceeded ? "payment succeeded" : null),
       },
     });
+  };
+
+  for (const s of sessions.values()) {
+    if (await isDismissedBrowser(s.id)) {
+      if (!(await isPaidBrowserSession(s.id))) {
+        sessions.delete(s.id);
+        continue;
+      }
+    }
+    await pushBrowser(s);
   }
-  browsers.sort((a, b) => a.index - b.index);
+
+  for (const id of await listPersistedSessionIds()) {
+    if (sessions.has(id)) continue;
+    if ((await isDismissedBrowser(id)) && !(await isPaidBrowserSession(id))) continue;
+    const cfgPath = path.join(RUNTIME_DIR, `config-${id}.json`);
+    const cfg = ((await readJson(cfgPath)) as Record<string, unknown> | null) || {
+      ...lastFormConfig,
+    };
+    const st = await readSessionStatus(id);
+    if (
+      st &&
+      /^(closed|idle)$/i.test(String(st.phase || "")) &&
+      !(st.card as { orderNumber?: string } | undefined)?.orderNumber &&
+      !(await lookupOrderForBrowser(id, allOrders))
+    ) {
+      continue;
+    }
+    await pushBrowser({
+      id,
+      index: browserIndexFromId(id),
+      pid: null,
+      running: false,
+      exitCode: 0,
+      startedAt: String(st?.updatedAt || new Date().toISOString()),
+      config: cfg,
+      logs: [],
+    });
+  }
+
+  // 由 order-summary 還原最近 Finished（唔受 dismiss／清 status 影響）
+  for (const o of allOrders) {
+    if (!o || typeof o !== "object") continue;
+    const orderNumber = String(o.orderNumber || "").trim();
+    if (!orderNumber || shownOrderNumbers.has(orderNumber)) continue;
+    const bid = browserIdFromOrderTag(o.browser);
+    const id = bid && !seen.has(bid) ? bid : `fin-${orderNumber}`;
+    await pushBrowser(
+      {
+        id,
+        index: bid ? browserIndexFromId(bid) : 100000 + browsers.length,
+        pid: null,
+        running: false,
+        exitCode: 0,
+        startedAt: String(o.orderPlacedAt || o.updatedAt || new Date().toISOString()),
+        config: {
+          model: o.productType || o.productName || o.model || lastFormConfig.model,
+          color: o.color || lastFormConfig.color,
+          storage: o.storage || lastFormConfig.storage,
+          quantity: o.quantity || lastFormConfig.quantity || 1,
+          fulfillmentPreference:
+            o.fulfillmentMode ||
+            o.fulfillmentPreference ||
+            lastFormConfig.fulfillmentPreference,
+          proxy: o.proxy || "",
+        },
+        logs: [],
+      },
+      o
+    );
+  }
+
+  browsers.sort((a, b) => Number(a.index ?? 0) - Number(b.index ?? 0));
 
   const runningCount = browsers.filter((b) => b.running).length;
-  const allLogs = browsers.flatMap((b) => b.logs).slice(-300);
+  const allLogs = browsers.flatMap((b) => (b.logs as string[]) || []).slice(-300);
   const monitorStatus = await readJson(path.join(RUNTIME_DIR, "monitor-status.json"));
+  const orders = allOrders;
 
   return {
     running: runningCount > 0,
@@ -512,8 +1076,8 @@ async function snapshot() {
     config: lastFormConfig,
     browsers,
     logs: allLogs,
-    orders: await collectOrders(),
-    cardLimits: await getLiveCardLimits(ROOT),
+    orders,
+    cardLimits: await getLiveCardLimits(ROOT, orders),
     monitor: {
       running: monitorState.running,
       pid: monitorState.pid,
@@ -524,6 +1088,7 @@ async function snapshot() {
     },
   };
 }
+
 
 function sendJson(res: http.ServerResponse, code: number, body: unknown) {
   res.writeHead(code, {
@@ -561,7 +1126,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     return sendJson(res, 200, await collectOrders());
   }
   if (pathname === "/api/card-limits" && req.method === "GET") {
-    return sendJson(res, 200, await getLiveCardLimits(ROOT));
+    return sendJson(res, 200, await getLiveCardLimits(ROOT, await collectOrders()));
   }
 
   if (pathname === "/api/orders/export-google-sheet" && req.method === "POST") {
@@ -673,7 +1238,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
 
   const closeOne = pathname.match(/^\/api\/browsers\/([^/]+)\/close$/);
   if (closeOne && req.method === "POST") {
-    await stopSession(decodeURIComponent(closeOne[1]!), "force");
+    await stopSession(normalizeBrowserId(decodeURIComponent(closeOne[1]!)), "force");
     return sendJson(res, 200, { ok: true, state: await snapshot() });
   }
 
@@ -796,7 +1361,9 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
-  console.log(`Checkout dashboard → http://127.0.0.1:${PORT}`);
+  void refreshNextIndexFromDisk().then(() => {
+    console.log(`Checkout dashboard → http://127.0.0.1:${PORT} (next browser id b${nextIndex + 1})`);
+  });
 });
 
 process.on("SIGINT", async () => {

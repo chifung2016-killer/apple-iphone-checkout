@@ -108,20 +108,19 @@
     }
     .browsers {
       display: flex;
-      flex-direction: row;
-      gap: 12px;
-      overflow-x: auto;
-      padding-bottom: 8px;
-      scroll-snap-type: x mandatory;
+      flex-direction: column;
+      gap: 8px;
     }
     .browser-card {
-      flex: 0 0 min(320px, 85vw);
-      scroll-snap-align: start;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px 14px;
       border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 12px 14px;
+      border-radius: 12px;
+      padding: 10px 14px;
       background: var(--field);
-      min-height: 220px;
+      min-height: 0;
     }
     .browsers-head {
       display: flex;
@@ -130,8 +129,54 @@
       gap: 12px;
       margin-bottom: 8px;
     }
-    .browsers-head h2 { margin: 0 0 6px; }
+    .browsers-head-left {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-width: 0;
+      flex: 1;
+    }
+    .browsers-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }
+    .browsers-tab {
+      font: inherit;
+      font-weight: 650;
+      font-size: 1rem;
+      padding: 8px 14px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+    }
+    .browsers-tab:hover {
+      border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+      color: var(--text);
+    }
+    .browsers-tab.is-active {
+      background: var(--accent);
+      color: var(--accent-ink);
+      border-color: transparent;
+    }
+    .browsers-tab .count {
+      display: inline-block;
+      margin-left: 6px;
+      font-size: 0.82rem;
+      font-weight: 700;
+      opacity: 0.85;
+    }
     .browsers-head .hint { margin: 0; }
+    .browsers-head .browsers-actions {
+      display: flex;
+      flex-shrink: 0;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
     .orders-head {
       display: flex;
       justify-content: space-between;
@@ -148,11 +193,15 @@
       gap: 8px;
     }
     .browser-head {
-      display: flex; justify-content: space-between; align-items: flex-start;
-      gap: 10px; margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex: 0 0 auto;
+      min-width: 120px;
+      margin-bottom: 0;
     }
     .browser-head-pills {
-      display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end;
+      display: flex; flex-wrap: wrap; gap: 6px;
     }
     .browser-head strong {
       font-family: "Fraunces", Georgia, serif; font-size: 1.05rem;
@@ -166,10 +215,6 @@
     .phase-pill.err { color: #3a1512; background: var(--danger); border-color: transparent; }
     .phase-pill.manual { color: #10222a; background: #7dd3fc; border-color: transparent; }
     .phase-pill.hidden { color: #1a1a1a; background: #c5c9c6; border-color: transparent; }
-    .browser-card.is-hidden {
-      opacity: 0.72;
-      border-style: dashed;
-    }
     .browser-card.is-paid {
       background: color-mix(in srgb, #1f8f4e 22%, var(--field));
       border-color: color-mix(in srgb, #2ecc71 55%, var(--line));
@@ -179,6 +224,87 @@
       color: #062816;
       background: #7ddea8;
       border-color: transparent;
+    }
+    @keyframes blink-green {
+      0%, 100% {
+        background: color-mix(in srgb, #1f8f4e 16%, var(--field));
+        border-color: color-mix(in srgb, #2ecc71 45%, var(--line));
+        box-shadow: inset 0 0 0 1px color-mix(in srgb, #2ecc71 20%, transparent);
+      }
+      50% {
+        background: color-mix(in srgb, #2ecc71 48%, var(--field));
+        border-color: #2ecc71;
+        box-shadow:
+          inset 0 0 0 1px color-mix(in srgb, #2ecc71 55%, transparent),
+          0 0 14px color-mix(in srgb, #2ecc71 30%, transparent);
+      }
+    }
+    @keyframes blink-pill-green {
+      0%, 100% { background: #3ecf7a; }
+      50% { background: #7ddea8; }
+    }
+    .browser-card.is-steps-complete {
+      animation: blink-green 1.1s ease-in-out infinite;
+    }
+    .phase-pill.steps {
+      color: #062816;
+      background: #7ddea8;
+      border-color: transparent;
+      animation: blink-pill-green 1.1s ease-in-out infinite;
+    }
+    @keyframes blink-yellow {
+      0%, 100% {
+        background: color-mix(in srgb, #e8c547 16%, var(--field));
+        border-color: color-mix(in srgb, #f5d76e 45%, var(--line));
+        box-shadow: inset 0 0 0 1px color-mix(in srgb, #f5d76e 20%, transparent);
+      }
+      50% {
+        background: color-mix(in srgb, #ffe566 48%, var(--field));
+        border-color: #ffe566;
+        box-shadow:
+          inset 0 0 0 1px color-mix(in srgb, #ffe566 55%, transparent),
+          0 0 14px color-mix(in srgb, #ffe566 30%, transparent);
+      }
+    }
+    @keyframes blink-pill-yellow {
+      0%, 100% { background: #e8c547; }
+      50% { background: #ffe566; }
+    }
+    .browser-card.is-adding-cart {
+      animation: blink-yellow 1.1s ease-in-out infinite;
+    }
+    .phase-pill.adding {
+      color: #3a2a10;
+      background: #ffe566;
+      border-color: transparent;
+      animation: blink-pill-yellow 1.1s ease-in-out infinite;
+    }
+    @keyframes blink-red {
+      0%, 100% {
+        background: color-mix(in srgb, #ff4d4d 14%, var(--field));
+        border-color: color-mix(in srgb, #ff6b6b 45%, var(--line));
+        box-shadow: inset 0 0 0 1px color-mix(in srgb, #ff6b6b 20%, transparent);
+      }
+      50% {
+        background: color-mix(in srgb, #ff4d4d 42%, var(--field));
+        border-color: #ff6b6b;
+        box-shadow:
+          inset 0 0 0 1px color-mix(in srgb, #ff6b6b 55%, transparent),
+          0 0 14px color-mix(in srgb, #ff4d4d 35%, transparent);
+      }
+    }
+    @keyframes blink-pill-red {
+      0%, 100% { background: #e85a5a; }
+      50% { background: #ff7a6e; }
+    }
+    .browser-card.is-stuck {
+      animation: blink-red 1.1s ease-in-out infinite;
+    }
+    .phase-pill.stuck {
+      color: #3a1010;
+      background: #ff7a6e;
+      border-color: transparent;
+      animation: blink-pill-red 1.1s ease-in-out infinite;
     }
     .preset-row {
       display: flex;
@@ -195,16 +321,38 @@
       color: var(--accent-ink);
       border-color: transparent;
     }
-    .browser-grid {
-      display: grid;
-      grid-template-columns: 88px 1fr;
-      gap: 4px 8px;
+    .browser-row-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 14px;
+      flex: 1 1 280px;
       font-size: 0.78rem;
-      margin-bottom: 10px;
+      min-width: 0;
     }
-    .browser-grid dt { color: var(--muted); }
-    .browser-grid dd { margin: 0; word-break: break-word; }
-    .browser-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .browser-row-meta span {
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 340px;
+    }
+    .browser-row-meta span.wide {
+      max-width: 100%;
+      flex: 1 1 100%;
+      white-space: normal;
+    }
+    .browser-row-meta span b {
+      color: var(--muted);
+      font-weight: 500;
+      margin-right: 4px;
+    }
+    .browser-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-left: auto;
+      flex: 0 1 auto;
+    }
     .hint { color: var(--muted); font-size: 0.8rem; margin: -6px 0 12px; }
     .orders { display: flex; flex-direction: column; gap: 10px; }
     .card-limits-head {
@@ -290,13 +438,10 @@
           <div class="field">
             <label>Product</label>
             <div class="preset-row" id="presetRow">
-              <button type="button" class="btn-ghost" data-preset="iphone17">iPhone 17 · 256GB · 薰衣草紫</button>
-              <button type="button" class="btn-ghost" data-preset="iphone18promax_128_burgundy">iPhone 18 Pro Max · 128GB · 布根地紅</button>
               <button type="button" class="btn-ghost" data-preset="iphone18promax_burgundy">iPhone 18 Pro Max · 256GB · 布根地紅</button>
               <button type="button" class="btn-ghost" data-preset="iphone18promax_glacier">iPhone 18 Pro Max · 256GB · 冰川色</button>
               <button type="button" class="btn-ghost" data-preset="iphone18promax_silver">iPhone 18 Pro Max · 256GB · 銀色</button>
               <button type="button" class="btn-ghost" data-preset="iphone18promax_black">iPhone 18 Pro Max · 256GB · 黑色</button>
-              <button type="button" class="btn-ghost" data-preset="iphone18pro_256_burgundy">iPhone 18 Pro · 256GB · 布根地紅</button>
             </div>
             <p class="hint" id="presetHint">請揀一個產品（會自動設定網址、型號、顏色、容量）。</p>
           </div>
@@ -333,16 +478,6 @@
               <input id="saleStartIso" name="saleStartIso" />
             </div>
           </div>
-          <div class="row">
-            <div class="field">
-              <label for="cardCompany">Credit card company（銀行，稍後填）</label>
-              <input id="cardCompany" name="cardCompany" placeholder="例如 HSBC / Hang Seng（可留空）" />
-            </div>
-            <div class="field">
-              <label for="cardLimit">Credit card limit（可選）</label>
-              <input id="cardLimit" name="cardLimit" placeholder="例如 HK$50,000" />
-            </div>
-          </div>
           <div class="field">
             <label for="proxy">Proxy / IP（可選，每個 task 可填唔同）</label>
             <input
@@ -363,13 +498,10 @@
             <button type="button" class="btn-ghost" id="btnMonitorBuy">Start monitor+buying</button>
             <button type="submit" class="btn-primary" id="btnStart">Launch browsers</button>
             <button type="button" class="btn-ghost" id="btnAdd">Add 1 browser</button>
-            <button type="button" class="btn-danger" id="btnStop">Stop all</button>
-            <button type="button" class="btn-ghost" id="btnClearAll">Clear all</button>
-            <button type="button" class="btn-warn" id="btnContinue">Continue all</button>
           </div>
           <p class="hint" id="monitorHint" style="margin-top:10px">
             <b>Start monitor</b>：Telegram 即時監察 iPhone 庫存／可買數量（撳一次變 Stop monitor）。
-            <b>Start monitor+buying</b>：有貨時再自動開瀏覽器落單。
+            <b>Start monitor+buying</b>：預熱停喺 Fulfillment-init。有貨且同色同容量 → 等 1 秒 → refresh Fulfillment-init → 完整加購；冇新通知就返 Fulfillment-init 待命。
           </p>
           <div class="meta" id="monitorMeta" style="margin-top:8px">
             <span>Monitor: <b id="monitorState">off</b></span>
@@ -391,9 +523,21 @@
 
     <section style="margin-top:18px">
       <div class="browsers-head">
-        <div>
-          <h2>Opened browsers</h2>
-          <p class="hint">隱藏時右上角仍顯示 live status。Open browser 會還原視窗。Launch 4 = 四宮格最大。付款成功會變綠色。</p>
+        <div class="browsers-head-left">
+          <div class="browsers-tabs" role="tablist" aria-label="Browser lists">
+            <button type="button" class="browsers-tab is-active" role="tab" id="tabOpened" data-tab="opened" aria-selected="true">
+              Opened browsers<span class="count" id="openedCount">0</span>
+            </button>
+            <button type="button" class="browsers-tab" role="tab" id="tabFinished" data-tab="finished" aria-selected="false">
+              Finished<span class="count" id="finishedCount">0</span>
+            </button>
+          </div>
+          <p class="hint" id="browsersHint">進行中嘅 task（新開嘅會排喺最底）。付款成功會即時移去 Finished。</p>
+        </div>
+        <div class="browsers-actions">
+          <button type="button" class="btn-danger btn-sm" id="btnStop">Stop all</button>
+          <button type="button" class="btn-ghost btn-sm" id="btnClearAll">Clear all</button>
+          <button type="button" class="btn-warn btn-sm" id="btnContinue">Continue all</button>
         </div>
       </div>
       <div class="browsers" id="browsers"><p class="empty">未開瀏覽器。上面填好設定後撳 Launch / Add。</p></div>
@@ -403,11 +547,12 @@
       <div class="card-limits-head">
         <div>
           <h2><span class="live-dot" aria-hidden="true"></span>Live card limits</h2>
-          <p class="hint">落單成功即時扣減剩餘額度（本地即時更新，唔使等 Google Sheet）。卡號只顯示尾四位。</p>
+          <p class="hint">同 Order summary 用同一份成功訂單資料（按訂單編號對齊）。Card／Company／Remaining／Amount 與摘要一致。</p>
         </div>
         <div class="card-limits-tools">
-          <input type="search" id="cardLimitSearch" placeholder="搜尋公司／類型／尾四位" />
-          <label class="chk"><input type="checkbox" id="cardLimitUsedOnly" />只顯示已用過</label>
+              <input type="search" id="cardLimitSearch" placeholder="搜尋訂單／產品／卡號／公司" />
+          <label class="chk"><input type="checkbox" id="cardLimitUsedOnly" />只顯示非 Apple Pay</label>
+          <button type="button" class="btn-ghost btn-sm" id="btnCardLimitsRefresh" title="重新載入成功訂單／卡額">Refresh</button>
         </div>
       </div>
       <p class="card-limits-meta" id="cardLimitsMeta">載入中…</p>
@@ -415,16 +560,18 @@
         <table class="card-limits">
           <thead>
             <tr>
+              <th>Order</th>
+              <th>Placed</th>
+              <th>Product</th>
+              <th>Qty</th>
+              <th>Amount spent</th>
               <th>Card</th>
               <th>Company</th>
-              <th>Type</th>
-              <th>Original</th>
-              <th>Used</th>
               <th>Remaining</th>
             </tr>
           </thead>
           <tbody id="cardLimitsBody">
-            <tr><td colspan="6" class="empty">載入卡額資料中…</td></tr>
+            <tr><td colspan="8" class="empty">載入訂單／卡額資料中…</td></tr>
           </tbody>
         </table>
       </div>
@@ -454,34 +601,12 @@
     const logEl = $("log");
     const knownLogLenByKey = new Map();
 
-    const URL_IPHONE17 =
-      "https://www.apple.com/hk-zh/shop/buy-iphone/iphone-17/6.3-%E5%90%8B%E9%A1%AF%E7%A4%BA%E5%99%A8-256gb-%E8%96%B0%E8%A1%A3%E8%8D%89%E7%B4%AB%E8%89%B2";
     const URL_PM_256_BURGUNDY =
       "https://www.apple.com/hk-zh/shop/buy-iphone/iphone-18-pro/6.9-%E5%90%8B%E9%A1%AF%E7%A4%BA%E5%99%A8-256gb-%E5%B8%83%E6%A0%B9%E5%9C%B0%E7%B4%85%E8%89%B2";
-    const URL_PM_128_BURGUNDY =
-      "https://www.apple.com/hk-zh/shop/buy-iphone/iphone-18-pro/6.9-%E5%90%8B%E9%A1%AF%E7%A4%BA%E5%99%A8-128gb-%E5%B8%83%E6%A0%B9%E5%9C%B0%E7%B4%85%E8%89%B2";
-    const URL_PRO_256_BURGUNDY =
-      "https://www.apple.com/hk-zh/shop/buy-iphone/iphone-18-pro/6.3-%E5%90%8B%E9%A1%AF%E7%A4%BA%E5%99%A8-256gb-%E5%B8%83%E6%A0%B9%E5%9C%B0%E7%B4%85%E8%89%B2";
 
     const SALE_START_IPHONE18 = "2026-09-12T20:00:00+08:00";
 
     const PRODUCT_PRESETS = {
-      iphone17: {
-        buyUrl: URL_IPHONE17,
-        model: "iPhone 17",
-        color: "薰衣草紫色",
-        storage: "256GB",
-        label: "iPhone 17 · 256GB · 薰衣草紫",
-        saleStartIso: "2026-09-12T20:00:00+08:00",
-      },
-      iphone18promax_128_burgundy: {
-        buyUrl: URL_PM_128_BURGUNDY,
-        model: "iPhone 18 Pro Max",
-        color: "布根地紅色",
-        storage: "128GB",
-        label: "iPhone 18 Pro Max · 128GB · 布根地紅",
-        saleStartIso: SALE_START_IPHONE18,
-      },
       iphone18promax_burgundy: {
         buyUrl: URL_PM_256_BURGUNDY,
         model: "iPhone 18 Pro Max",
@@ -521,14 +646,6 @@
         color: "黑色",
         storage: "256GB",
         label: "iPhone 18 Pro Max · 256GB · 黑色",
-        saleStartIso: SALE_START_IPHONE18,
-      },
-      iphone18pro_256_burgundy: {
-        buyUrl: URL_PRO_256_BURGUNDY,
-        model: "iPhone 18 Pro",
-        color: "布根地紅色",
-        storage: "256GB",
-        label: "iPhone 18 Pro · 256GB · 布根地紅",
         saleStartIso: SALE_START_IPHONE18,
       },
     };
@@ -587,7 +704,7 @@
     function fillForm(cfg) {
       if (!cfg) return;
       // 唔覆寫 quantity / browserCount / fulfillmentPreference，等你自己填
-      for (const key of ["pickupSearch","saleStartIso","productPollIntervalMs","cardCompany","cardLimit","proxy"]) {
+      for (const key of ["pickupSearch","saleStartIso","productPollIntervalMs","proxy"]) {
         if (cfg[key] != null && $(key)) $(key).value = cfg[key];
       }
     }
@@ -618,8 +735,6 @@
         pickupSearch: String(fd.get("pickupSearch") || "中環"),
         saleStartIso: String(fd.get("saleStartIso") || preset.saleStartIso || SALE_START_IPHONE18),
         productPollIntervalMs: Number(fd.get("productPollIntervalMs") || 5000),
-        cardCompany: String(fd.get("cardCompany") || "").trim(),
-        cardLimit: String(fd.get("cardLimit") || "").trim(),
         proxy: String(fd.get("proxy") || "").trim(),
         skipTradeIn: true,
         addAppleCare: false,
@@ -640,104 +755,278 @@
 
     function phaseClass(phase) {
       if (/payment_succeeded|orders_ready|paid/i.test(phase || "")) return "paid";
+      if (/error|fail|stuck/i.test(phase || "")) return "stuck";
+      if (/steps_complete|waiting_for_payment|waiting_user|awaiting_payment/i.test(phase || "")) return "steps";
+      if (/waiting_for_stock_at_stores/i.test(phase || "")) return "wait";
+      if (/polling_continue|adding_cart/i.test(phase || "")) return "adding";
       if (/manual/i.test(phase || "")) return "manual";
       if (/wait|payment|awaiting/i.test(phase || "")) return "wait";
-      if (/error|fail/i.test(phase || "")) return "err";
       if (/run|poll|start|config|fill|checkout|contact/i.test(phase || "")) return "run";
       return "";
     }
 
-    function phaseLabel(phase, live) {
+    function phaseLabel(phase) {
       const p = String(phase || "");
-      if (/polling_continue|adding_cart/i.test(p)) {
-        return `adding cart${live ? " · live" : ""}`;
+      if (/polling_continue|adding_cart/i.test(p)) return "adding cart";
+      if (/cart_added/i.test(p)) return "cart added";
+      if (/cart_ready/i.test(p)) return "cart ready";
+      if (/checkout|guest_or_signin/i.test(p)) return "checkout";
+      if (/contact_filled/i.test(p)) return "contact filled";
+      if (/waiting_for_stock_at_stores/i.test(p)) return "waiting for stock @ stores";
+      if (/resuming_after_stock/i.test(p)) return "stock resume → pick store";
+      if (/steps_complete|waiting_user|waiting_for_payment|awaiting_payment/i.test(p)) {
+        return "waiting for payment";
       }
-      if (/waiting_user|waiting_for_payment|awaiting_payment|contact_filled|stop_requested/i.test(p)) {
-        if (/stop_requested/i.test(p)) return `stopping…${live ? " · live" : ""}`;
-        return `waiting for payment${live ? " · live" : ""}`;
+      if (/stop_requested/i.test(p)) return "stopping…";
+      if (/manual_control/i.test(p)) return "manual control";
+      if (/payment_succeeded/i.test(p)) return "payment succeeded";
+      if (/error|fail|stuck/i.test(p)) return "stuck / error";
+      if (/fulfill|shipping|guest|billing/i.test(p)) return "waiting for payment";
+      return p || "—";
+    }
+
+    /** Opened browsers Colour：只顯示呢四個名 */
+    function displayColour(raw) {
+      const s = String(raw || "").trim();
+      if (!s || s === "—") return "—";
+      if (/布根地|burgundy/i.test(s)) return "布根地紅色";
+      if (/水手|冰川|霧藍|深藍|glacier|blue/i.test(s)) return "水手布藍色";
+      if (/灰褐|銀|silver|白/i.test(s)) return "灰褐色";
+      if (/桑椹|黑|black|薰衣草紫|mulberry|lavender/i.test(s)) return "桑椹色";
+      if (/水手布藍色|灰褐色|桑椹色|布根地紅色/.test(s)) return s;
+      return s;
+    }
+
+    const STUCK_AFTER_MS = 30000;
+
+    function isTaskStuck(b) {
+      const phase = String(b.phase || "");
+      const paid =
+        Boolean(b.card?.paymentSucceeded) ||
+        Boolean(b.card?.orderNumber && String(b.card.orderNumber).trim()) ||
+        /payment_succeeded|orders_ready/i.test(phase);
+      if (paid) return false;
+      if (/waiting_for_payment|waiting_for_stock_at_stores|steps_complete|waiting_user|awaiting_payment|manual_control|closed|idle|adding_cart|polling_continue/i.test(phase)) {
+        return false;
       }
-      if (/manual_control/i.test(p)) {
-        return `manual control${live ? " · live" : ""}`;
+      if (b.stuck) return true;
+      const last = Date.parse(
+        String(b.lastProgressAt || b.updatedAt || b.runtimeStatus?.lastProgressAt || b.runtimeStatus?.updatedAt || "")
+      );
+      if (!Number.isFinite(last)) {
+        // 無進展時間但已係 error → 當卡住
+        return /error|fail/i.test(phase);
       }
-      if (/payment_succeeded/i.test(p)) {
-        return `payment succeeded${live ? " · live" : ""}`;
+      return Date.now() - last >= STUCK_AFTER_MS;
+    }
+
+    let browsersTab = "opened"; // "opened" | "finished"
+    let lastBrowsersSnap = [];
+
+    function isPaidBrowser(b) {
+      const c = b?.card || {};
+      return (
+        Boolean(c.paymentSucceeded) ||
+        Boolean(c.orderNumber && String(c.orderNumber).trim()) ||
+        /payment_succeeded|orders_ready/i.test(String(b?.phase || ""))
+      );
+    }
+
+    function browserSortKey(b) {
+      const t = Date.parse(String(b?.startedAt || b?.updatedAt || "")) || 0;
+      const id = String(b?.id || "");
+      return { t, id };
+    }
+
+    /** 舊→新：新開 task 排喺最底 */
+    function sortBrowsersOldestFirst(list) {
+      return [...list].sort((a, b) => {
+        const ka = browserSortKey(a);
+        const kb = browserSortKey(b);
+        if (ka.t !== kb.t) return ka.t - kb.t;
+        return ka.id.localeCompare(kb.id, undefined, { numeric: true });
+      });
+    }
+
+    function setBrowsersTab(tab) {
+      browsersTab = tab === "finished" ? "finished" : "opened";
+      const openedBtn = $("tabOpened");
+      const finishedBtn = $("tabFinished");
+      if (openedBtn && finishedBtn) {
+        openedBtn.classList.toggle("is-active", browsersTab === "opened");
+        finishedBtn.classList.toggle("is-active", browsersTab === "finished");
+        openedBtn.setAttribute("aria-selected", browsersTab === "opened" ? "true" : "false");
+        finishedBtn.setAttribute("aria-selected", browsersTab === "finished" ? "true" : "false");
       }
-      // checkout 流程中其他階段都當 waiting for payment（除咗 early product／cart poll）
-      if (/fulfill|shipping|guest|checkout|billing/i.test(p)) {
-        return `waiting for payment${live ? " · live" : ""}`;
+      const hint = $("browsersHint");
+      if (hint) {
+        hint.textContent =
+          browsersTab === "finished"
+            ? "已付款成功嘅 task（即時由 Opened browsers 移入）。"
+            : "進行中嘅 task（新開嘅會排喺最底）。付款成功會即時移去 Finished。";
       }
-      return `${p || "—"}${live ? " · live" : ""}`;
+      renderBrowsers(lastBrowsersSnap);
     }
 
     function renderBrowsers(browsers) {
+      lastBrowsersSnap = Array.isArray(browsers) ? browsers : [];
+      const opened = sortBrowsersOldestFirst(lastBrowsersSnap.filter((b) => !isPaidBrowser(b)));
+      const finished = sortBrowsersOldestFirst(lastBrowsersSnap.filter((b) => isPaidBrowser(b)));
+      const openedCountEl = $("openedCount");
+      const finishedCountEl = $("finishedCount");
+      if (openedCountEl) openedCountEl.textContent = String(opened.length);
+      if (finishedCountEl) finishedCountEl.textContent = String(finished.length);
+
+      const list = browsersTab === "finished" ? finished : opened;
       const box = $("browsers");
-      if (!browsers?.length) {
-        box.innerHTML = '<p class="empty">未開瀏覽器。上面填好設定後撳 Launch / Add。</p>';
+      if (!list.length) {
+        box.innerHTML =
+          browsersTab === "finished"
+            ? '<p class="empty">未有付款成功嘅 task。</p>'
+            : '<p class="empty">未開瀏覽器。上面填好設定後撳 Launch / Add。</p>';
         return;
       }
-      box.innerHTML = browsers.map((b) => {
+      box.innerHTML = list.map((b) => {
         const c = b.card || {};
-        const d = c.deliveryDetails || {};
         const fulfillment = c.fulfillmentMode || b.config?.fulfillmentPreference || "—";
-        const isDelivery = /delivery/i.test(String(fulfillment));
-        const hidden = Boolean(b.windowHidden);
-        const paid = Boolean(c.paymentSucceeded) || /payment_succeeded|orders_ready/i.test(String(b.phase || ""));
-        const pc = paid ? "paid" : phaseClass(b.phase);
-        const live = Boolean(b.running);
-        const label = paid ? phaseLabel("payment_succeeded", live) : phaseLabel(b.phase, live);
-        return `<article class="browser-card${hidden ? " is-hidden" : ""}${paid ? " is-paid" : ""}" data-id="${esc(b.id)}">
+        const paid = isPaidBrowser(b);
+        const waitingPay =
+          !paid &&
+          /steps_complete|waiting_for_payment|waiting_user|awaiting_payment/i.test(
+            String(b.phase || "")
+          );
+        const addingCart =
+          !paid &&
+          !waitingPay &&
+          /polling_continue|adding_cart/i.test(String(b.phase || ""));
+        const stuck = !paid && !waitingPay && !addingCart && isTaskStuck(b);
+        const pc = paid
+          ? "paid"
+          : stuck
+            ? "stuck"
+            : waitingPay
+              ? "steps"
+              : addingCart
+                ? "adding"
+                : phaseClass(b.phase);
+        const label = paid
+          ? phaseLabel("payment_succeeded")
+          : stuck
+            ? "stuck / error"
+            : waitingPay
+              ? "waiting for payment"
+              : addingCart
+                ? "adding cart"
+                : phaseLabel(b.phase);
+        const product = c.productType || b.config?.model || "—";
+        const colour = displayColour(c.color || b.config?.color || "—");
+        const storage = c.storage || b.config?.storage || "—";
+        const qty = c.quantity ?? b.config?.quantity ?? "—";
+        const amount = c.total || "—";
+        const cardShow = c.cardNumber
+          ? displayCardNumber(c.cardNumber)
+          : /apple_pay/i.test(String(fulfillment))
+            ? "Apple Pay"
+            : "—";
+        const companyShow =
+          c.cardCompany || (cardShow === "Apple Pay" ? "Apple Pay" : "—");
+        const emailShow = c.email || "—";
+        const phoneShow = c.phone || "—";
+        const nameShow = c.name || "—";
+        const addrShow = c.address || c.areaDistrictStreet || "—";
+        const buildingShow = c.buildingFloorUnit || "—";
+        const etaShow = c.estimatedDelivery || "—";
+        const cardTypeShow = c.cardType || (cardShow === "Apple Pay" ? "Apple Pay" : "—");
+        const urlShow = c.url || "—";
+        const msgShow =
+          c.message ||
+          b.runtimeStatus?.message ||
+          b.error ||
+          "";
+        const lastNameShow = c.lastName || "—";
+        const firstNameShow = c.firstName || "—";
+        const orderNoShow = c.orderNumber || "—";
+        const cardClass = [
+          "browser-card",
+          paid ? "is-paid" : "",
+          stuck ? "is-stuck" : "",
+          !stuck && waitingPay ? "is-steps-complete" : "",
+          !stuck && !waitingPay && addingCart ? "is-adding-cart" : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
+        return `<article class="${cardClass}" data-id="${esc(b.id)}">
           <div class="browser-head">
             <strong>${esc(b.id)}</strong>
-            <div class="browser-head-pills">
-              <span class="phase-pill ${pc}">${esc(label)}</span>
-              ${hidden ? '<span class="phase-pill hidden">window hidden</span>' : '<span class="phase-pill run">window open</span>'}
-            </div>
+            <span class="phase-pill ${pc}">${esc(label)}</span>
           </div>
-          <dl class="browser-grid">
-            <dt>Status</dt><dd>${esc(label)}${hidden ? " · window hidden" : ""}</dd>
-            <dt>Window</dt><dd>${esc(hidden ? "minimized / hidden" : (b.windowState || "visible"))}</dd>
-            <dt>Type</dt><dd>${esc(c.productType || b.config?.model || "—")}</dd>
-            <dt>Colour</dt><dd>${esc(c.color || b.config?.color || "—")}</dd>
-            <dt>Storage</dt><dd>${esc(c.storage || b.config?.storage || "—")}</dd>
-            <dt>Qty</dt><dd>${esc(c.quantity ?? b.config?.quantity ?? "—")}</dd>
-            <dt>Amount spent</dt><dd>${esc(c.total || "—")}</dd>
-            <dt>Fulfill</dt><dd>${esc(fulfillment)}</dd>
-            <dt>Order #</dt><dd>${esc(c.orderNumber || "—")}</dd>
-            ${isDelivery ? `
-            <dt>姓氏</dt><dd>${esc(d.lastName || c.lastName || "—")}</dd>
-            <dt>名字</dt><dd>${esc(d.firstName || c.firstName || "—")}</dd>
-            <dt>區域/地區/街道</dt><dd>${esc(d.areaDistrictStreet || c.areaDistrictStreet || "—")}</dd>
-            <dt>屋苑/大廈/樓層/單位</dt><dd>${esc(d.buildingFloorUnit || c.buildingFloorUnit || "—")}</dd>
-            <dt>Name</dt><dd>${esc(d.name || c.name || "—")}</dd>
-            <dt>Email</dt><dd>${esc(d.email || c.email || "—")}</dd>
-            <dt>Phone</dt><dd>${esc(d.phone || c.phone || "—")}</dd>
-            <dt>Address</dt><dd>${esc(d.address || c.address || "—")}</dd>
-            <dt>Est. delivery</dt><dd>${esc(d.estimatedDelivery || c.estimatedDelivery || "—")}</dd>
-            <dt>Credit card</dt><dd>${esc(d.cardNumber || c.cardNumber || "（付款頁人手填）")}</dd>
-            <dt>Card type</dt><dd>${esc(d.cardType || c.cardType || "—")}</dd>
-            <dt>Card company</dt><dd>${esc(d.cardCompany || c.cardCompany || "—")}</dd>
-            <dt>Card limit</dt><dd>${esc(d.cardLimit || c.cardLimit || "—")}</dd>
-            <dt>Order placed at</dt><dd>${esc(d.orderPlacedAt || c.orderPlacedAt || "—")}</dd>
-            ` : `
-            <dt>Email</dt><dd>${esc(c.email || "—")}</dd>
-            <dt>Address</dt><dd>${esc(c.address || "—")}</dd>
-            <dt>Phone</dt><dd>${esc(c.phone || "—")}</dd>
-            <dt>Credit card</dt><dd>${esc(c.cardNumber || "—")}</dd>
-            <dt>Card type</dt><dd>${esc(c.cardType || "—")}</dd>
-            <dt>Card company</dt><dd>${esc(c.cardCompany || "—")}</dd>
-            <dt>Card limit</dt><dd>${esc(c.cardLimit || "—")}</dd>
-            <dt>Order placed at</dt><dd>${esc(c.orderPlacedAt || "—")}</dd>
-            `}
-          </dl>
-          <div class="browser-actions">
+          <div class="browser-row-meta">
+            <span><b>Type</b>${esc(product)}</span>
+            <span><b>Colour</b>${esc(colour)}</span>
+            <span><b>Storage</b>${esc(storage)}</span>
+            <span><b>Qty</b>${esc(qty)}</span>
+            <span><b>Fulfill</b>${esc(fulfillment)}</span>
+            <span><b>Amount</b>${esc(amount)}</span>
+            <span><b>Order</b>${esc(orderNoShow)}</span>
+            <span><b>Card</b>${esc(cardShow)}</span>
+            <span><b>Card type</b>${esc(cardTypeShow)}</span>
+            <span><b>Company</b>${esc(companyShow)}</span>
+            <span><b>Name</b>${esc(nameShow)}</span>
+            <span><b>姓</b>${esc(lastNameShow)}</span>
+            <span><b>名</b>${esc(firstNameShow)}</span>
+            <span><b>Phone</b>${esc(phoneShow)}</span>
+            <span><b>Email</b>${esc(emailShow)}</span>
+            <span><b>Address</b>${esc(addrShow)}</span>
+            <span><b>Building</b>${esc(buildingShow)}</span>
+            <span><b>ETA</b>${esc(etaShow)}</span>
+            ${msgShow ? `<span class="wide"><b>Status</b>${esc(msgShow)}</span>` : ""}
+            ${urlShow && urlShow !== "—" ? `<span class="wide"><b>URL</b>${esc(urlShow)}</span>` : ""}
+          </div>
+          ${
+            browsersTab === "finished"
+              ? ""
+              : `<div class="browser-actions">
             <button type="button" class="btn-primary btn-sm" data-act="show" data-id="${esc(b.id)}">Open browser</button>
             <button type="button" class="btn-ghost btn-sm" data-act="hide" data-id="${esc(b.id)}">Hide</button>
-            <button type="button" class="btn-danger btn-sm" data-act="stop" data-id="${esc(b.id)}">Stop (take over)</button>
+            <button type="button" class="btn-danger btn-sm" data-act="stop" data-id="${esc(b.id)}">Stop</button>
             <button type="button" class="btn-ghost btn-sm" data-act="close" data-id="${esc(b.id)}">Close</button>
             <button type="button" class="btn-warn btn-sm" data-act="continue" data-id="${esc(b.id)}">Continue</button>
-          </div>
+          </div>`
+          }
         </article>`;
       }).join("");
+    }
+
+    function displayCardNumber(v) {
+      const s = String(v ?? "").trim();
+      if (!s || s === "—" || /人手填/i.test(s)) return "Apple Pay";
+      if (/apple\s*pay/i.test(s)) return "Apple Pay";
+      if (s.replace(/\D/g, "").length < 4) return "Apple Pay";
+      return s;
+    }
+
+    /** Order summary ↔ Live card limits 共用（同一訂單編號必須一致） */
+    function orderDisplayFields(o) {
+      const ship = o.confirmationPageShipping || {};
+      const card = displayCardNumber(o.cardNumber || ship.cardNumber);
+      const isApplePay = /apple\s*pay/i.test(card);
+      return {
+        orderNumber: String(o.orderNumber || "").trim(),
+        browser: o.browser || "—",
+        orderPlacedAt: o.orderPlacedAt || "—",
+        product: o.productType || o.productName || "—",
+        color: o.color || "—",
+        storage: o.storage || "—",
+        quantity: o.quantity ?? "—",
+        amountSpent: o.amountSpent || o.total || "—",
+        cardNumber: card,
+        cardType: o.cardType || (isApplePay ? "Apple Pay" : "—"),
+        cardCompany: o.cardCompany || (isApplePay ? "Apple Pay" : "—"),
+        cardLimit: o.cardLimit || "—",
+        remainingLimit: isApplePay
+          ? "—"
+          : o.remainingCreditCardLimit || o.remainingLimit || "—",
+      };
     }
 
     function hasOrderNumber(o) {
@@ -746,14 +1035,23 @@
     }
 
     function collectSuccessfulOrders(snap) {
-      const merged = [];
-      const seen = new Set();
+      const byKey = new Map();
+      const richness = (o) => {
+        let s = 0;
+        if (o?.cardNumber && String(o.cardNumber).trim() && !/人手填/.test(String(o.cardNumber))) s += 4;
+        if (o?.cardCompany && String(o.cardCompany).trim()) s += 2;
+        if (o?.remainingCreditCardLimit || o?.remainingLimit) s += 2;
+        if (o?.cardLimit) s += 1;
+        if (o?.amountSpent || o?.total) s += 1;
+        return s;
+      };
       const push = (o) => {
         if (!hasOrderNumber(o)) return;
         const key = String(o.orderNumber).trim();
-        if (seen.has(key)) return;
-        seen.add(key);
-        merged.push(o);
+        if (/^W9876543210$/i.test(key)) return;
+        const prev = byKey.get(key);
+        if (prev && richness(o) <= richness(prev)) return;
+        byKey.set(key, o);
       };
       const list = Array.isArray(snap?.orders) ? snap.orders : snap?.orders ? [snap.orders] : [];
       for (const o of list) push(o);
@@ -774,6 +1072,8 @@
           cardType: c.cardType,
           cardCompany: c.cardCompany,
           cardLimit: c.cardLimit,
+          remainingCreditCardLimit: c.remainingCreditCardLimit || c.remainingLimit,
+          remainingLimit: c.remainingLimit || c.remainingCreditCardLimit,
           orderPlacedAt: c.orderPlacedAt,
           deliveryMethod: c.deliveryMethod || c.fulfillmentMode || b.config?.fulfillmentPreference,
           fulfillmentMode: c.fulfillmentMode,
@@ -804,9 +1104,12 @@
             areaDistrictStreet: c.areaDistrictStreet,
             buildingFloorUnit: c.buildingFloorUnit,
           },
+          confirmationPageShipping: c.deliveryDetails || {},
         });
       }
-      return merged;
+      return [...byKey.values()].sort((a, b) =>
+        String(b.orderPlacedAt || "").localeCompare(String(a.orderPlacedAt || ""))
+      );
     }
 
     let lastSuccessfulOrders = [];
@@ -822,23 +1125,13 @@
         return;
       }
       box.innerHTML = list.map((o) => {
+        const d = orderDisplayFields(o);
         const contact = o.checkoutContactUsed || {};
         const ship = o.confirmationPageShipping || {};
         const sd = o.shippingDetails || {};
         const boxes = o.deliveryShippingBoxes || {};
         const identity = o.identity || {};
-        const amount = o.amountSpent || o.total || "—";
-        const card = o.cardNumber || ship.cardNumber || "—";
-        const cardType = o.cardType || "—";
-        const cardCompany = o.cardCompany || "—";
-        const cardLimit = o.cardLimit || "—";
-        const remainingLimit = o.remainingCreditCardLimit || o.remainingLimit || "—";
-        const orderPlacedAt = o.orderPlacedAt || "—";
         const deliveryMethod = o.deliveryMethod || o.fulfillmentMode || contact.mode || "—";
-        const productType = o.productType || o.productName || "—";
-        const colour = o.color || "—";
-        const storage = o.storage || "—";
-        const qty = o.quantity ?? "—";
         const lastName = boxes.lastName || sd.lastName || contact.lastName || identity.lastName || "";
         const firstName = boxes.firstName || sd.firstName || contact.firstName || identity.firstName || "";
         const areaDistrictStreet =
@@ -861,25 +1154,25 @@
         const pickupStore = sd.pickupStore || ship.pickupStore || "";
         const isDelivery = /delivery/i.test(String(deliveryMethod));
         return `<article class="order-card">
-          <strong>${esc(o.orderNumber)}</strong>
+          <strong>${esc(d.orderNumber)}</strong>
           <div class="order-money">
-            <div><span>Amount spent</span><b>${esc(amount)}</b></div>
-            <div><span>Credit card</span><b>${esc(card)}</b></div>
+            <div><span>Amount spent</span><b>${esc(d.amountSpent)}</b></div>
+            <div><span>Credit card</span><b>${esc(d.cardNumber)}</b></div>
           </div>
           <dl>
-            <dt>Browser</dt><dd>${esc(o.browser || "—")}</dd>
+            <dt>Browser</dt><dd>${esc(d.browser)}</dd>
             <dt>Delivery method</dt><dd>${esc(deliveryMethod)}</dd>
-            <dt>Product type</dt><dd>${esc(productType)}</dd>
-            <dt>Colour</dt><dd>${esc(colour)}</dd>
-            <dt>Storage</dt><dd>${esc(storage)}</dd>
-            <dt>Qty</dt><dd>${esc(qty)}</dd>
-            <dt>Amount spent</dt><dd>${esc(amount)}</dd>
-            <dt>Credit card</dt><dd>${esc(card)}</dd>
-            <dt>Credit card type</dt><dd>${esc(cardType)}</dd>
-            <dt>Credit card company</dt><dd>${esc(cardCompany)}</dd>
-            <dt>Credit card limit</dt><dd>${esc(cardLimit)}</dd>
-            <dt>Remaining credit card limit</dt><dd>${esc(remainingLimit)}</dd>
-            <dt>Order placed at</dt><dd>${esc(orderPlacedAt)}</dd>
+            <dt>Product type</dt><dd>${esc(d.product)}</dd>
+            <dt>Colour</dt><dd>${esc(d.color)}</dd>
+            <dt>Storage</dt><dd>${esc(d.storage)}</dd>
+            <dt>Qty</dt><dd>${esc(d.quantity)}</dd>
+            <dt>Amount spent</dt><dd>${esc(d.amountSpent)}</dd>
+            <dt>Credit card</dt><dd>${esc(d.cardNumber)}</dd>
+            <dt>Credit card type</dt><dd>${esc(d.cardType)}</dd>
+            <dt>Credit card company</dt><dd>${esc(d.cardCompany)}</dd>
+            <dt>Credit card limit</dt><dd>${esc(d.cardLimit)}</dd>
+            <dt>Remaining credit card limit</dt><dd>${esc(d.remainingLimit)}</dd>
+            <dt>Order placed at</dt><dd>${esc(d.orderPlacedAt)}</dd>
             ${isDelivery ? `
             <dt>姓氏</dt><dd>${esc(lastName || "—")}</dd>
             <dt>名字</dt><dd>${esc(firstName || "—")}</dd>
@@ -912,51 +1205,67 @@
       return Number(n).toLocaleString("en-HK");
     }
 
-    function renderCardLimits(payload) {
-      lastCardLimits = payload || null;
+    function renderCardLimitsFromOrders(orders) {
       const body = $("cardLimitsBody");
       const meta = $("cardLimitsMeta");
       if (!body) return;
-      const cards = Array.isArray(payload?.cards) ? payload.cards : [];
+      const rows = (Array.isArray(orders) ? orders : [])
+        .filter(hasOrderNumber)
+        .map((o) => orderDisplayFields(o));
+      lastCardLimits = { orders: rows, updatedAt: new Date().toISOString() };
+
       const q = String($("cardLimitSearch")?.value || "").trim().toLowerCase();
-      const usedOnly = Boolean($("cardLimitUsedOnly")?.checked);
-      const filtered = cards.filter((c) => {
-        if (usedOnly && !c.touched) return false;
+      const cardOnly = Boolean($("cardLimitUsedOnly")?.checked);
+      const filtered = rows.filter((r) => {
+        if (cardOnly && /apple\s*pay/i.test(String(r.cardNumber))) return false;
         if (!q) return true;
-        const hay = `${c.masked} ${c.last4} ${c.company} ${c.type}`.toLowerCase();
+        const hay = `${r.orderNumber} ${r.product} ${r.color} ${r.storage} ${r.cardNumber} ${r.cardCompany} ${r.browser} ${r.amountSpent}`.toLowerCase();
         return hay.includes(q);
       });
 
       if (meta) {
-        const touched = payload?.touchedCount ?? cards.filter((c) => c.touched).length;
-        const updated = payload?.updatedAt
-          ? new Date(payload.updatedAt).toLocaleTimeString("zh-HK", { hour12: false })
-          : "—";
-        meta.innerHTML = `Live · 已用過 <b>${touched}</b> / ${cards.length} 張 · 顯示 ${filtered.length} 張 · 更新 ${esc(updated)}`;
+        const withAmt = rows.filter((r) => r.amountSpent && r.amountSpent !== "—").length;
+        const updated = new Date().toLocaleTimeString("zh-HK", { hour12: false });
+        meta.innerHTML = `Live · 同 Order summary 對齊 · 成功訂單 <b>${rows.length}</b> · 有金額 ${withAmt} · 顯示 ${filtered.length} · 更新 ${esc(updated)}`;
       }
 
       if (!filtered.length) {
-        body.innerHTML = `<tr><td colspan="6" class="empty">${
-          usedOnly ? "未有卡被扣過額度。成功落單後會即時出現。" : "未有卡額資料。"
+        body.innerHTML = `<tr><td colspan="8" class="empty">${
+          cardOnly
+            ? "未有非 Apple Pay 嘅成功訂單。"
+            : "未有成功訂單。Order summary 出現訂單編號後會即時顯示喺呢度。"
         }</td></tr>`;
         return;
       }
 
       body.innerHTML = filtered
-        .map((c) => {
-          const rem = c.remainingLimit;
-          const low = rem != null && rem < 11500;
-          const cls = [c.touched ? "touched" : "", low ? "low" : ""].filter(Boolean).join(" ");
-          return `<tr class="${cls}">
-            <td>${esc(c.masked)}</td>
-            <td>${esc(c.company)}</td>
-            <td>${esc(c.type)}</td>
-            <td class="num">${esc(fmtLimit(c.originalLimit))}</td>
-            <td class="num">${esc(c.touched ? fmtLimit(c.usedAmount) : "—")}</td>
-            <td class="num remaining">${esc(fmtLimit(c.remainingLimit))}</td>
+        .map((r) => {
+          const remRaw = String(r.remainingLimit || "").replace(/[^\d.-]/g, "");
+          const remNum = remRaw ? Number(remRaw) : NaN;
+          const low = Number.isFinite(remNum) && remNum < 11500;
+          const product = [r.product, r.storage, r.color].filter((x) => x && x !== "—").join(" · ");
+          const cls = [
+            r.cardNumber && !/apple\s*pay/i.test(r.cardNumber) ? "touched" : "",
+            low ? "low" : "",
+          ]
+            .filter(Boolean)
+            .join(" ");
+          return `<tr class="${cls}" data-order="${esc(r.orderNumber)}">
+            <td>${esc(r.orderNumber)}</td>
+            <td>${esc(r.orderPlacedAt)}</td>
+            <td>${esc(product || "—")}</td>
+            <td class="num">${esc(r.quantity)}</td>
+            <td class="num">${esc(r.amountSpent)}</td>
+            <td>${esc(r.cardNumber)}</td>
+            <td>${esc(r.cardCompany)}</td>
+            <td class="num remaining">${esc(r.remainingLimit)}</td>
           </tr>`;
         })
         .join("");
+    }
+
+    function renderCardLimits(_payload) {
+      renderCardLimitsFromOrders(lastSuccessfulOrders);
     }
 
     function applySnapshot(snap) {
@@ -966,8 +1275,9 @@
       $("totalBrowsers").textContent = String(snap.totalBrowsers ?? 0);
       if (snap.config) fillForm(snap.config);
       renderBrowsers(snap.browsers || []);
-      renderOrders(collectSuccessfulOrders(snap));
-      renderCardLimits(snap.cardLimits);
+      const orders = collectSuccessfulOrders(snap);
+      renderOrders(orders);
+      renderCardLimitsFromOrders(orders);
       applyMonitorUI(snap.monitor);
 
       const key = "all";
@@ -1036,6 +1346,7 @@
       });
       const data = await res.json();
       if (!data.ok) alert(data.error || "Launch failed");
+      setBrowsersTab("opened");
       applySnapshot(data.state);
     });
 
@@ -1054,6 +1365,7 @@
       });
       const data = await res.json();
       if (!data.ok) alert(data.error || "Add failed");
+      setBrowsersTab("opened");
       applySnapshot(data.state);
     });
 
@@ -1100,7 +1412,35 @@
     });
 
     $("btnMonitorBuy").addEventListener("click", async () => {
+      let cfg;
+      try {
+        cfg = formConfig();
+      } catch (err) {
+        alert(
+          (err && err.message) ||
+            "請先揀產品並填好 Quantity／Launch count（monitor+buying 會開預熱 task）"
+        );
+        return;
+      }
       await startMonitorFromUi(true);
+      const holdCfg = {
+        ...cfg,
+        fulfillmentPreference: "pickup",
+        holdAtPickupStoresForStock: true,
+        browserCount: 1,
+        count: 1,
+      };
+      const res = await fetch("/api/browsers/add", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(holdCfg),
+      });
+      const data = await res.json();
+      if (!data.ok) alert(data.error || "開預熱門市 task 失敗");
+      else {
+        setBrowsersTab("opened");
+        applySnapshot(data.state);
+      }
     });
 
     $("btnStop").addEventListener("click", async () => {
@@ -1108,8 +1448,11 @@
       applySnapshot((await res.json()).state);
     });
 
+    $("tabOpened")?.addEventListener("click", () => setBrowsersTab("opened"));
+    $("tabFinished")?.addEventListener("click", () => setBrowsersTab("finished"));
+
     $("btnClearAll").addEventListener("click", async () => {
-      if (!confirm("Clear all opened tasks？會強制關晒所有瀏覽器。")) return;
+      if (!confirm("Clear all opened tasks？只會清未完成嘅 Opened browsers；Finished 會保留。")) return;
       const res = await fetch("/api/clear-all", { method: "POST" });
       applySnapshot((await res.json()).state);
     });
@@ -1179,12 +1522,25 @@
       if (act === "close") {
         btn.disabled = true;
         btn.textContent = "Closing…";
+        const row = btn.closest("article.browser-card");
         try {
           const res = await fetch(`/api/browsers/${encodeURIComponent(id)}/close`, {
             method: "POST",
           });
           const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            alert(data.error || `Close failed (${res.status})`);
+            btn.disabled = false;
+            btn.textContent = "Close";
+            return;
+          }
+          // 樂觀移除：即使 refresh 慢都即刻唔見
+          if (row) row.remove();
           if (data.state) applySnapshot(data.state);
+        } catch (err) {
+          alert(err instanceof Error ? err.message : String(err));
+          btn.disabled = false;
+          btn.textContent = "Close";
         } finally {
           setTimeout(refresh, 300);
           setTimeout(refresh, 1000);
@@ -1214,10 +1570,26 @@
     };
 
     $("cardLimitSearch")?.addEventListener("input", () => {
-      if (lastCardLimits) renderCardLimits(lastCardLimits);
+      renderCardLimitsFromOrders(lastSuccessfulOrders);
     });
     $("cardLimitUsedOnly")?.addEventListener("change", () => {
-      if (lastCardLimits) renderCardLimits(lastCardLimits);
+      renderCardLimitsFromOrders(lastSuccessfulOrders);
+    });
+    $("btnCardLimitsRefresh")?.addEventListener("click", async () => {
+      const btn = $("btnCardLimitsRefresh");
+      const prev = btn?.textContent || "Refresh";
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "Refreshing…";
+      }
+      try {
+        await refresh();
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = prev;
+        }
+      }
     });
 
     refresh();

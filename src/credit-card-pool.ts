@@ -110,6 +110,90 @@ export function parseHkAmount(raw: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+/** Apple HK 官價（iPhone 18 Pro / Pro Max，2026） */
+const IPHONE18_UNIT_HKD: Record<string, Record<string, number>> = {
+  "iphone 18 pro max": {
+    "256gb": 11499,
+    "512gb": 13299,
+    "1tb": 16799,
+    "2tb": 21999,
+  },
+  "iphone 18 pro": {
+    "256gb": 10499,
+    "512gb": 12299,
+    "1tb": 15799,
+    "2tb": 20999,
+  },
+  "iphone 17": {
+    "256gb": 6999,
+    "512gb": 8499,
+  },
+};
+
+function normalizeStorageKey(storage: string | null | undefined): string {
+  return String(storage || "")
+    .replace(/\s+/g, "")
+    .toLowerCase()
+    .replace(/（.*?）|\(.*?\)/g, "");
+}
+
+function normalizeModelKey(model: string | null | undefined): string {
+  return String(model || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** 單機官價；搵唔到就 null */
+export function lookupIphoneUnitPriceHkd(
+  model: string | null | undefined,
+  storage: string | null | undefined
+): number | null {
+  const m = normalizeModelKey(model);
+  const s = normalizeStorageKey(storage);
+  for (const [key, prices] of Object.entries(IPHONE18_UNIT_HKD)) {
+    if (m.includes(key)) {
+      return prices[s] ?? null;
+    }
+  }
+  return null;
+}
+
+export function formatHkMoney(n: number | null | undefined): string {
+  if (n == null || !Number.isFinite(n)) return "";
+  return `HK$${Math.round(n).toLocaleString("en-US")}.00`;
+}
+
+/**
+ * 訂單應付總額：優先用合理 scraped 金額；太細／冇掃到 → 官價 × 數量。
+ * （確認頁有時會掃到 HK$229 等雜項，唔係訂單總額）
+ */
+export function resolveOrderAmountSpent(opts: {
+  scrapedAmount?: unknown;
+  model?: string | null;
+  storage?: string | null;
+  quantity?: number | null;
+}): { amount: number | null; label: string; source: "scraped" | "catalog" | "none" } {
+  const qty = Math.max(1, Number(opts.quantity) || 1);
+  const scraped = parseHkAmount(opts.scrapedAmount);
+  const unit = lookupIphoneUnitPriceHkd(opts.model, opts.storage);
+  const catalog = unit != null ? unit * qty : null;
+
+  // scraped 太細（例如 229）或遠低於官價 50% → 當錯掃
+  if (scraped != null && scraped >= 3000) {
+    if (catalog == null || scraped >= catalog * 0.5) {
+      return { amount: scraped, label: formatHkMoney(scraped), source: "scraped" };
+    }
+  }
+  if (catalog != null) {
+    return { amount: catalog, label: formatHkMoney(catalog), source: "catalog" };
+  }
+  if (scraped != null) {
+    return { amount: scraped, label: formatHkMoney(scraped), source: "scraped" };
+  }
+  return { amount: null, label: "", source: "none" };
+}
+
 /** 用完整卡號或尾四位對應（尾四位唯一先用） */
 export function findCreditCard(cardNumber: string | null | undefined): CreditCardInfo | null {
   const d = cardDigits(cardNumber);
@@ -212,6 +296,39 @@ export function lookupCardMeta(cardNumber: string | null | undefined): {
   };
 }
 
+/** 只讀剩餘額度（唔再扣一次） */
+export async function peekCardLimitInfo(
+  rootDir: string,
+  cardNumber: string | null | undefined,
+  amountSpentRaw?: unknown
+): Promise<{
+  company: string;
+  type: string;
+  cardLimit: string;
+  remainingLimit: number | null;
+  remainingLabel: string;
+} | null> {
+  const card = findCreditCard(cardNumber);
+  if (!card) return null;
+  const store = await readRemainingStore(rootDir);
+  const key = cardDigits(card.number);
+  const amount = parseHkAmount(amountSpentRaw);
+  let remaining: number | null =
+    store[key] != null ? store[key]! : card.limit;
+  if (remaining == null && card.limit != null && amount != null) {
+    remaining = Math.round((card.limit - amount) * 100) / 100;
+  } else if (store[key] == null && card.limit != null && amount != null) {
+    remaining = Math.round((card.limit - amount) * 100) / 100;
+  }
+  return {
+    company: card.company,
+    type: card.type,
+    cardLimit: formatHkLimit(card.limit),
+    remainingLimit: remaining,
+    remainingLabel: remaining != null ? formatHkLimit(remaining) : "",
+  };
+}
+
 export type LiveCardLimitRow = {
   /** 遮罩卡號，Dashboard 顯示用 */
   masked: string;
@@ -225,11 +342,55 @@ export type LiveCardLimitRow = {
   touched: boolean;
 };
 
-/** Dashboard live：全部卡嘅目前剩餘額度 */
-export async function getLiveCardLimits(rootDir: string): Promise<{
+/** Order summary → Live card limits 列 */
+export type LiveOrderSpendRow = {
+  orderNumber: string;
+  orderPlacedAt: string;
+  browser: string;
+  product: string;
+  color: string;
+  storage: string;
+  quantity: number | null;
+  amountSpent: number | null;
+  amountSpentLabel: string;
+  cardMasked: string;
+  company: string;
+  type: string;
+  remainingLimit: number | null;
+  remainingLabel: string;
+};
+
+function hasRealOrderNumber(o: Record<string, unknown>): boolean {
+  const n = String(o.orderNumber || "").trim();
+  if (!n) return false;
+  if (/^W9876543210$/i.test(n)) return false;
+  if (/demo/i.test(String(o.browser || ""))) return false;
+  return true;
+}
+
+function orderAmountSpent(o: Record<string, unknown>): {
+  amount: number | null;
+  label: string;
+} {
+  const label = String(o.amountSpent || o.total || "").trim();
+  const amount = parseHkAmount(o.amountSpent ?? o.total);
+  return { amount, label: label || (amount != null ? formatHkLimit(amount) : "") };
+}
+
+/**
+ * Dashboard live：
+ * - cards：信用卡池剩餘額度
+ * - orders：由 Order summary（訂單編號 + 消費金額）帶入
+ */
+export async function getLiveCardLimits(
+  rootDir: string,
+  orders: unknown[] = []
+): Promise<{
   updatedAt: string;
   cards: LiveCardLimitRow[];
+  orders: LiveOrderSpendRow[];
   touchedCount: number;
+  orderCount: number;
 }> {
   const store = await readRemainingStore(rootDir);
   const cards: LiveCardLimitRow[] = CREDIT_CARD_POOL.map((card) => {
@@ -252,16 +413,101 @@ export async function getLiveCardLimits(rootDir: string): Promise<{
       touched,
     };
   });
-  // 已用過嘅排前，再按剩餘額度由低到高
   cards.sort((a, b) => {
     if (a.touched !== b.touched) return a.touched ? -1 : 1;
     const ar = a.remainingLimit ?? Number.POSITIVE_INFINITY;
     const br = b.remainingLimit ?? Number.POSITIVE_INFINITY;
     return ar - br;
   });
+
+  const orderRows: LiveOrderSpendRow[] = [];
+  const seenOrders = new Set<string>();
+  for (const item of orders) {
+    if (!item || typeof item !== "object") continue;
+    const o = item as Record<string, unknown>;
+    if (!hasRealOrderNumber(o)) continue;
+    const orderNumber = String(o.orderNumber).trim();
+    if (seenOrders.has(orderNumber)) continue;
+    seenOrders.add(orderNumber);
+
+    const { amount, label } = orderAmountSpent(o);
+    const ship =
+      (o.confirmationPageShipping as { cardNumber?: string } | undefined) || {};
+    const cardRaw = String(o.cardNumber || ship.cardNumber || "").trim();
+    const digits = cardDigits(cardRaw);
+    const isApplePay =
+      /apple\s*pay/i.test(cardRaw) ||
+      !cardRaw ||
+      cardRaw === "—" ||
+      /人手填/.test(cardRaw) ||
+      digits.length < 4;
+
+    // 同 Order summary 一致：有完整卡號就顯示完整；否則 Apple Pay
+    const cardDisplay = isApplePay
+      ? "Apple Pay"
+      : cardRaw.replace(/(\d{4})(?=\d)/g, "$1 ").replace(/\s+/g, " ").trim() ||
+        cardRaw;
+
+    const company = isApplePay
+      ? String(o.cardCompany || "Apple Pay").trim() || "Apple Pay"
+      : String(o.cardCompany || findCreditCard(cardRaw)?.company || "").trim() ||
+        "—";
+
+    const remainingFromOrder = String(
+      o.remainingCreditCardLimit || o.remainingLimit || ""
+    ).trim();
+    const poolCard = isApplePay ? null : findCreditCard(cardRaw);
+    const key = poolCard ? cardDigits(poolCard.number) : "";
+    const remainingNum =
+      remainingFromOrder
+        ? parseHkAmount(remainingFromOrder)
+        : key && store[key] != null
+          ? store[key]!
+          : poolCard?.limit != null && amount != null
+            ? Math.round((poolCard.limit - amount) * 100) / 100
+            : null;
+    const remainingLabel = isApplePay
+      ? "—"
+      : remainingFromOrder ||
+        (remainingNum != null ? formatHkLimit(remainingNum) : "—");
+
+    const amountLabel =
+      label ||
+      String(o.amountSpent || o.total || "").trim() ||
+      (amount != null ? formatHkLimit(amount) : "—");
+
+    orderRows.push({
+      orderNumber,
+      orderPlacedAt: String(o.orderPlacedAt || o.scrapedAt || "") || "—",
+      browser: String(o.browser || "") || "—",
+      product: String(o.productType || o.productName || "") || "—",
+      color: String(o.color || "") || "—",
+      storage: String(o.storage || "") || "—",
+      quantity:
+        o.quantity == null || o.quantity === ""
+          ? null
+          : Number(o.quantity) || null,
+      amountSpent: amount,
+      amountSpentLabel: amountLabel,
+      /** 同 Order summary Credit card 欄一致（完整卡號或 Apple Pay） */
+      cardMasked: cardDisplay,
+      company,
+      type: isApplePay
+        ? String(o.cardType || "Apple Pay")
+        : String(o.cardType || poolCard?.type || "") || "—",
+      remainingLimit: isApplePay ? null : remainingNum,
+      remainingLabel,
+    });
+  }
+
+  // 新單排前
+  orderRows.sort((a, b) => String(b.orderPlacedAt).localeCompare(String(a.orderPlacedAt)));
+
   return {
     updatedAt: new Date().toISOString(),
     cards,
+    orders: orderRows,
     touchedCount: cards.filter((c) => c.touched).length,
+    orderCount: orderRows.length,
   };
 }

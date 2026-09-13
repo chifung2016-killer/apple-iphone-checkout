@@ -92,6 +92,9 @@ export const MONITOR_CONFIG = {
   /**
    * 有貨時自動啟動 buy-iphone-17.ts（加入購物袋 → 改數量 → 結帳到付款頁）
    * Dashboard「Start monitor+buying」會設 MONITOR_AUTO_CHECKOUT=1。
+   * 而家流程：Dashboard 先開預熱 pickup task 停喺 Fulfillment-init；
+   * 有貨時寫 stock-resume（含 color／storage），預熱頁只跟進同色同容量，
+   * 1 秒後 refresh Fulfillment-init 再落單；冇新通知就返待命。
    */
   autoCheckout: {
     /** true = 偵測到有貨就自動開 headed 購買流程 */

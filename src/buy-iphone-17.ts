@@ -20,6 +20,7 @@ import {
   applySuccessfulCheckoutToCardLimit,
   formatHkLimit,
   lookupCardMeta,
+  resolveOrderAmountSpent,
 } from "./credit-card-pool.js";
 
 // =============================================================================
@@ -86,6 +87,11 @@ let CONFIG = {
    * 留空＝唔用 proxy
    */
   proxy: "",
+  /**
+   * Monitor+buying：跑到取貨門市列表（中環＋6 掣）後停低，
+   * 等有貨通知先 refresh 再隨機揀店繼續。
+   */
+  holdAtPickupStoresForStock: false,
 };
 
 type CheckoutConfig = typeof CONFIG;
@@ -308,6 +314,12 @@ const DASHBOARD_SHOW_FLAG = path.join(RUNTIME_DIR, `show-${SESSION_ID}.flag`);
 const DASHBOARD_HIDE_FLAG = path.join(RUNTIME_DIR, `hide-${SESSION_ID}.flag`);
 /** Stop all：停自動化但唔開窗／唔 fullscreen */
 const DASHBOARD_STOP_ALL_FLAG = path.join(RUNTIME_DIR, "stop-all.flag");
+/** Monitor 有貨：通知停喺門市列表嘅 task 繼續 */
+const STOCK_RESUME_SESSION_FLAG = path.join(
+  RUNTIME_DIR,
+  `stock-resume-${SESSION_ID}.flag`
+);
+const STOCK_RESUME_ALL_FLAG = path.join(RUNTIME_DIR, "stock-resume-all.flag");
 const STATUS_FILE = path.join(
   RUNTIME_DIR,
   SESSION_ID === "default" ? "runtime-status.json" : `status-${SESSION_ID}.json`
@@ -340,8 +352,11 @@ async function throwIfReleased(): Promise<void> {
   for (const s of ACTIVE_SESSIONS) {
     await syncDashboardWindowFlags(s).catch(() => {});
   }
-  // Close 優先（唔好被 release flag 食咗）
-  if (await flagExists(DASHBOARD_CLOSE_FLAG)) {
+  // Close／Dismiss：即刻退出，唔好再寫 status 令卡片返嚟
+  if (
+    (await flagExists(DASHBOARD_CLOSE_FLAG)) ||
+    (await flagExists(path.join(RUNTIME_DIR, `dismissed-${SESSION_ID}.flag`)))
+  ) {
     throw new ReleaseError("Dashboard 要求關閉呢個瀏覽器 session");
   }
   if (await flagExists(DASHBOARD_RELEASE_FLAG)) {
@@ -399,22 +414,163 @@ async function withReleaseCheck<T>(work: Promise<T>): Promise<T> {
   }
 }
 
+let writeStatusChain: Promise<void> = Promise.resolve();
+
+function keepCardStr(next: unknown, prev: unknown): string | null {
+  const n = next == null ? "" : String(next).trim();
+  const p = prev == null ? "" : String(prev).trim();
+  if (n && n !== "—" && !/人手填/.test(n)) return n;
+  if (p && p !== "—" && !/人手填/.test(p)) return p;
+  return n || p || null;
+}
+
+function preferCardNumber(next: unknown, prev: unknown): string | null {
+  const n = next == null ? "" : String(next).trim();
+  const p = prev == null ? "" : String(prev).trim();
+  const nd = n.replace(/\D/g, "");
+  const pd = p.replace(/\D/g, "");
+  if (/人手填/.test(n) && (pd.length >= 4 || /apple\s*pay/i.test(p))) return p || null;
+  if (/apple\s*pay/i.test(n)) return n;
+  if (/apple\s*pay/i.test(p) && nd.length < 4) return p;
+  if (nd.length >= pd.length && nd.length >= 4) return n;
+  if (pd.length >= 4) return p;
+  return n || p || null;
+}
+
 async function writeStatus(patch: Record<string, unknown>): Promise<void> {
-  await ensureRuntimeDir();
-  let prev: Record<string, unknown> = {};
-  try {
-    prev = JSON.parse(await fs.readFile(STATUS_FILE, "utf8")) as Record<string, unknown>;
-  } catch {
-    /* empty */
-  }
-  const next = {
-    ...prev,
-    ...patch,
-    sessionId: SESSION_ID,
-    windowIndex: WINDOW_INDEX,
-    updatedAt: new Date().toISOString(),
+  // 串行化：避免 window sync 同 payment_succeeded 並寫時互相覆蓋
+  const run = async () => {
+    // 已 Close／dismiss：唔再寫 status（避免殘留卡片返 Opened browsers）
+    if (
+      process.env.CHECKOUT_DASHBOARD === "1" &&
+      ((await flagExists(DASHBOARD_CLOSE_FLAG)) ||
+        (await flagExists(path.join(RUNTIME_DIR, `dismissed-${SESSION_ID}.flag`))))
+    ) {
+      return;
+    }
+    await ensureRuntimeDir();
+    let prev: Record<string, unknown> = {};
+    try {
+      prev = JSON.parse(await fs.readFile(STATUS_FILE, "utf8")) as Record<string, unknown>;
+    } catch {
+      /* empty */
+    }
+    const prevCard =
+      prev.card && typeof prev.card === "object" && !Array.isArray(prev.card)
+        ? (prev.card as Record<string, unknown>)
+        : {};
+    const patchCard =
+      patch.card && typeof patch.card === "object" && !Array.isArray(patch.card)
+        ? (patch.card as Record<string, unknown>)
+        : null;
+
+    const mergedCard = patchCard
+      ? {
+          ...prevCard,
+          ...patchCard,
+          // 一經標成功／有訂單編號，唔好被之後空值蓋走
+          paymentSucceeded:
+            Boolean(prevCard.paymentSucceeded) ||
+            Boolean(patchCard.paymentSucceeded) ||
+            Boolean(prevCard.orderNumber) ||
+            Boolean(patchCard.orderNumber),
+          orderNumber: patchCard.orderNumber || prevCard.orderNumber || null,
+          cardNumber: preferCardNumber(patchCard.cardNumber, prevCard.cardNumber),
+          cardType: keepCardStr(patchCard.cardType, prevCard.cardType),
+          cardCompany: keepCardStr(patchCard.cardCompany, prevCard.cardCompany),
+          cardLimit: keepCardStr(patchCard.cardLimit, prevCard.cardLimit),
+          remainingCreditCardLimit: keepCardStr(
+            patchCard.remainingCreditCardLimit ?? patchCard.remainingLimit,
+            prevCard.remainingCreditCardLimit ?? prevCard.remainingLimit
+          ),
+          remainingLimit: keepCardStr(
+            patchCard.remainingLimit ?? patchCard.remainingCreditCardLimit,
+            prevCard.remainingLimit ?? prevCard.remainingCreditCardLimit
+          ),
+          total: keepCardStr(patchCard.total, prevCard.total),
+          orderPlacedAt: keepCardStr(patchCard.orderPlacedAt, prevCard.orderPlacedAt),
+        }
+      : prevCard;
+
+    const next: Record<string, unknown> = {
+      ...prev,
+      ...patch,
+      sessionId: SESSION_ID,
+      windowIndex: WINDOW_INDEX,
+      updatedAt: new Date().toISOString(),
+    };
+    if (patchCard || Object.keys(prevCard).length) {
+      next.card = mergedCard;
+    }
+    // phase：payment_succeeded 優先保留
+    if (
+      /payment_succeeded/i.test(String(prev.phase || "")) &&
+      !/payment_succeeded/i.test(String(patch.phase || ""))
+    ) {
+      next.phase = "payment_succeeded";
+    } else if (mergedCard.paymentSucceeded || mergedCard.orderNumber) {
+      if (!patch.phase || /waiting_for_payment|waiting_user|manual_control|idle|steps_complete/i.test(String(patch.phase))) {
+        // window-only／等待類 patch 唔好降級已成功狀態
+        if (/payment_succeeded/i.test(String(prev.phase || "")) || mergedCard.paymentSucceeded) {
+          next.phase = "payment_succeeded";
+        }
+      }
+    } else if (
+      /steps_complete/i.test(String(prev.phase || "")) &&
+      (!patch.phase || /waiting_user|idle/i.test(String(patch.phase || "")))
+    ) {
+      // steps_complete 之後 window sync／idle 唔好降級；waiting_for_payment 可以寫入
+      next.phase = "steps_complete";
+    }
+
+    // 進展時間：只喺步驟／phase／輪詢有變先更新（window sync 唔計）
+    const phaseNext = String(next.phase || "");
+    const madeProgress =
+      patch.stuck === false ||
+      (patch.phase != null && String(patch.phase) !== String(prev.phase || "")) ||
+      (patch.message != null && String(patch.message) !== String(prev.message || "")) ||
+      (patch.pollRound != null && patch.pollRound !== prev.pollRound) ||
+      (patch.error != null && String(patch.error) !== String(prev.error || "")) ||
+      (patchCard?.url != null &&
+        String(patchCard.url) !== String(prevCard.url || ""));
+    if (madeProgress && patch.stuck !== true) {
+      next.lastProgressAt = new Date().toISOString();
+      next.stuck = false;
+      next.stuckSince = null;
+    } else {
+      next.lastProgressAt =
+        prev.lastProgressAt || prev.updatedAt || next.updatedAt;
+      if (patch.stuck === true) {
+        next.stuck = true;
+        next.stuckSince =
+          patch.stuckSince || prev.stuckSince || new Date().toISOString();
+      } else if (patch.stuck === false) {
+        next.stuck = false;
+        next.stuckSince = null;
+      } else {
+        next.stuck = Boolean(prev.stuck);
+        next.stuckSince = prev.stuckSince ?? null;
+      }
+    }
+    // 終態／等人：唔標 stuck
+    if (
+      /waiting_for_payment|waiting_for_stock_at_stores|steps_complete|payment_succeeded|orders_ready|manual_control|closed|idle/i.test(
+        phaseNext
+      )
+    ) {
+      next.stuck = false;
+      next.stuckSince = null;
+    }
+
+    await fs.writeFile(STATUS_FILE, JSON.stringify(next, null, 2), "utf8").catch(() => {});
   };
-  await fs.writeFile(STATUS_FILE, JSON.stringify(next, null, 2), "utf8").catch(() => {});
+
+  const queued = writeStatusChain.then(run, run);
+  writeStatusChain = queued.then(
+    () => undefined,
+    () => undefined
+  );
+  await queued;
 }
 
 async function loadRuntimeConfig(): Promise<void> {
@@ -424,9 +580,20 @@ async function loadRuntimeConfig(): Promise<void> {
     const raw = await fs.readFile(file, "utf8");
     const parsed = JSON.parse(raw) as Partial<CheckoutConfig>;
     CONFIG = { ...CONFIG, ...parsed };
+    const holdRaw = (parsed as Record<string, unknown>).holdAtPickupStoresForStock;
+    if (
+      process.env.CHECKOUT_HOLD_AT_PICKUP_STORES === "1" ||
+      holdRaw === true ||
+      holdRaw === "1" ||
+      holdRaw === 1
+    ) {
+      CONFIG.holdAtPickupStoresForStock = true;
+    }
     console.log(`已載入 runtime config：${file}`);
     console.log(
-      `  ${CONFIG.model} / ${CONFIG.color} / ${CONFIG.storage} ×${CONFIG.quantity}｜${CONFIG.fulfillmentPreference}｜browsers=${CONFIG.browserCount}`
+      `  ${CONFIG.model} / ${CONFIG.color} / ${CONFIG.storage} ×${CONFIG.quantity}｜${CONFIG.fulfillmentPreference}｜browsers=${CONFIG.browserCount}${
+        CONFIG.holdAtPickupStoresForStock ? "｜hold@stores→等有貨" : ""
+      }`
     );
     await writeStatus({
       phase: "config_loaded",
@@ -644,7 +811,22 @@ async function waitForEnter(
   if (process.env.CHECKOUT_DASHBOARD === "1") {
     console.log("（Dashboard 模式：請喺 UI 撳該瀏覽器／全部「確認已落單／繼續」）");
     const phase = opts?.phase || "waiting_user";
-    await writeStatus({ phase, message });
+    const keepHiddenForPayment = /waiting_for_payment|steps_complete/i.test(phase);
+    if (keepHiddenForPayment) {
+      for (const s of ACTIVE_SESSIONS) {
+        await setBrowserWindowState(s, "minimized").catch(() => {});
+      }
+      if (opts?.session) {
+        await setBrowserWindowState(opts.session, "minimized").catch(() => {});
+      }
+    }
+    await writeStatus({
+      phase,
+      message: keepHiddenForPayment ? "waiting for payment" : message,
+      ...(keepHiddenForPayment
+        ? { windowHidden: true, windowState: "minimized" }
+        : {}),
+    });
     await fs.unlink(DASHBOARD_CONTINUE_SESSION_FLAG).catch(() => {});
     while (true) {
       await throwIfReleased();
@@ -660,6 +842,9 @@ async function waitForEnter(
               cardNumber: opts.session.capturedCardNumber,
               url: opts.session.page.url(),
             }),
+            ...(keepHiddenForPayment
+              ? { windowHidden: true, windowState: "minimized" }
+              : {}),
           }).catch(() => {});
         }
       }
@@ -675,16 +860,31 @@ async function waitForEnter(
             opts.session.capturedCardNumber ||
             scraped.cardNumber ||
             null;
+          const poolMeta = lookupCardMeta(cardNo);
           await writeStatus({
             phase: "payment_succeeded",
             message: `付款成功：${scraped.orderNumber}`,
+            windowHidden: true,
             card: cardFieldsFromSession(opts.session, {
               orderNumber: scraped.orderNumber,
               total: scraped.total,
               quantity: scraped.quantity,
               cardNumber: cardNo,
-              cardType: detectCardType(cardNo) || opts.session.cardType || "",
-              cardCompany: resolveCardCompany() || opts.session.cardCompany || "",
+              cardType:
+                poolMeta?.type ||
+                detectCardType(cardNo) ||
+                opts.session.cardType ||
+                "",
+              cardCompany:
+                poolMeta?.company ||
+                resolveCardCompany() ||
+                opts.session.cardCompany ||
+                "",
+              cardLimit:
+                poolMeta?.limit ||
+                resolveCardLimit() ||
+                opts.session.cardLimit ||
+                "",
               orderPlacedAt: opts.session.orderPlacedAt,
               paymentSucceeded: true,
             }),
@@ -696,20 +896,48 @@ async function waitForEnter(
       try {
         await fs.access(DASHBOARD_CONTINUE_SESSION_FLAG);
         await fs.unlink(DASHBOARD_CONTINUE_SESSION_FLAG).catch(() => {});
-        await writeStatus({ phase: "user_continued" });
-        return;
+        // waiting for payment：Continue 唔好提早離開（要等付款成功或 Close）
+        if (keepHiddenForPayment) {
+          console.log("waiting for payment：已忽略 Continue，請完成付款或撳 Close。");
+        } else {
+          await writeStatus({ phase: "user_continued" });
+          return;
+        }
       } catch {
         /* try global flag */
       }
       try {
         await fs.access(DASHBOARD_CONTINUE_FLAG);
-        await writeStatus({ phase: "user_continued" });
-        return;
+        if (keepHiddenForPayment) {
+          await fs.unlink(DASHBOARD_CONTINUE_FLAG).catch(() => {});
+          console.log("waiting for payment：已忽略 Continue，請完成付款或撳 Close。");
+        } else {
+          await writeStatus({ phase: "user_continued" });
+          return;
+        }
       } catch {
         /* wait */
       }
       for (const s of ACTIVE_SESSIONS) {
         await syncDashboardWindowFlags(s).catch(() => {});
+      }
+      // 保持隱藏（Open browser 會將 windowHidden 設 false，就唔再強制 minimize）
+      if (keepHiddenForPayment) {
+        try {
+          const st = JSON.parse(await fs.readFile(STATUS_FILE, "utf8")) as {
+            windowHidden?: boolean;
+          };
+          if (st.windowHidden !== false) {
+            for (const s of ACTIVE_SESSIONS) {
+              const state = await readBrowserWindowState(s).catch(() => null);
+              if (state && state !== "minimized") {
+                await setBrowserWindowState(s, "minimized").catch(() => {});
+              }
+            }
+          }
+        } catch {
+          /* ignore */
+        }
       }
       await sleepCheckingRelease(800);
     }
@@ -743,6 +971,13 @@ async function humanClick(
 async function settleAfterNavigation(page: Page): Promise<void> {
   await withReleaseCheck(page.waitForLoadState("domcontentloaded").catch(() => {}));
   await withReleaseCheck(page.waitForLoadState("networkidle").catch(() => {}));
+  if (isShop404Url(page.url())) {
+    await recoverFromShop404IfNeeded(page).catch((err) => {
+      console.warn(
+        `  404 復原失敗：${err instanceof Error ? err.message : String(err)}`
+      );
+    });
+  }
   await sleepCheckingRelease(CONFIG.clickDelayMs);
 }
 
@@ -1154,17 +1389,35 @@ async function takeNEmails(count: number): Promise<string[]> {
   if (pool.length === 0) {
     throw new StepError("電郵", "EMAIL_POOL 係空。請加入電郵。");
   }
-  const used = new Set((await readUsedEmails()).map((e) => e.toLowerCase()));
-  const unused = pool.filter((e) => !used.has(e));
+  let used = new Set((await readUsedEmails()).map((e) => e.toLowerCase()));
+  let unused = pool.filter((e) => !used.has(e));
+
+  // 全部用完／剩餘唔夠：自動清空 used-emails.json，重用 pool
   if (unused.length < count) {
-    throw new StepError(
-      "電郵",
-      `需要 ${count} 個未用電郵，而家剩餘 ${unused.length} 個。請加新電郵，或刪 used-emails.json。`
+    console.warn(
+      `[email] 未用電郵剩 ${unused.length} 個，需要 ${count} 個 → 偵測到電郵已用完，自動重用 EMAIL_POOL（清空 used-emails.json）`
     );
+    used = new Set();
+    unused = [...pool];
+    await fs.writeFile(USED_EMAILS_FILE, "[]", "utf8").catch(() => {});
   }
-  const picked = unused.slice(0, count);
+
+  // pool 本身少過 count：循環重用同一批
+  const picked: string[] = [];
+  if (unused.length >= count) {
+    picked.push(...unused.slice(0, count));
+  } else {
+    console.warn(
+      `[email] EMAIL_POOL 只有 ${pool.length} 個，少過今次需要 ${count} 個 → 循環重用`
+    );
+    for (let i = 0; i < count; i++) {
+      picked.push(pool[i % pool.length]!);
+    }
+  }
+
   for (const email of picked) used.add(email);
   await fs.writeFile(USED_EMAILS_FILE, JSON.stringify([...used], null, 2), "utf8");
+  console.log(`[email] 已分配 ${picked.length} 個電郵（used=${used.size}/${pool.length}）`);
   return picked;
 }
 
@@ -1479,32 +1732,47 @@ function currentIphone18BuyUrl(page?: Page): string {
   return CONFIG.buyUrl;
 }
 
-/** 偵測 iPhone 18 產品設定頁錯誤／無 CTA */
+/** 偵測 iPhone 18 產品設定頁真正錯誤（唔包「暫無供應」等可繼續 refresh 嘅軟狀態） */
 async function isIphone18BuyPageError(page: Page): Promise<boolean> {
   const url = page.url();
   if (/\/shop\/bag|\/checkout|\/signIn|wallet\.apple/i.test(url)) return false;
+  if (isShop404Url(url)) return true;
 
   const title = (await page.title().catch(() => "")) || "";
   const body =
     ((await page.locator("body").innerText().catch(() => "")) || "").slice(0, 3500);
   const blob = `${title}\n${body}`;
+
+  // 硬錯誤：真 404／拒絕存取／整頁壞咗
   if (
-    /404|Page Not Found|找不到(?:此)?頁|發生錯誤|無法載入|Something went wrong|系統繁忙|請稍後再試|Please try again|Currently unavailable|暫無供應|目前無法提供|This page isn'?t available|Access Denied|Service Unavailable|維護中/i.test(
+    /404|Page Not Found|找不到(?:此)?頁|This page isn'?t available|Access Denied|Service Unavailable|維護中|Something went wrong/i.test(
       blob
     )
   ) {
     return true;
   }
 
+  const ctaCount = await page
+    .locator(
+      '[data-autom="continueButton"], [data-autom="add-to-cart"], button[name="add-to-cart"], button:has-text("加入購物袋"), button:has-text("繼續")'
+    )
+    .count()
+    .catch(() => 0);
+
+  // 「暫無供應／系統繁忙」但仲有 CTA：開賣前／搶購正常狀態 → 唔當錯誤、唔好亂轉 goto
+  if (
+    /系統繁忙|請稍後再試|Please try again|Currently unavailable|暫無供應|目前無法提供|無法載入|發生錯誤/i.test(
+      blob
+    )
+  ) {
+    if (ctaCount > 0) return false;
+    // 冇 CTA 先當錯誤，轉 goto 試
+    return true;
+  }
+
   // 設定 slug 頁但完全冇「繼續／加入購物袋」
   if (isIphone18ConfiguredSlugUrl(url) || isIphone18ConfiguredSlugUrl(CONFIG.buyUrl)) {
-    const cta = await page
-      .locator(
-        '[data-autom="continueButton"], [data-autom="add-to-cart"], button[name="add-to-cart"], button:has-text("加入購物袋"), button:has-text("繼續")'
-      )
-      .count()
-      .catch(() => 0);
-    if (cta === 0) return true;
+    if (ctaCount === 0) return true;
   }
   return false;
 }
@@ -1526,6 +1794,7 @@ async function pollIphone18GotoUntilNextPage(page: Page): Promise<boolean> {
     round += 1;
     await writeStatus({
       phase: "adding_cart",
+      message: "adding cart",
       pollRound: round,
       buyUrl: gotoUrl,
       saleStartIso: CONFIG.saleStartIso,
@@ -1542,6 +1811,16 @@ async function pollIphone18GotoUntilNextPage(page: Page): Promise<boolean> {
     await settleDom(page, 150);
 
     if (await isIphone18BuyPageError(page)) {
+      if (isShop404Url(page.url())) {
+        console.warn("  goto 輪詢撞到 /shop/404 → 購物袋復原…");
+        const recovered = await recoverFromShop404IfNeeded(page);
+        if (recovered && (await confirmAddedToBag(page))) {
+          console.log("  ✓ 404 復原後已有購物袋貨，當加購成功");
+          return true;
+        }
+        await sleepCheckingRelease(CONFIG.productPollIntervalMs);
+        continue;
+      }
       console.warn("  goto 頁仍似錯誤頁，refresh 再試…");
       await sleepCheckingRelease(CONFIG.productPollIntervalMs);
       continue;
@@ -2050,8 +2329,184 @@ function isBagPage(url: string): boolean {
   return /\/shop\/bag/i.test(url);
 }
 
+/** Apple HK 錯誤頁：https://www.apple.com/hk-zh/shop/404 */
+function isShop404Url(url: string): boolean {
+  return /\/shop\/404\b/i.test(url);
+}
+
+async function clickShoppingBagNavButton(page: Page): Promise<boolean> {
+  const candidates = [
+    page.locator("#globalnav-menubutton-link-bag"),
+    page.locator("a.globalnav-link-bag, button.globalnav-link-bag"),
+    page.locator('[data-autom="globalnav-bag"], [data-analytics-title="bag"]'),
+    page.locator(
+      'a[aria-label*="購物袋" i], button[aria-label*="購物袋" i], a[aria-label*="Shopping Bag" i], button[aria-label*="Bag" i]'
+    ),
+    page.getByRole("link", { name: /^(購物袋|Shopping Bag|Bag)$/i }),
+    page.getByRole("button", { name: /^(購物袋|Shopping Bag|Bag)$/i }),
+    page.locator(".globalnav-bag a, .globalnav-bag button, li.globalnav-item-bag a"),
+  ];
+  for (const loc of candidates) {
+    const el = loc.first();
+    if (!(await el.count().catch(() => 0))) continue;
+    if (!(await visible(el, 1200))) continue;
+    await humanClick(el, { force: true }).catch(async () => {
+      await el.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
+    });
+    return true;
+  }
+  // DOM 掃描：頂欄 bag icon
+  const clicked = await page
+    .evaluate(() => {
+      const nodes = Array.from(
+        document.querySelectorAll<HTMLElement>("a, button, summary")
+      );
+      for (const el of nodes) {
+        const id = (el.id || "").toLowerCase();
+        const cls = (el.className || "").toString().toLowerCase();
+        const aria = (el.getAttribute("aria-label") || "").toLowerCase();
+        const href = (el.getAttribute("href") || "").toLowerCase();
+        const autom = (el.getAttribute("data-autom") || "").toLowerCase();
+        if (
+          id.includes("bag") ||
+          cls.includes("globalnav-link-bag") ||
+          cls.includes("globalnav-bag") ||
+          autom.includes("bag") ||
+          aria.includes("購物袋") ||
+          aria.includes("shopping bag") ||
+          (href.includes("/shop/bag") && cls.includes("globalnav"))
+        ) {
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    })
+    .catch(() => false);
+  return Boolean(clicked);
+}
+
+async function clickViewBagButton(page: Page): Promise<boolean> {
+  const candidates = [
+    page.getByRole("link", { name: /查看購物袋|檢視購物袋|前往購物袋|Review Bag|View Bag/i }),
+    page.getByRole("button", { name: /查看購物袋|檢視購物袋|前往購物袋|Review Bag|View Bag/i }),
+    page.locator(
+      'a:has-text("查看購物袋"), button:has-text("查看購物袋"), a:has-text("檢視購物袋"), button:has-text("檢視購物袋")'
+    ),
+    page.locator(
+      'a:has-text("Review Bag"), button:has-text("Review Bag"), a:has-text("View Bag"), button:has-text("View Bag")'
+    ),
+    page.locator('[data-autom*="bag" i]').filter({ hasText: /查看|檢視|Review|View/i }),
+  ];
+  for (const loc of candidates) {
+    const el = loc.first();
+    if (!(await el.count().catch(() => 0))) continue;
+    if (!(await visible(el, 1500))) continue;
+    await humanClick(el, { force: true }).catch(async () => {
+      await el.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
+    });
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 所有 task 停喺 /shop/404：
+ * 撳頂欄「購物袋」→「查看購物袋」→ 再交俾後續結帳步驟。
+ * （唔會喺呢度遞迴 call addToBag，避免搶購時爆 stack）
+ */
+const recovering404Pages = new WeakSet<Page>();
+
+async function recoverFromShop404IfNeeded(
+  page: Page,
+  tag = ""
+): Promise<boolean> {
+  if (!isShop404Url(page.url())) return false;
+  const prefix = tag ? `${tag} ` : "";
+  if (recovering404Pages.has(page)) {
+    console.warn(`${prefix}/shop/404 復原重入 → 直達 /shop/bag`);
+    await page
+      .goto("https://www.apple.com/hk-zh/shop/bag", { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await settleDom(page, 200);
+    return isBagPage(page.url()) || isCheckoutFlowPage(page.url());
+  }
+  recovering404Pages.add(page);
+  try {
+  console.log(
+    `${prefix}偵測到 /shop/404 → 撳購物袋掣 →「查看購物袋」，再繼續流程`
+  );
+  await writeStatus({
+    phase: "recover_404_to_bag",
+    url: page.url(),
+    message: "shop/404 → shopping bag → 查看購物袋",
+  }).catch(() => {});
+
+  const bagNavClicked = await clickShoppingBagNavButton(page);
+  if (bagNavClicked) {
+    console.log(`${prefix}已撳頂欄購物袋掣`);
+    await settleDom(page, 350);
+    const viewed = await clickViewBagButton(page);
+    if (viewed) {
+      console.log(`${prefix}已撳「查看購物袋」`);
+      await settleDom(page, 400);
+      await withReleaseCheck(
+        page
+          .waitForURL((u) => /\/shop\/bag|\/shop\/checkout|\/shop\/signIn/i.test(u.toString()), {
+            timeout: 12_000,
+          })
+          .catch(() => {})
+      );
+    } else {
+      console.warn(`${prefix}揾唔到「查看購物袋」，改直接開 /shop/bag`);
+      await page
+        .goto("https://www.apple.com/hk-zh/shop/bag", { waitUntil: "domcontentloaded" })
+        .catch(() => {});
+    }
+  } else {
+    console.warn(`${prefix}揾唔到頂欄購物袋掣，改直接開 /shop/bag`);
+    await page
+      .goto("https://www.apple.com/hk-zh/shop/bag", { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+  }
+
+  await settleDom(page, 250);
+  const url = page.url();
+  if (isCheckoutFlowPage(url) || /\/shop\/signIn/i.test(url)) {
+    console.log(`${prefix}404 復原後已到結帳／登入：${url}`);
+    return true;
+  }
+  if (isBagPage(url)) {
+    if (await isBagEmpty(page)) {
+      // 唔喺度遞迴加購；交返外層輪詢由 buy/goto 再試
+      console.warn(`${prefix}404→購物袋係空，返回產品頁等外層輪詢重試…`);
+      const resumeUrl = isIphone18Task() ? currentIphone18BuyUrl(page) : CONFIG.buyUrl;
+      await page.goto(resumeUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+      await selectProductOptions(page, { randomColor: false }).catch(() => {});
+      return false;
+    }
+    console.log(`${prefix}已由 404 回到購物袋（有貨），繼續流程`);
+    return true;
+  }
+
+  // 仍喺 404：最後再試一次直達 bag
+  if (isShop404Url(page.url())) {
+    await page
+      .goto("https://www.apple.com/hk-zh/shop/bag", { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await settleDom(page, 200);
+  }
+  return isBagPage(page.url()) || isCheckoutFlowPage(page.url());
+  } finally {
+    recovering404Pages.delete(page);
+  }
+}
+
 /** 若被踢返產品設定頁／購物袋，重新加購（沿用 CONFIG 顏色，唔隨機） */
 async function recoverAddToBagIfNeeded(page: Page, tag: string): Promise<boolean> {
+  if (isShop404Url(page.url())) {
+    return recoverFromShop404IfNeeded(page, tag);
+  }
   const url = page.url();
   if (isProductConfigPage(url)) {
     console.log(`${tag} 偵測到退回產品頁，重新揀規格並加入購物袋…`);
@@ -2126,10 +2581,23 @@ async function waitUntilSalePollWindow(): Promise<void> {
   const saleStart = Date.parse(CONFIG.saleStartIso);
   if (Number.isNaN(saleStart)) return;
   const now = Date.now();
+  const lead = Math.max(0, Number(CONFIG.salePollLeadMs) || 0);
   console.log(`  開賣時間：${formatHkTime(saleStart)} HKT（「繼續」預計呢個時間先可用）`);
-  if (now < saleStart) {
+  if (now < saleStart - lead) {
+    const waitMs = saleStart - lead - now;
     console.log(
-      `  而家未開賣（仲有約 ${Math.ceil((saleStart - now) / 1000)} 秒）。會即刻每 ${CONFIG.productPollIntervalMs / 1000} 秒 refresh 重試「繼續」。`
+      `  距離搶購窗口仲有 ${Math.ceil(waitMs / 1000)} 秒（提前 ${Math.ceil(lead / 1000)} 秒開始 refresh）。會先停喺產品頁暖機。`
+    );
+    // 暖機：保持頁面，短間隔 sleep，唔狂 refresh 燒 IP
+    const warmUntil = saleStart - lead;
+    while (Date.now() < warmUntil) {
+      await throwIfReleased();
+      await sleepCheckingRelease(Math.min(5000, Math.max(500, warmUntil - Date.now())));
+    }
+  }
+  if (Date.now() < saleStart) {
+    console.log(
+      `  已入搶購窗口（開賣前 ${Math.ceil((saleStart - Date.now()) / 1000)} 秒）。每 ${CONFIG.productPollIntervalMs / 1000} 秒 refresh 重試「繼續」。`
     );
   } else {
     console.log("  已過開賣時間，即刻每 5 秒 refresh 重試「繼續」。");
@@ -2546,6 +3014,15 @@ async function addConfiguredSlugToBagOnce(page: Page): Promise<boolean> {
   for (let w = 0; w < 12; w++) {
     await throwIfReleased();
 
+    if (isShop404Url(page.url())) {
+      console.warn("  加購後落到 /shop/404 → 購物袋復原…");
+      const ok = await recoverFromShop404IfNeeded(page);
+      if (ok && (await confirmAddedToBag(page))) {
+        console.log(`  已加購成功（經 404 復原）→ ${page.url()}`);
+        return true;
+      }
+    }
+
     if (
       isAttachStepUrl(page.url()) ||
       (await page.locator('[data-autom="proceed"]').count().catch(() => 0)) > 0
@@ -2752,6 +3229,7 @@ async function addToBagAndOpenBag(page: Page): Promise<void> {
     console.log(`  目標頁：${CONFIG.buyUrl}`);
     await writeStatus({
       phase: "adding_cart",
+      message: "adding cart",
       pollRound: 0,
       buyUrl: CONFIG.buyUrl,
       saleStartIso: CONFIG.saleStartIso,
@@ -2863,10 +3341,15 @@ async function addToBagAndOpenBag(page: Page): Promise<void> {
   }
 
   let round = 0;
+  const saleStartMs = Date.parse(CONFIG.saleStartIso);
+  const saleGraceEnd =
+    (Number.isFinite(saleStartMs) ? saleStartMs : Date.now()) + 45 * 60 * 1000;
   while (true) {
     await throwIfReleased();
     round += 1;
-    if (round > 40) {
+    // 開賣前後 45 分鐘內大幅放寬，避免 round>40 提早放棄（12/9 8pm 波次問題）
+    const maxRounds = Date.now() <= saleGraceEnd ? 900 : 80;
+    if (round > maxRounds) {
       throw new StepError(
         "加入購物袋",
         "多次重試仍未能將 iPhone 加入購物袋。請人手加入後再繼續。"
@@ -2884,10 +3367,24 @@ async function addToBagAndOpenBag(page: Page): Promise<void> {
     }
     await writeStatus({
       phase: "adding_cart",
+      message: "adding cart",
       pollRound: round,
       buyUrl: CONFIG.buyUrl,
       saleStartIso: CONFIG.saleStartIso,
     });
+
+    // 每輪先處理 /shop/404（開賣高峰常見）
+    if (isShop404Url(page.url())) {
+      console.warn("  輪詢撞到 /shop/404 → 復原…");
+      const recovered = await recoverFromShop404IfNeeded(page);
+      if (recovered && (await confirmAddedToBag(page))) {
+        console.log("  ✓ 404 復原後已有購物袋貨");
+        await settleDom(page, 200);
+        await skipAccessoryUpsells(page);
+        await removeAccessoryItemsFromBag(page).catch(() => {});
+        return;
+      }
+    }
 
     console.log(`  refresh 產品頁…`);
     // iPhone 18：若設定頁已出錯／已切 goto，走 goto 輪詢
@@ -2984,6 +3481,16 @@ async function addToBagAndOpenBag(page: Page): Promise<void> {
     throw new StepError("加入購物袋", "購物袋仍然係空，未能加入 iPhone。");
   }
   console.log("  ✓ 加購完成，購物袋有貨");
+  // 畀 Dashboard 即時更新（有 session 先寫）
+  for (const s of ACTIVE_SESSIONS) {
+    if (s.page === page) {
+      await publishTaskSnapshot(s, "cart_added", {
+        message: "已加入購物袋",
+        url: page.url(),
+      }).catch(() => {});
+      break;
+    }
+  }
 }
 
 function buyConfigUrlFromAttach(url: string): string {
@@ -3010,6 +3517,9 @@ async function isBagEmpty(page: Page): Promise<boolean> {
 async function setBagQuantity(page: Page, quantity: number): Promise<void> {
   console.log(`步驟：購物袋數量改做 ${quantity}`);
 
+  if (isShop404Url(page.url())) {
+    await recoverFromShop404IfNeeded(page);
+  }
   if (!/\/shop\/bag/i.test(page.url())) {
     await page.goto("https://www.apple.com/hk-zh/shop/bag", {
       waitUntil: "domcontentloaded",
@@ -3099,6 +3609,19 @@ async function setBagQuantity(page: Page, quantity: number): Promise<void> {
 }
 
 async function goToCheckout(page: Page): Promise<void> {
+  if (isShop404Url(page.url())) {
+    await recoverFromShop404IfNeeded(page);
+  }
+  if (!isBagPage(page.url()) && !isCheckoutFlowPage(page.url())) {
+    // 唔喺袋／結帳：先試 404／nav bag 復原，再直達 bag
+    if (isShop404Url(page.url())) await recoverFromShop404IfNeeded(page);
+    if (!isBagPage(page.url()) && !isCheckoutFlowPage(page.url())) {
+      await page
+        .goto("https://www.apple.com/hk-zh/shop/bag", { waitUntil: "domcontentloaded" })
+        .catch(() => {});
+      await settleDom(page, 200);
+    }
+  }
   if (isPickupApplePay()) {
     console.log("步驟：使用 Apple Pay 結帳（pickup apple pay）");
     const clicked = await clickByAccessibleName(page, [
@@ -4444,6 +4967,153 @@ async function clickContinueToPickupDetails(page: Page): Promise<boolean> {
   return false;
 }
 
+/** Monitor+buying：解析 stock-resume flag（含 color／storage） */
+type StockResumeSku = {
+  name?: string;
+  model?: string;
+  color?: string;
+  storage?: string;
+  stockQty?: number | null;
+  buyQty?: number;
+};
+
+type StockResumePayload = {
+  atMs: number;
+  skus: StockResumeSku[];
+};
+
+function normColorKey(s: string): string {
+  return String(s || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "");
+}
+
+function normStorageKey(s: string): string {
+  return String(s || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "");
+}
+
+function stockSkuMatchesCheckout(sku: StockResumeSku): boolean {
+  const wantStorage = normStorageKey(CONFIG.storage);
+  const gotStorage = normStorageKey(String(sku.storage || ""));
+  if (!wantStorage || !gotStorage || wantStorage !== gotStorage) return false;
+
+  const wantColor = normColorKey(CONFIG.color);
+  if (!wantColor) return true;
+
+  const gotColor = normColorKey(String(sku.color || ""));
+  if (gotColor) {
+    return (
+      wantColor === gotColor ||
+      wantColor.includes(gotColor) ||
+      gotColor.includes(wantColor)
+    );
+  }
+  const name = normColorKey(String(sku.name || ""));
+  return Boolean(name && name.includes(wantColor));
+}
+
+async function readStockResumePayload(): Promise<StockResumePayload | null> {
+  const tryFile = async (file: string): Promise<StockResumePayload | null> => {
+    try {
+      const st = await fs.stat(file);
+      const raw = await fs.readFile(file, "utf8");
+      let skus: StockResumeSku[] = [];
+      let atMs = st.mtimeMs;
+      try {
+        const parsed = JSON.parse(raw) as {
+          at?: string;
+          atMs?: number;
+          skus?: StockResumeSku[];
+        };
+        if (typeof parsed.atMs === "number") atMs = parsed.atMs;
+        else if (parsed.at) {
+          const t = Date.parse(parsed.at);
+          if (Number.isFinite(t)) atMs = t;
+        }
+        if (Array.isArray(parsed.skus)) skus = parsed.skus;
+      } catch {
+        skus = [];
+      }
+      return { atMs, skus };
+    } catch {
+      return null;
+    }
+  };
+  const session = await tryFile(STOCK_RESUME_SESSION_FLAG);
+  const all = await tryFile(STOCK_RESUME_ALL_FLAG);
+  if (session && all) return session.atMs >= all.atMs ? session : all;
+  return session || all;
+}
+
+/**
+ * 等 monitor 有貨，且 color+storage 同本 task 一致。
+ * timeoutMs 有設：逾時回 null；否則一直等。
+ * afterMs：只要更新過呢個時間戳之後嘅通知。
+ */
+async function waitForMatchingStockResume(opts?: {
+  afterMs?: number;
+  timeoutMs?: number;
+}): Promise<StockResumePayload | null> {
+  const afterMs = opts?.afterMs ?? 0;
+  const deadline =
+    opts?.timeoutMs != null && opts.timeoutMs >= 0
+      ? Date.now() + opts.timeoutMs
+      : null;
+
+  while (true) {
+    await throwIfReleased();
+    if (deadline != null && Date.now() >= deadline) return null;
+
+    const payload = await readStockResumePayload();
+    if (payload && payload.atMs > afterMs) {
+      const matched =
+        payload.skus.length === 0
+          ? false
+          : payload.skus.some((s) => stockSkuMatchesCheckout(s));
+      // 舊格式冇 skus：唔當匹配（避免誤觸）
+      if (matched) {
+        console.log(
+          `  收到有貨通知（匹配 ${CONFIG.color}／${CONFIG.storage}）at=${new Date(payload.atMs).toISOString()}`
+        );
+        return payload;
+      }
+    }
+    await sleepCheckingRelease(400);
+  }
+}
+
+async function gotoFulfillmentInit(page: Page): Promise<void> {
+  const current = page.url();
+  let target = "";
+  if (/\/shop\/checkout/i.test(current)) {
+    if (/[?&]_s=/i.test(current)) {
+      target = current.replace(/([?&]_s=)[^&]*/i, "$1Fulfillment-init");
+    } else {
+      target = `${current.split("#")[0]}${current.includes("?") ? "&" : "?"}_s=Fulfillment-init`;
+    }
+  } else {
+    const host = current.match(/^(https?:\/\/[^/]+)/i)?.[1] || "https://secure6.store.apple.com";
+    target = `${host}/hk-zh/shop/checkout?_s=Fulfillment-init`;
+  }
+  console.log(`  前往 Fulfillment-init：${target}`);
+  if (target === current || /_s=Fulfillment-init/i.test(current)) {
+    await withReleaseCheck(
+      page.reload({ waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {})
+    );
+  } else {
+    await withReleaseCheck(
+      page.goto(target, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(async () => {
+        await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+      })
+    );
+  }
+  await settleAfterNavigation(page);
+}
+
 /** 輸入「中環」後，等到「選擇取貨零售店」下面出現 6 個選項，再雙重確認 */
 async function waitForSixPickupStoreOptions(page: Page): Promise<Locator[]> {
   console.log("  等待「選擇取貨零售店：」下面出現 6 個門市掣…");
@@ -4536,10 +5206,7 @@ async function clickAnyNearbyStore(page: Page): Promise<boolean> {
   return true;
 }
 
-async function choosePickupStore(page: Page): Promise<boolean> {
-  console.log(`  搜尋取貨地點：${CONFIG.pickupSearch}`);
-  await sleepCheckingRelease(usesFastPickupContactFill() ? 150 : 800);
-
+async function fillPickupSearchAndWaitHeading(page: Page): Promise<boolean> {
   const search = await findPickupSearchInput(page);
   if (!search) {
     console.warn("  揾唔到取貨搜尋欄。");
@@ -4570,6 +5237,14 @@ async function choosePickupStore(page: Page): Promise<boolean> {
     .first()
     .waitFor({ state: "visible", timeout: 30000 })
     .catch(() => {});
+  return true;
+}
+
+async function choosePickupStore(page: Page): Promise<boolean> {
+  console.log(`  搜尋取貨地點：${CONFIG.pickupSearch}`);
+  await sleepCheckingRelease(usesFastPickupContactFill() ? 150 : 800);
+
+  if (!(await fillPickupSearchAndWaitHeading(page))) return false;
 
   // 最多試 6 間（唔重複）；某一間「繼續」失敗就換下一間
   for (let storeTry = 1; storeTry <= 6; storeTry++) {
@@ -4650,6 +5325,202 @@ async function choosePickupStore(page: Page): Promise<boolean> {
 
   console.warn("  6 個門市掣都試過仍未能繼續。");
   return false;
+}
+
+/** Monitor+buying：Fulfillment-init 待命 → 同色同容量有貨就 refresh 再落單；冇新通知就返待命 */
+async function ensureFulfillmentInitStandby(page: Page): Promise<void> {
+  console.log("  待命：回到 Fulfillment-init，預熱中環＋6 門市…");
+  await gotoFulfillmentInit(page);
+  usedPickupStoreKeys.clear();
+  const pickupClicked = await clickPickupOption(page);
+  if (!pickupClicked) {
+    console.warn("  待命：撳唔到「我會前來取貨」（可能已揀）");
+  } else {
+    console.log("  已揀：我會前來取貨");
+  }
+  await sleepCheckingRelease(usesFastPickupContactFill() ? 150 : 500);
+  if (!(await fillPickupSearchAndWaitHeading(page))) {
+    console.warn("  待命：搜尋門市失敗，仍會停低等有貨");
+    return;
+  }
+  const ready = await waitForSixPickupStoreOptions(page);
+  if (ready.length < 6) {
+    console.warn("  待命：未齊 6 個門市掣，仍然停低等有貨…");
+  } else {
+    console.log("  待命：已見 6 個門市掣，停低等同色同容量有貨…");
+  }
+}
+
+/**
+ * 由而家頁面跑取貨→聯絡→付款（一次嘗試）。
+ * @returns true = 已到付款／帳單頁
+ */
+async function attemptPickupCheckoutToPayment(
+  page: Page,
+  identity: Identity,
+  tag: string,
+  session?: BrowserSession
+): Promise<boolean> {
+  usedPickupStoreKeys.clear();
+  const pickupClicked = await clickPickupOption(page);
+  if (pickupClicked) console.log("  已揀：我會前來取貨");
+  const storeOk = await choosePickupStore(page);
+  if (!storeOk && !isPickupContactPage(page.url())) {
+    console.warn("  今次取貨揀店失敗");
+    return false;
+  }
+
+  if (usesFastPickupContactFill() && isPickupContactPage(page.url())) {
+    await fillPickupContactGuestAndContinue(page, tag, session);
+  }
+
+  if (await isOnPaymentStep(page) || isBillingPage(page.url()) || isReviewPage(page.url())) {
+    if (session && isBillingPage(page.url())) {
+      await revealAndEnlargeBrowser(session).catch(() => {});
+    }
+    await fillBillingAddressFields(page, {
+      useShippingAddress: shouldUseShippingAddressForBilling(session),
+      session,
+    }).catch(() => {});
+    if (session) {
+      await writeStatus({
+        phase: "waiting_for_payment",
+        windowHidden: true,
+        windowState: "minimized",
+        card: cardFieldsFromSession(session, { url: page.url() }),
+      });
+    }
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 完整加購一次：產品頁 → 入袋 → 結帳 → 取貨揀店 → 付款頁。
+ * @returns true = 已到付款／帳單頁
+ */
+async function attemptFullAddCartToPayment(
+  page: Page,
+  identity: Identity,
+  tag: string,
+  session?: BrowserSession
+): Promise<boolean> {
+  console.log(`${tag} 開始完整加購（${CONFIG.color}／${CONFIG.storage} ×${CONFIG.quantity}）…`);
+  if (session) {
+    await publishTaskSnapshot(session, "adding_cart", {
+      message: "有貨：重新加購",
+      url: CONFIG.buyUrl,
+    }).catch(() => {});
+  }
+
+  await withReleaseCheck(
+    page.goto(CONFIG.buyUrl, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {})
+  );
+  await dismissCookies(page).catch(() => {});
+  if (isShop404Url(page.url())) {
+    await recoverFromShop404IfNeeded(page, tag).catch(() => {});
+  }
+
+  if (!(isAttachStepUrl(CONFIG.buyUrl) || isAttachStepUrl(page.url()))) {
+    if (
+      !(
+        isIphone17Task() &&
+        (isConfiguredProductSlugUrl(CONFIG.buyUrl) || isConfiguredProductSlugUrl(page.url()))
+      )
+    ) {
+      await selectProductOptions(page).catch(() => {});
+    }
+  }
+
+  await addToBagAndOpenBag(page);
+  await setBagQuantity(page, CONFIG.quantity).catch(() => {});
+  await goToCheckout(page);
+  await settleAfterNavigation(page);
+
+  if (usesAppleAccount()) {
+    await signInWithAppleAccount(page).catch(() => {});
+  } else {
+    await continueAsGuest(page).catch(() => {});
+  }
+  await settleAfterNavigation(page);
+
+  return attemptPickupCheckoutToPayment(page, identity, tag, session);
+}
+
+async function runMonitorHoldBuyLoop(
+  page: Page,
+  identity: Identity,
+  tag: string,
+  session?: BrowserSession
+): Promise<void> {
+  /** 連續幾耐冇「新」嘅同色同容量通知，就當呢波完 */
+  const STOCK_IDLE_MS = 8_000;
+  let lastConsumedAt = 0;
+
+  console.log(
+    `${tag} Monitor+buying hold：等 ${CONFIG.color}／${CONFIG.storage} 有貨 → refresh Fulfillment-init → 完整加購`
+  );
+
+  while (true) {
+    await ensureFulfillmentInitStandby(page);
+    await writeStatus({
+      phase: "waiting_for_stock_at_stores",
+      message: `待命 Fulfillment-init：等 ${CONFIG.color}／${CONFIG.storage} 有貨再加購`,
+      stuck: false,
+      stuckSince: null,
+    });
+    await fs.unlink(STOCK_RESUME_SESSION_FLAG).catch(() => {});
+
+    // 只要「而家之後」寫入嘅新通知（避免舊 flag 即刻誤觸）
+    const gateAt = Math.max(lastConsumedAt, Date.now());
+    let pending = await waitForMatchingStockResume({
+      afterMs: gateAt,
+    });
+
+    // 有貨波：不斷 refresh Fulfillment-init＋完整加購，直到冇新匹配通知
+    while (pending) {
+      lastConsumedAt = pending.atMs;
+
+      console.log(
+        `  同色同容量有貨 — ${CONFIG.color}／${CONFIG.storage}：等 1 秒 → refresh Fulfillment-init → 完整加購…`
+      );
+      await writeStatus({
+        phase: "resuming_after_stock",
+        message: `有貨（${CONFIG.color}／${CONFIG.storage}）：refresh 後完整加購`,
+      });
+      await sleepCheckingRelease(1000);
+      await gotoFulfillmentInit(page);
+
+      try {
+        const reachedPay = await attemptFullAddCartToPayment(
+          page,
+          identity,
+          tag,
+          session
+        );
+        if (reachedPay) {
+          console.log(`${tag} 已到付款頁 — 結束 monitor hold loop`);
+          return;
+        }
+      } catch (err) {
+        if (err instanceof ReleaseError) throw err;
+        console.warn(
+          `${tag} 今次加購嘗試失敗：`,
+          err instanceof Error ? err.message : String(err)
+        );
+      }
+
+      pending = await waitForMatchingStockResume({
+        afterMs: lastConsumedAt,
+        timeoutMs: STOCK_IDLE_MS,
+      });
+      if (!pending) {
+        console.log(
+          `  已 ${STOCK_IDLE_MS / 1000}s 冇新嘅 ${CONFIG.color}／${CONFIG.storage} 通知 → 返 Fulfillment-init 待命`
+        );
+      }
+    }
+  }
 }
 
 async function clickPickupOption(page: Page): Promise<boolean> {
@@ -6732,9 +7603,7 @@ async function persistOrderSummaryPartial(
   patch: Record<string, unknown>
 ): Promise<void> {
   const boxes = session.deliveryShippingBoxes;
-  const cardNo =
-    session.capturedCardNumber ||
-    (usesApplePay() ? "Apple Pay" : null);
+  const cardNo = session.capturedCardNumber || "Apple Pay";
   const record = {
     browser: session.tag,
     deliveryMethod: fulfillmentLabel(),
@@ -7274,119 +8143,191 @@ async function scrollPageToBottomRight(page: Page): Promise<void> {
     .catch(() => {});
 }
 
-/** Billing：normal 100% → maximized／fullscreen；成功先至標 once */
-async function revealAndEnlargeBrowser(
+/** Zoom 100%，並令 Playwright viewport 貼齊最大化後嘅視窗，避免右邊／底欄捲軸內縮 */
+async function applyFullWindowViewportAndZoom(
   session: BrowserSession,
-  opts?: { force?: boolean }
+  // Playwright CDPSession 泛型好嚴
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  cdp: any,
+  windowId: number
 ): Promise<void> {
-  // Stop all 期間絕對唔好開窗／fullscreen
-  if (SILENT_STOP_ALL || (await flagExists(DASHBOARD_STOP_ALL_FLAG))) {
-    SILENT_STOP_ALL = true;
-    return;
-  }
-  if (session.billingWindowRevealed && !opts?.force) return;
+  await cdp.send("Emulation.setPageScaleFactor", { pageScaleFactor: 1 }).catch(() => {});
+  await session.page
+    .evaluate(() => {
+      try {
+        const html = document.documentElement as HTMLElement | null;
+        const body = document.body as HTMLElement | null;
+        if (html) html.style.zoom = "1";
+        if (body) body.style.zoom = "1";
+      } catch {
+        /* ignore */
+      }
+    })
+    .catch(() => {});
 
-  const windowId = await ensureSessionWindowId(session);
-  if (windowId == null) {
-    console.warn(`${session.tag} 無 windowId，無法開全螢幕`);
-    return;
-  }
+  const screen = await session.page
+    .evaluate(() => ({
+      aw: Math.max(window.screen.availWidth || 0, window.screen.width || 0, 1280),
+      ah: Math.max(window.screen.availHeight || 0, window.screen.height || 0, 720),
+    }))
+    .catch(() => ({ aw: 1920, ah: 1080 }));
 
+  let outerW = screen.aw;
+  let outerH = screen.ah;
   try {
-    const screen = await session.page
-      .evaluate(() => ({
-        w: Math.max(window.screen.width || 0, window.screen.availWidth || 0, 1280),
-        h: Math.max(window.screen.height || 0, window.screen.availHeight || 0, 720),
-        aw: window.screen.availWidth || 1920,
-        ah: window.screen.availHeight || 1080,
-      }))
-      .catch(() => ({ w: 1920, h: 1080, aw: 1920, ah: 1080 }));
-
-    // 用可用桌面面積鋪滿（100%）
-    const bounds = {
-      left: 0,
-      top: 0,
-      width: Math.max(1024, screen.aw || screen.w),
-      height: Math.max(700, screen.ah || screen.h),
+    const got = (await cdp.send("Browser.getWindowBounds", { windowId })) as {
+      bounds?: { width?: number; height?: number };
     };
-    session.windowBounds = bounds;
+    if (got?.bounds?.width) outerW = Math.max(outerW, Number(got.bounds.width) || 0);
+    if (got?.bounds?.height) outerH = Math.max(outerH, Number(got.bounds.height) || 0);
+  } catch {
+    /* ignore */
+  }
 
-    const cdp = await session.page.context().newCDPSession(session.page);
+  const viewportW = Math.max(1024, outerW);
+  const viewportH = Math.max(700, outerH);
+  await session.page.setViewportSize({ width: viewportW, height: viewportH }).catch(() => {});
 
-    // Windows：由 minimized 還原要分步 + 短停
-    await cdp.send("Browser.setWindowBounds", {
+  await cdp
+    .send("Browser.setWindowBounds", {
       windowId,
-      bounds: { windowState: "normal" },
-    });
-    await new Promise((r) => setTimeout(r, 250));
+      bounds: { windowState: "maximized" },
+    })
+    .catch(() => {});
+  await new Promise((r) => setTimeout(r, 200));
 
-    await cdp.send("Browser.setWindowBounds", {
-      windowId,
-      bounds: { ...bounds, windowState: "normal" },
-    });
-    await new Promise((r) => setTimeout(r, 200));
-
-    // maximized 最穩（Windows Chromium 對 fullscreen 經常無效）
+  const inner = await session.page
+    .evaluate(() => ({
+      w: Math.max(
+        window.innerWidth || 0,
+        document.documentElement?.clientWidth || 0,
+        1024
+      ),
+      h: Math.max(
+        window.innerHeight || 0,
+        document.documentElement?.clientHeight || 0,
+        700
+      ),
+    }))
+    .catch(() => ({ w: viewportW, h: viewportH }));
+  if (Math.abs(inner.w - viewportW) > 24 || Math.abs(inner.h - viewportH) > 24) {
+    await session.page
+      .setViewportSize({
+        width: Math.max(1024, inner.w),
+        height: Math.max(700, inner.h),
+      })
+      .catch(() => {});
     await cdp
       .send("Browser.setWindowBounds", {
         windowId,
         bounds: { windowState: "maximized" },
       })
       .catch(() => {});
+  }
+}
+
+/**
+ * 最後一步完成：好似平時 Chrome 撳最大化，zoom 100%，捲軸貼最右／最底。
+ */
+async function maximizeBrowserLikeNormalChrome(
+  session: BrowserSession
+): Promise<void> {
+  if (SILENT_STOP_ALL || (await flagExists(DASHBOARD_STOP_ALL_FLAG))) {
+    SILENT_STOP_ALL = true;
+    return;
+  }
+  const windowId = await ensureSessionWindowId(session);
+  if (windowId == null) {
+    console.warn(`${session.tag} 無 windowId，無法最大化`);
+    return;
+  }
+
+  const cdp = await session.page.context().newCDPSession(session.page);
+  try {
+    await cdp.send("Browser.setWindowBounds", {
+      windowId,
+      bounds: { windowState: "normal" },
+    });
     await new Promise((r) => setTimeout(r, 200));
 
-    // 再試 CDP fullscreen
-    let finalState: "fullscreen" | "maximized" | "normal" = "maximized";
-    try {
-      await cdp.send("Browser.setWindowBounds", {
-        windowId,
-        bounds: { windowState: "fullscreen" },
-      });
-      finalState = "fullscreen";
-    } catch {
-      finalState = "maximized";
-    }
+    const screen = await session.page
+      .evaluate(() => ({
+        aw: Math.max(window.screen.availWidth || 0, 1280),
+        ah: Math.max(window.screen.availHeight || 0, 720),
+      }))
+      .catch(() => ({ aw: 1920, ah: 1080 }));
+
+    session.windowBounds = {
+      left: 0,
+      top: 0,
+      width: screen.aw,
+      height: screen.ah,
+    };
+
+    await cdp.send("Browser.setWindowBounds", {
+      windowId,
+      bounds: {
+        left: 0,
+        top: 0,
+        width: screen.aw,
+        height: screen.ah,
+        windowState: "normal",
+      },
+    });
+    await new Promise((r) => setTimeout(r, 150));
+
+    await cdp.send("Browser.setWindowBounds", {
+      windowId,
+      bounds: { windowState: "maximized" },
+    });
+    await new Promise((r) => setTimeout(r, 250));
+
+    await applyFullWindowViewportAndZoom(session, cdp, windowId);
 
     await session.page.bringToFront().catch(() => {});
-
-    // 鍵盤 F11 強化全螢幕（只試一次；失敗唔緊要）
-    if (finalState !== "fullscreen") {
-      await session.page.keyboard.press("F11").catch(() => {});
-      await new Promise((r) => setTimeout(r, 300));
-      const st = await cdp
-        .send("Browser.getWindowBounds", { windowId })
-        .catch(() => null);
-      if (st?.bounds?.windowState === "fullscreen") finalState = "fullscreen";
-      else if (st?.bounds?.windowState === "maximized") finalState = "maximized";
+    if (process.platform === "win32") {
+      const proc = (
+        session.browser as unknown as { process?: () => { pid?: number } | null }
+      ).process?.();
+      const pid = proc?.pid;
+      if (pid) {
+        const ps = `Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class W{[DllImport("user32.dll")]public static extern bool SetForegroundWindow(IntPtr h);[DllImport("user32.dll")]public static extern bool ShowWindowAsync(IntPtr h,int n);}' -ErrorAction SilentlyContinue; $p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if($p -and $p.MainWindowHandle -ne 0){[void][W]::ShowWindowAsync($p.MainWindowHandle,3);[void][W]::SetForegroundWindow($p.MainWindowHandle)}`;
+        spawn("powershell", ["-NoProfile", "-Command", ps], {
+          stdio: "ignore",
+          windowsHide: true,
+        });
+      }
     }
 
-    await session.page
-      .setViewportSize({
-        width: Math.max(360, bounds.width - 16),
-        height: Math.max(400, bounds.height - 88),
-      })
-      .catch(() => {});
-    await cdp.detach().catch(() => {});
-
-    // 放大後：頁面捲軸推去最右同最底
     await new Promise((r) => setTimeout(r, 200));
     await scrollPageToBottomRight(session.page);
-    await new Promise((r) => setTimeout(r, 150));
+    await new Promise((r) => setTimeout(r, 120));
     await scrollPageToBottomRight(session.page);
 
     session.billingWindowRevealed = true;
     await writeStatus({
-      windowState: finalState,
+      windowState: "maximized",
       windowHidden: false,
     });
-    console.log(`${session.tag} Billing 視窗已設為 ${finalState}（只此一次），頁面已捲去最右最底`);
-  } catch (err) {
-    console.warn(
-      `${session.tag} 無法開大視窗：${err instanceof Error ? err.message : String(err)}`
+    console.log(
+      `${session.tag} 步驟完成 → 已最大化（zoom 100%），捲軸貼最右／最底`
     );
-    // 失敗唔標 revealed，之後重試得
-    await setBrowserWindowState(session, "normal");
+  } finally {
+    await cdp.detach().catch(() => {});
   }
+}
+
+/** 開大／置頂瀏覽器。自動化預設唔 call；opts.force 或步驟完成先開。 */
+async function revealAndEnlargeBrowser(
+  session: BrowserSession,
+  opts?: { force?: boolean }
+): Promise<void> {
+  if (!opts?.force) return;
+  if (SILENT_STOP_ALL || (await flagExists(DASHBOARD_STOP_ALL_FLAG))) {
+    SILENT_STOP_ALL = true;
+    return;
+  }
+  await maximizeBrowserLikeNormalChrome(session);
 }
 
 function shouldUseShippingAddressForBilling(session?: BrowserSession): boolean {
@@ -7402,21 +8343,153 @@ async function markWaitingForPayment(
 ): Promise<void> {
   if (!session) return;
   if (!isCheckoutFlowPage(page.url()) && !(await isOnPaymentStep(page))) return;
-  // 只更新 status；開大視窗淨係 Billing 頁先做
-  const onBilling = isBillingPage(page.url());
-  if (onBilling) {
-    await revealAndEnlargeBrowser(session);
-  }
+  // 中途只更新 status；視窗全程保持隱藏，完成後先 sealStepsComplete 黃閃
   await writeStatus({
     phase: "waiting_for_payment",
-    windowHidden: onBilling ? false : true,
-    windowState: onBilling ? "fullscreen" : "minimized",
+    windowHidden: true,
+    windowState: "minimized",
     card: cardFieldsFromSession(session, { url: page.url() }),
   });
   if (tag) {
-    console.log(
-      `${tag} 已入 checkout，status → waiting for payment${onBilling ? "（Billing：已 fullscreen 一次）" : "（未到 Billing，保持隱藏）"}`
-    );
+    console.log(`${tag} 已入 checkout，status → waiting for payment（視窗保持隱藏）`);
+  }
+}
+
+/** 自動化步驟全部做完：保持隱藏、唔自動開窗；dashboard 顯示 waiting for payment */
+async function sealStepsComplete(session: BrowserSession): Promise<void> {
+  await setBrowserWindowState(session, "minimized").catch(() => {});
+  await writeStatus({
+    phase: "waiting_for_payment",
+    windowHidden: true,
+    windowState: "minimized",
+    message: "waiting for payment",
+    card: cardFieldsFromSession(session, {
+      url: session.page.url(),
+      quantity: CONFIG.quantity,
+      estimatedDelivery: session.estimatedDelivery,
+    }),
+  });
+  console.log(
+    `${session.tag} 步驟已完成 → waiting for payment；瀏覽器保持隱藏，唔會自動開啟`
+  );
+}
+
+/** Dashboard：保持瀏覽器開住並隱藏，淨係 Close 先關 */
+async function holdSessionsHiddenUntilClose(
+  sessions: BrowserSession[]
+): Promise<void> {
+  if (!sessions.length) return;
+  console.log(
+    "Dashboard：瀏覽器保持開啟並隱藏（waiting for payment 唔自動開）。撳 Close 先關閉。"
+  );
+  for (const s of sessions) {
+    await setBrowserWindowState(s, "minimized").catch(() => {});
+  }
+
+  let phase = "waiting_for_payment";
+  try {
+    const st = JSON.parse(await fs.readFile(STATUS_FILE, "utf8")) as {
+      phase?: string;
+    };
+    if (/payment_succeeded|orders_ready/i.test(String(st.phase || ""))) {
+      phase = "payment_succeeded";
+    } else {
+      phase = "waiting_for_payment";
+      await writeStatus({
+        phase: "waiting_for_payment",
+        windowHidden: true,
+        windowState: "minimized",
+        message: "waiting for payment",
+      });
+    }
+  } catch {
+    await writeStatus({
+      phase: "waiting_for_payment",
+      windowHidden: true,
+      windowState: "minimized",
+      message: "waiting for payment",
+    });
+  }
+
+  while (true) {
+    if (await flagExists(DASHBOARD_CLOSE_FLAG)) {
+      await fs.unlink(DASHBOARD_CLOSE_FLAG).catch(() => {});
+      console.log("收到 Close，結束保持開啟…");
+      return;
+    }
+    for (const s of ACTIVE_SESSIONS.length ? ACTIVE_SESSIONS : sessions) {
+      await syncDashboardWindowFlags(s).catch(() => {});
+      await captureCardNumberIfPresent(s).catch(() => {});
+      if (!/payment_succeeded/i.test(phase)) {
+        const scraped = await scrapeConfirmation(s.page).catch(() => null);
+        if (scraped?.orderNumber) {
+          if (!s.orderPlacedAt) s.orderPlacedAt = formatHkOrderDateTime();
+          const cardNo = s.capturedCardNumber || scraped.cardNumber || null;
+          const poolMeta = lookupCardMeta(cardNo);
+          phase = "payment_succeeded";
+          await writeStatus({
+            phase: "payment_succeeded",
+            message: `付款成功：${scraped.orderNumber}`,
+            windowHidden: true,
+            card: cardFieldsFromSession(s, {
+              orderNumber: scraped.orderNumber,
+              total: scraped.total,
+              quantity: scraped.quantity,
+              cardNumber: cardNo,
+              cardType:
+                poolMeta?.type || detectCardType(cardNo) || s.cardType || "",
+              cardCompany:
+                poolMeta?.company ||
+                resolveCardCompany() ||
+                s.cardCompany ||
+                "",
+              cardLimit:
+                poolMeta?.limit || resolveCardLimit() || s.cardLimit || "",
+              orderPlacedAt: s.orderPlacedAt,
+              paymentSucceeded: true,
+            }),
+          });
+          // 付款成功後都保持隱藏；用戶要睇先 Open browser
+          await setBrowserWindowState(s, "minimized").catch(() => {});
+        }
+      }
+    }
+    // waiting for payment：若仍標 hidden 但視窗被彈出，再藏返（Open browser 會標 windowHidden=false）
+    if (/waiting_for_payment/i.test(phase)) {
+      try {
+        const st = JSON.parse(await fs.readFile(STATUS_FILE, "utf8")) as {
+          windowHidden?: boolean;
+        };
+        if (st.windowHidden !== false) {
+          for (const s of sessions) {
+            const state = await readBrowserWindowState(s).catch(() => null);
+            if (state && state !== "minimized") {
+              await setBrowserWindowState(s, "minimized").catch(() => {});
+            }
+          }
+          await writeStatus({
+            phase: "waiting_for_payment",
+            windowHidden: true,
+            windowState: "minimized",
+          }).catch(() => {});
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    try {
+      await sleepCheckingRelease(800);
+    } catch (err) {
+      if (err instanceof ReleaseError) {
+        if (/關閉/.test(err.message) || (await flagExists(DASHBOARD_CLOSE_FLAG))) {
+          throw err;
+        }
+        // Stop take-over：waiting for payment 仍然唔關瀏覽器
+        await new Promise((r) => setTimeout(r, 800));
+        continue;
+      }
+      throw err;
+    }
   }
 }
 
@@ -7438,8 +8511,8 @@ async function fillShippingAndGoToPayment(
     if (session) {
       await writeStatus({
         phase: "waiting_for_payment",
-        windowHidden: false,
-        windowState: "fullscreen",
+        windowHidden: true,
+        windowState: "minimized",
         card: cardFieldsFromSession(session, { url: page.url() }),
       });
     }
@@ -7460,16 +8533,16 @@ async function fillShippingAndGoToPayment(
       const onReview = isReviewPage(page.url());
       await writeStatus({
         phase: "waiting_for_payment",
-        windowHidden: !(onBilling || onReview),
-        windowState: onBilling || onReview ? "fullscreen" : "minimized",
+        windowHidden: true,
+        windowState: "minimized",
         card: cardFieldsFromSession(session, { url: page.url() }),
       });
     }
     return;
   }
 
-  // 若被踢返產品頁／購物袋，重新加購
-  if (isProductConfigPage(page.url()) || isBagPage(page.url())) {
+  // 若被踢返 404／產品頁／購物袋，重新加購或由 404 入袋
+  if (isShop404Url(page.url()) || isProductConfigPage(page.url()) || isBagPage(page.url())) {
     await recoverAddToBagIfNeeded(page, tag);
     await settleAfterNavigation(page);
     await goToCheckout(page).catch(() => {});
@@ -7483,6 +8556,12 @@ async function fillShippingAndGoToPayment(
     if (usesAppleAccount()) await signInWithAppleAccount(page);
     else await continueAsGuest(page);
     await settleDom(page, 150);
+  }
+
+  // Monitor+buying：喺 Fulfillment-init 待命，只響應同色同容量有貨
+  if (CONFIG.holdAtPickupStoresForStock) {
+    await runMonitorHoldBuyLoop(page, identity, tag, session);
+    return;
   }
 
   // 已喺 PickupContact：快速填固定聯絡資料 → 前往付款／Apple Pay 繼續
@@ -7499,8 +8578,8 @@ async function fillShippingAndGoToPayment(
       }
       await writeStatus({
         phase: "waiting_for_payment",
-        windowHidden: !onBilling,
-        windowState: onBilling ? "fullscreen" : "minimized",
+        windowHidden: true,
+        windowState: "minimized",
         card: cardFieldsFromSession(session, { url: page.url() }),
       });
     }
@@ -7524,8 +8603,8 @@ async function fillShippingAndGoToPayment(
         }
         await writeStatus({
           phase: "waiting_for_payment",
-          windowHidden: !onBilling,
-          windowState: onBilling ? "fullscreen" : "minimized",
+          windowHidden: true,
+          windowState: "minimized",
           card: cardFieldsFromSession(session, { url: page.url() }),
         });
       }
@@ -7541,8 +8620,8 @@ async function fillShippingAndGoToPayment(
     }
   }
 
-  // 履行中途又退回產品頁
-  if (isProductConfigPage(page.url())) {
+  // 履行中途又退回 404／產品頁
+  if (isShop404Url(page.url()) || isProductConfigPage(page.url())) {
     await recoverAddToBagIfNeeded(page, tag);
     await settleAfterNavigation(page);
     await goToCheckout(page);
@@ -7564,8 +8643,8 @@ async function fillShippingAndGoToPayment(
         }
         await writeStatus({
           phase: "waiting_for_payment",
-          windowHidden: !onBilling,
-          windowState: onBilling ? "fullscreen" : "minimized",
+          windowHidden: true,
+          windowState: "minimized",
           card: cardFieldsFromSession(session, { url: page.url() }),
         });
       }
@@ -7600,8 +8679,8 @@ async function fillShippingAndGoToPayment(
       const onBilling = isBillingPage(page.url());
       await writeStatus({
         phase: "waiting_for_payment",
-        windowHidden: !onBilling,
-        windowState: onBilling ? "fullscreen" : "minimized",
+        windowHidden: true,
+        windowState: "minimized",
         card: cardFieldsFromSession(session, { url: page.url() }),
       });
     }
@@ -7670,8 +8749,8 @@ async function fillShippingAndGoToPayment(
       }
       await writeStatus({
         phase: "waiting_for_payment",
-        windowHidden: !onBilling,
-        windowState: onBilling ? "fullscreen" : "minimized",
+        windowHidden: true,
+        windowState: "minimized",
         card: cardFieldsFromSession(session, { url: page.url() }),
       });
     }
@@ -7726,8 +8805,8 @@ async function fillShippingAndGoToPayment(
       }
       await writeStatus({
         phase: "waiting_for_payment",
-        windowHidden: !onBilling,
-        windowState: onBilling ? "fullscreen" : "minimized",
+        windowHidden: true,
+        windowState: "minimized",
         card: cardFieldsFromSession(session, { url: page.url() }),
       });
     }
@@ -7749,8 +8828,8 @@ async function fillShippingAndGoToPayment(
         }
         await writeStatus({
           phase: "waiting_for_payment",
-          windowHidden: !onBilling,
-          windowState: onBilling ? "fullscreen" : "minimized",
+          windowHidden: true,
+          windowState: "minimized",
           card: cardFieldsFromSession(session, { url: page.url() }),
         });
       }
@@ -7779,7 +8858,7 @@ async function fillShippingAndGoToPayment(
 
   let filled = false;
   for (let attempt = 1; attempt <= 3; attempt++) {
-    if (isProductConfigPage(page.url())) {
+    if (isShop404Url(page.url()) || isProductConfigPage(page.url())) {
       await recoverAddToBagIfNeeded(page, tag);
       await settleAfterNavigation(page);
       await goToCheckout(page);
@@ -7817,9 +8896,11 @@ async function fillShippingAndGoToPayment(
     await settleAfterNavigation(page);
   }
 
-  // 撳完又退回產品頁就再走一次
-  if (isProductConfigPage(page.url())) {
-    console.warn(`${tag} 前往付款後退回產品頁，重新加購再試…`);
+  // 撳完又退回 404／產品頁就再走一次
+  if (isShop404Url(page.url()) || isProductConfigPage(page.url())) {
+    console.warn(
+      `${tag} 前往付款後落到 ${isShop404Url(page.url()) ? "/shop/404" : "產品頁"}，復原再試…`
+    );
     await recoverAddToBagIfNeeded(page, tag);
     await settleAfterNavigation(page);
     await goToCheckout(page);
@@ -7855,13 +8936,11 @@ async function fillShippingAndGoToPayment(
     }
     await writeStatus({
       phase: "waiting_for_payment",
-      windowHidden: !onBilling,
-      windowState: onBilling ? "fullscreen" : "minimized",
+      windowHidden: true,
+      windowState: "minimized",
       card: cardFieldsFromSession(session, { url: page.url() }),
     });
-    console.log(
-      `${tag} checkout status 已更新${onBilling ? "，Billing 已開大瀏覽器" : "（未到 Billing，保持隱藏）"}`
-    );
+    console.log(`${tag} checkout status 已更新（視窗保持隱藏）`);
   }
 }
 
@@ -7904,13 +8983,25 @@ async function scrapeConfirmation(page: Page) {
     ),
   ];
 
-  const total =
+  const scrapedTotalRaw =
     firstMatch(text, [
       /(?:總計|合計|總額|應付總額|訂單總額|Grand Total|Order Total|Total)\s*[:：]?\s*(HK\$\s*[\d,]+(?:\.\d{2})?)/i,
       /(?:你已支付|已付款|Paid)\s*[:：]?\s*(HK\$\s*[\d,]+(?:\.\d{2})?)/i,
     ]) || amounts.at(-1) || null;
 
+  const productResolved = productName ?? CONFIG.model;
+  const storageResolved = storage ?? CONFIG.storage;
+  const qtyResolved = CONFIG.quantity;
+  const resolvedAmt = resolveOrderAmountSpent({
+    scrapedAmount: scrapedTotalRaw,
+    model: productResolved,
+    storage: storageResolved,
+    quantity: qtyResolved,
+  });
+  const total = resolvedAmt.label || scrapedTotalRaw;
+
   const estimatedDelivery = firstMatch(text, [
+    /運送於\s*([0-9]{1,2}\/[0-9]{1,2}\/[0-9]{4}\s*[–—-]\s*[0-9]{1,2}\/[0-9]{1,2}\/[0-9]{4})/i,
     /(?:預計送貨|預計送達|送貨日期|Deliver(?:y|s)|Arrives)\s*[:：]?\s*([^\n]{1,80})/i,
     /(星期[一二三四五六日][^\n]{0,40})/,
   ]);
@@ -7965,11 +9056,11 @@ async function scrapeConfirmation(page: Page) {
     url,
     title,
     orderNumber,
-    productName: productName ?? CONFIG.model,
+    productName: productResolved,
     color: color ?? CONFIG.color,
-    storage: storage ?? CONFIG.storage,
-    quantity: CONFIG.quantity,
-    /** 消費金額（確認頁總計） */
+    storage: storageResolved,
+    quantity: qtyResolved,
+    /** 消費金額（確認頁總計；不合理時用官價×數量） */
     total,
     amountSpent: total,
     amounts,
@@ -8024,16 +9115,30 @@ async function buildOrderRecord(
   const cardNumber =
     session.capturedCardNumber ||
     scraped.cardNumber ||
-    (usesApplePay() ? "Apple Pay" : null);
+    "Apple Pay";
   const poolMeta = lookupCardMeta(cardNumber);
-  const cardType =
-    poolMeta?.type || detectCardType(cardNumber) || session.cardType || "";
   const cardCompany =
-    poolMeta?.company || resolveCardCompany() || session.cardCompany || "";
+    poolMeta?.company ||
+    resolveCardCompany() ||
+    session.cardCompany ||
+    (/apple\s*pay/i.test(String(cardNumber || "")) ? "Apple Pay" : "");
   const cardLimit =
     poolMeta?.limit || resolveCardLimit() || session.cardLimit || "";
+  const cardTypeResolved =
+    poolMeta?.type ||
+    detectCardType(cardNumber) ||
+    session.cardType ||
+    (/apple\s*pay/i.test(String(cardNumber || "")) ? "Apple Pay" : "");
   const orderPlacedAt = session.orderPlacedAt || formatHkOrderDateTime();
   session.orderPlacedAt = orderPlacedAt;
+
+  const resolvedAmt = resolveOrderAmountSpent({
+    scrapedAmount: scraped.amountSpent ?? scraped.total,
+    model: scraped.productName ?? CONFIG.model,
+    storage: scraped.storage ?? CONFIG.storage,
+    quantity: scraped.quantity ?? CONFIG.quantity,
+  });
+  const amountLabel = resolvedAmt.label || scraped.amountSpent || scraped.total || null;
 
   // 成功落單：用資料庫額度 − 今次消費 = 剩餘限額（寫入 Google Sheet）
   let remainingCreditCardLimit = "";
@@ -8041,7 +9146,7 @@ async function buildOrderRecord(
     const applied = await applySuccessfulCheckoutToCardLimit(
       ROOT,
       cardNumber,
-      scraped.amountSpent ?? scraped.total
+      amountLabel
     ).catch(() => null);
     if (applied) {
       remainingCreditCardLimit = formatHkLimit(applied.remainingLimit);
@@ -8061,10 +9166,10 @@ async function buildOrderRecord(
     color: scraped.color,
     storage: scraped.storage,
     quantity: scraped.quantity,
-    total: scraped.total,
-    amountSpent: scraped.amountSpent ?? scraped.total,
+    total: amountLabel,
+    amountSpent: amountLabel,
     cardNumber,
-    cardType,
+    cardType: cardTypeResolved,
     cardCompany,
     cardLimit: cardLimit || poolMeta?.limit || "",
     /** 成功結帳後剩餘信用額 */
@@ -8174,6 +9279,7 @@ async function setBrowserWindowState(
           bounds: { windowState: "maximized" },
         })
         .catch(() => {});
+      await applyFullWindowViewportAndZoom(session, cdp, windowId).catch(() => {});
       await session.page.bringToFront().catch(() => {});
       await session.page.evaluate(() => {
         try {
@@ -8182,20 +9288,21 @@ async function setBrowserWindowState(
           /* ignore */
         }
       }).catch(() => {});
-      // Windows：用 PowerShell 將 Chromium 視窗置頂
+      // Windows：用 PowerShell 將 Chromium 視窗置頂／最大化
       if (process.platform === "win32") {
         const proc = (
           session.browser as unknown as { process?: () => { pid?: number } | null }
         ).process?.();
         const pid = proc?.pid;
         if (pid) {
-          const ps = `Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class W{[DllImport("user32.dll")]public static extern bool SetForegroundWindow(IntPtr h);[DllImport("user32.dll")]public static extern bool ShowWindowAsync(IntPtr h,int n);}' -ErrorAction SilentlyContinue; $p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if($p -and $p.MainWindowHandle -ne 0){[void][W]::ShowWindowAsync($p.MainWindowHandle,9);[void][W]::SetForegroundWindow($p.MainWindowHandle)}`;
+          const ps = `Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class W{[DllImport("user32.dll")]public static extern bool SetForegroundWindow(IntPtr h);[DllImport("user32.dll")]public static extern bool ShowWindowAsync(IntPtr h,int n);}' -ErrorAction SilentlyContinue; $p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if($p -and $p.MainWindowHandle -ne 0){[void][W]::ShowWindowAsync($p.MainWindowHandle,3);[void][W]::SetForegroundWindow($p.MainWindowHandle)}`;
           spawn("powershell", ["-NoProfile", "-Command", ps], {
             stdio: "ignore",
             windowsHide: true,
           });
         }
       }
+      await scrollPageToBottomRight(session.page).catch(() => {});
     } else {
       await cdp.send("Browser.setWindowBounds", {
         windowId,
@@ -8262,6 +9369,53 @@ async function syncDashboardWindowFlags(session: BrowserSession): Promise<void> 
   }
 }
 
+/** Dashboard：超過 30 秒無步驟進展 → 標 stuck（紅閃） */
+const STUCK_AFTER_MS = 30_000;
+
+function startStuckWatcher(): () => void {
+  if (process.env.CHECKOUT_DASHBOARD !== "1") return () => {};
+  let stopped = false;
+  const tick = async () => {
+    if (stopped) return;
+    try {
+      const raw = await fs.readFile(STATUS_FILE, "utf8");
+      const st = JSON.parse(raw) as Record<string, unknown>;
+      const phase = String(st.phase || "");
+      if (
+        /waiting_for_payment|waiting_for_stock_at_stores|steps_complete|payment_succeeded|orders_ready|manual_control|closed|idle/i.test(
+          phase
+        )
+      ) {
+        if (st.stuck) {
+          await writeStatus({ stuck: false, stuckSince: null });
+        }
+        return;
+      }
+      const last = Date.parse(String(st.lastProgressAt || st.updatedAt || ""));
+      if (!Number.isFinite(last)) return;
+      if (Date.now() - last < STUCK_AFTER_MS) return;
+      if (st.stuck) return;
+      await writeStatus({
+        stuck: true,
+        stuckSince: new Date(last).toISOString(),
+        message:
+          String(st.error || st.message || "").trim() ||
+          `超過 ${STUCK_AFTER_MS / 1000}s 無進展／未能進入下一步`,
+      });
+    } catch {
+      /* ignore */
+    }
+  };
+  const timer = setInterval(() => {
+    void tick();
+  }, 5000);
+  void tick();
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+}
+
 function startWindowWatcher(sessions: BrowserSession[]): () => void {
   let stopped = false;
   const tick = async () => {
@@ -8300,17 +9454,12 @@ async function holdForManualControl(
     });
   } else {
     console.log("\n已停止自動化。瀏覽器保留畀你人手操作（Dashboard 顯示 manual_control）。");
+    console.log("個別 Stop：唔會自動開大／置頂視窗；要睇請撳 Open browser。");
     console.log("撳 Continue 會由而家頁面繼續跑到最後一步；撳 Close 關閉瀏覽器。");
-    for (const s of sessions) {
-      await setBrowserWindowState(s, "normal").catch(async () => {
-        await revealAndEnlargeBrowser(s, { force: true }).catch(() => {});
-      });
-    }
+    // 刻意唔 call setBrowserWindowState / revealAndEnlargeBrowser
     await writeStatus({
       phase: "manual_control",
-      message: "自動化已停；Continue=繼續步驟，Close=關閉",
-      windowHidden: false,
-      windowState: "maximized",
+      message: "自動化已停（視窗保持原狀；Open browser 先開大）",
     });
   }
 
@@ -8355,6 +9504,7 @@ async function resumeCheckoutToFinal(session: BrowserSession): Promise<void> {
 
   if (await isConfirmationPage(page)) {
     console.log(`${tag} 已喺確認頁`);
+    await sealStepsComplete(session);
     return;
   }
 
@@ -8369,37 +9519,23 @@ async function resumeCheckoutToFinal(session: BrowserSession): Promise<void> {
     isReviewPage(page.url()) ||
     (await isOnPaymentStep(page))
   ) {
-    if (session && (isBillingPage(page.url()) || isReviewPage(page.url()))) {
-      await revealAndEnlargeBrowser(session).catch(() => {});
-    }
     // Review：走 fillBillingAddressFields 內嘅 Review 短路徑（iPhone 17／18 共用）
     await fillBillingAddressFields(page, {
       useShippingAddress: shouldUseShippingAddressForBilling(session),
       session,
     }).catch(() => {});
-    await writeStatus({
-      phase: "waiting_for_payment",
-      windowHidden: false,
-      card: cardFieldsFromSession(session, { url: page.url() }),
-    });
+    await sealStepsComplete(session);
     return;
   }
 
   await fillShippingAndGoToPayment(page, session.identity, tag, session);
-  const onBilling = isBillingPage(page.url()) || isReviewPage(page.url());
-  if (onBilling && isBillingPage(page.url())) {
-    await revealAndEnlargeBrowser(session);
+  if (isBillingPage(page.url())) {
     await fillBillingAddressFields(page, {
       useShippingAddress: shouldUseShippingAddressForBilling(session),
       session,
     }).catch(() => {});
   }
-  await writeStatus({
-    phase: "waiting_for_payment",
-    windowHidden: !onBilling && !usesApplePay(),
-    windowState: onBilling || usesApplePay() ? "fullscreen" : "minimized",
-    card: cardFieldsFromSession(session, { url: page.url() }),
-  });
+  await sealStepsComplete(session);
 }
 
 function computeWindowLayout(
@@ -8537,8 +9673,16 @@ async function runCheckoutToPayment(session: BrowserSession): Promise<void> {
   console.log(
     `${tag} 資料：${identity.lastName}${identity.firstName} / ${identity.area} ${identity.district} / ${identity.street} / ${identity.phone} / ${identity.email}`
   );
+  await publishTaskSnapshot(session, "starting", {
+    message: "開啟購買頁",
+    url: CONFIG.buyUrl,
+  });
   await page.goto(CONFIG.buyUrl, { waitUntil: "domcontentloaded" });
   await dismissCookies(page);
+  if (isShop404Url(page.url())) {
+    console.warn(`${tag} 開買頁即到 /shop/404 → 先試購物袋復原`);
+    await recoverFromShop404IfNeeded(page, tag);
+  }
 
   if (isAttachStepUrl(CONFIG.buyUrl) || isAttachStepUrl(page.url())) {
     console.log(`${tag} attach URL — 跳過揀規格，稍後直接「查看購物袋」`);
@@ -8570,13 +9714,25 @@ async function runCheckoutToPayment(session: BrowserSession): Promise<void> {
       retries: 0,
     }
   );
+  await publishTaskSnapshot(session, "cart_added", {
+    message: "已加入購物袋",
+    url: page.url(),
+  });
   await runStep(
     `${tag} 數量改做 ${CONFIG.quantity}`,
     () => setBagQuantity(page, CONFIG.quantity),
     base
   );
+  await publishTaskSnapshot(session, "cart_ready", {
+    message: `購物袋數量 ×${CONFIG.quantity}`,
+    url: page.url(),
+  });
   await runStep(`${tag} 前往結帳`, () => goToCheckout(page), base);
   await markWaitingForPayment(session, page, tag);
+  await publishTaskSnapshot(session, "checkout", {
+    message: "已前往結帳",
+    url: page.url(),
+  });
   if (usesAppleAccount()) {
     await runStep(`${tag} 以 Apple 帳戶登入`, () => signInWithAppleAccount(page), {
       ...base,
@@ -8586,11 +9742,41 @@ async function runCheckoutToPayment(session: BrowserSession): Promise<void> {
     await runStep(`${tag} 以訪客身份繼續`, () => continueAsGuest(page), base);
   }
   await markWaitingForPayment(session, page, tag);
+  await publishTaskSnapshot(session, "guest_or_signin", {
+    message: usesAppleAccount() ? "已登入 Apple 帳戶" : "已以訪客繼續",
+    url: page.url(),
+  });
   await runStep(
     `${tag} 填寫聯絡資料並前往付款`,
     () => fillShippingAndGoToPayment(page, identity, tag, session),
     { ...base, retries: 2 }
   );
+  await publishTaskSnapshot(session, "contact_filled", {
+    message: "已填聯絡資料／前往付款",
+    url: page.url(),
+  });
+}
+
+/** Dashboard：即時把而家 session 資料推去 Opened browsers */
+async function publishTaskSnapshot(
+  session: BrowserSession,
+  phase: string,
+  extra?: Record<string, unknown>
+): Promise<void> {
+  const url =
+    (extra?.url as string | undefined) ||
+    session.page.url() ||
+    "";
+  await writeStatus({
+    phase,
+    message: String(extra?.message || phase),
+    windowHidden: true,
+    card: cardFieldsFromSession(session, {
+      url,
+      ...extra,
+    }),
+    identity: session.identity,
+  });
 }
 
 function cardFieldsFromSession(session: BrowserSession, extra?: Record<string, unknown>) {
@@ -8621,6 +9807,12 @@ function cardFieldsFromSession(session: BrowserSession, extra?: Record<string, u
     (extra?.estimatedDelivery as string | null | undefined) ??
     session.estimatedDelivery ??
     null;
+  const estimated = resolveOrderAmountSpent({
+    scrapedAmount: extra?.total,
+    model: CONFIG.model,
+    storage: CONFIG.storage,
+    quantity: (extra?.quantity as number | undefined) ?? CONFIG.quantity,
+  });
   return {
     productType: CONFIG.model,
     color: CONFIG.color,
@@ -8630,12 +9822,16 @@ function cardFieldsFromSession(session: BrowserSession, extra?: Record<string, u
     fulfillmentPreference: CONFIG.fulfillmentPreference,
     deliveryMethod: fulfillmentLabel(),
     orderNumber: null as string | null,
-    total: null as string | null,
+    total:
+      (extra?.total as string | null | undefined) ||
+      estimated.label ||
+      null,
     email: contact.email,
     phone: contact.phone,
     address: contact.address,
     name: contact.name,
     estimatedDelivery: eta,
+    proxy: CONFIG.proxy || "",
     lastName: boxes?.lastName || (mode === "pickup" ? pickup.lastName : id.lastName),
     firstName: boxes?.firstName || (mode === "pickup" ? pickup.firstName : id.firstName),
     areaDistrictStreet: isDeliveryUi
@@ -8660,8 +9856,11 @@ function cardFieldsFromSession(session: BrowserSession, extra?: Record<string, u
           cardNumber:
             usesApplePay()
               ? "Apple Pay"
-              : ((extra?.cardNumber as string | null | undefined) ??
-                "（付款頁人手填）"),
+              : ((extra?.cardNumber as string | null | undefined) &&
+                  String(extra.cardNumber).trim() &&
+                  !/人手填/.test(String(extra.cardNumber))
+                    ? String(extra.cardNumber).trim()
+                    : "Apple Pay"),
           cardType:
             (extra?.cardType as string | null | undefined) ||
             detectCardType(
@@ -8678,8 +9877,11 @@ function cardFieldsFromSession(session: BrowserSession, extra?: Record<string, u
         }
       : null,
     cardNumber:
-      (extra?.cardNumber as string | null | undefined) ??
-      (usesApplePay() ? "Apple Pay" : isDeliveryUi ? "（付款頁人手填）" : null),
+      (extra?.cardNumber as string | null | undefined) &&
+      String(extra.cardNumber).trim() &&
+      !/人手填/.test(String(extra.cardNumber))
+        ? String(extra.cardNumber).trim()
+        : "Apple Pay",
     cardType:
       (extra?.cardType as string | null | undefined) ||
       detectCardType(
@@ -8690,6 +9892,14 @@ function cardFieldsFromSession(session: BrowserSession, extra?: Record<string, u
     cardCompany:
       (extra?.cardCompany as string | null | undefined) || resolveCardCompany() || "",
     cardLimit: (extra?.cardLimit as string | null | undefined) || resolveCardLimit() || "",
+    remainingCreditCardLimit:
+      (extra?.remainingCreditCardLimit as string | null | undefined) ||
+      (extra?.remainingLimit as string | null | undefined) ||
+      "",
+    remainingLimit:
+      (extra?.remainingLimit as string | null | undefined) ||
+      (extra?.remainingCreditCardLimit as string | null | undefined) ||
+      "",
     orderPlacedAt:
       (extra?.orderPlacedAt as string | null | undefined) || session.orderPlacedAt || null,
     buyUrl: CONFIG.buyUrl,
@@ -8726,6 +9936,7 @@ async function main(): Promise<void> {
 
   let sessions: BrowserSession[] = [];
   let stopWatcher: (() => void) | null = null;
+  let stopStuckWatcher: (() => void) | null = null;
   try {
     sessions = await Promise.all(
       identities.map((identity, index) =>
@@ -8734,6 +9945,7 @@ async function main(): Promise<void> {
     );
     ACTIVE_SESSIONS = sessions;
     stopWatcher = startWindowWatcher(sessions);
+    stopStuckWatcher = startStuckWatcher();
 
     const primary = sessions[0]!;
     await writeStatus({
@@ -8765,19 +9977,32 @@ async function main(): Promise<void> {
         }
         summaries.push(await buildOrderRecord(session, scraped));
         if (scraped.orderNumber) {
+          const rec = summaries[summaries.length - 1] as {
+            orderNumber?: string | null;
+            total?: string | null;
+            amountSpent?: string | null;
+            quantity?: number;
+            cardNumber?: string | null;
+            cardType?: string;
+            cardCompany?: string;
+            cardLimit?: string;
+            remainingCreditCardLimit?: string;
+            remainingLimit?: string;
+            orderPlacedAt?: string | null;
+          };
           await writeStatus({
             phase: "payment_succeeded",
             card: cardFieldsFromSession(session, {
-              orderNumber: scraped.orderNumber,
-              total: scraped.total,
-              quantity: scraped.quantity,
-              cardNumber: session.capturedCardNumber || scraped.cardNumber,
-              cardType:
-                detectCardType(session.capturedCardNumber || scraped.cardNumber) ||
-                session.cardType ||
-                "",
-              cardCompany: resolveCardCompany() || session.cardCompany || "",
-              orderPlacedAt: session.orderPlacedAt,
+              orderNumber: rec.orderNumber,
+              total: rec.amountSpent || rec.total || scraped.total,
+              quantity: rec.quantity ?? scraped.quantity,
+              cardNumber: rec.cardNumber ?? session.capturedCardNumber ?? scraped.cardNumber,
+              cardType: rec.cardType || "",
+              cardCompany: rec.cardCompany || "",
+              cardLimit: rec.cardLimit || "",
+              remainingCreditCardLimit: rec.remainingCreditCardLimit || "",
+              remainingLimit: rec.remainingLimit || rec.remainingCreditCardLimit || "",
+              orderPlacedAt: rec.orderPlacedAt || session.orderPlacedAt,
               paymentSucceeded: true,
             }),
           });
@@ -8845,41 +10070,23 @@ async function main(): Promise<void> {
             const onBilling = isBillingPage(session.page.url());
             const onReview = isReviewPage(session.page.url());
             if (onReview && selectsApplePayAtBilling()) {
-              await revealAndEnlargeBrowser(session).catch(() => {});
               await completeDeliveryApplePayReview(session.page, session).catch((err) => {
                 console.warn(
                   `${session.tag} Review CTA：${err instanceof Error ? err.message : String(err)}`
                 );
               });
             } else if (onBilling) {
-              await revealAndEnlargeBrowser(session);
               await fillBillingAddressFields(session.page, {
                 useShippingAddress: shouldUseShippingAddressForBilling(session),
                 session,
               }).catch(() => {});
             }
-            const stillReview = isReviewPage(session.page.url());
-            const stillBilling = isBillingPage(session.page.url());
-            await writeStatus({
-              phase: "waiting_for_payment",
-              windowHidden: !(stillBilling || stillReview || usesApplePay()),
-              windowState:
-                stillBilling || stillReview || usesApplePay() ? "fullscreen" : "minimized",
-              card: cardFieldsFromSession(session, {
-                url: session.page.url(),
-                quantity: CONFIG.quantity,
-                estimatedDelivery: session.estimatedDelivery,
-              }),
-            });
+            await sealStepsComplete(session);
             const payHint = usesApplePay()
               ? "請喺裝置完成 Apple Pay 確認"
               : "請手動輸入信用卡卡號並確認";
             console.log(
-              stillBilling || stillReview || selectsApplePayAtBilling()
-                ? `\n${session.tag} 已到付款步驟，已開大瀏覽器；${payHint}`
-                : isPickupApplePay()
-                  ? `\n${session.tag} pickup Apple Pay 已撳繼續；${payHint}`
-                  : `\n${session.tag} 已入 checkout（未到 Billing），視窗保持隱藏`
+              `\n${session.tag} 自動化步驟完成（視窗保持隱藏）；${payHint}`
             );
             console.log(`${session.tag} URL：${session.page.url()}`);
             console.log(`${session.tag} 電郵：${session.identity.email}`);
@@ -8952,8 +10159,27 @@ async function main(): Promise<void> {
     }
   } finally {
     stopWatcher?.();
+    stopStuckWatcher?.();
+    if (process.env.CHECKOUT_DASHBOARD === "1" && sessions.length) {
+      const wantClose = await flagExists(DASHBOARD_CLOSE_FLAG);
+      if (!wantClose) {
+        try {
+          // waiting for payment／未關：保持瀏覽器開住並隱藏，唔自動 close
+          await holdSessionsHiddenUntilClose(sessions);
+        } catch (err) {
+          if (
+            !(err instanceof ReleaseError) ||
+            !/關閉/.test(err.message)
+          ) {
+            console.warn(
+              `保持瀏覽器時出錯：${err instanceof Error ? err.message : String(err)}`
+            );
+          }
+        }
+      }
+    }
     await Promise.all(sessions.map((s) => s.browser.close().catch(() => {})));
-    await writeStatus({ phase: "idle", windowHidden: true });
+    await writeStatus({ phase: "closed", windowHidden: true });
   }
 }
 
@@ -8962,6 +10188,7 @@ main().catch(async (err) => {
   await writeStatus({
     phase: "error",
     error: err instanceof Error ? err.message : String(err),
+    message: err instanceof Error ? err.message : String(err),
   });
   process.exitCode = 1;
 });

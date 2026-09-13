@@ -8,7 +8,6 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { MONITOR_CONFIG, SKUS, type SkuConfig } from "./config.js";
-import { launchCheckoutFromMonitor } from "./checkout-launcher.js";
 import { escapeMd, formatHkNow, notifyAll, notifyTelegram, upsertTelegramStockMonitor } from "./notifier.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -495,8 +494,8 @@ async function handleResult(result: CheckResult): Promise<void> {
   rt.lastStatus = result.status;
 }
 
-/** 有貨期間每隔 spawnBrowserGapMs 再開一個 Dashboard 瀏覽器，直至空倉超過 spawnIdleStopMs */
-async function maybeSpawnCheckoutBrowsers(
+/** 有貨時通知已停喺門市列表嘅預熱 task 繼續（唔再開新瀏覽器） */
+async function maybeResumeHeldCheckoutBrowsers(
   results: CheckResult[],
   state: {
     lastAvailableAt: number;
@@ -514,62 +513,54 @@ async function maybeSpawnCheckoutBrowsers(
     state.lastAvailableAt = now;
     state.spawningActive = true;
 
-    const gap = MONITOR_CONFIG.spawnBrowserGapMs;
-    const due = state.lastSpawnAt === 0 || now - state.lastSpawnAt >= gap;
-    if (!due) return state;
-
-    if (wasIdle) {
-      await notifyTelegram({
-        title: "有貨 — 開始連開瀏覽器",
-        message: [
-          `每 ${gap / 1000} 秒再開一個 Dashboard 瀏覽器`,
-          `直至連續 ${MONITOR_CONFIG.spawnIdleStopMs / 1000} 秒冇貨先停`,
-          ...available.map(
-            (r) =>
-              `${r.sku.name}｜庫存=${r.stockQty ?? "?"}｜落單×${r.buyQty}`
-          ),
-        ].join("\n"),
-        url: available[0]?.sku.url,
-      });
-    }
-
-    for (const r of available) {
-      const rt = getRuntime(r.sku.name);
-      try {
-        const buyUrl = r.sku.checkoutUrl?.trim() || r.sku.url;
-        console.log(
-          `  → 再開新瀏覽器：${r.sku.name}｜數量=${r.buyQty}｜${buyUrl}`
-        );
-        const launched = await launchCheckoutFromMonitor({
-          sku: r.sku,
-          quantity: r.buyQty,
-        });
-        rt.checkoutTriggered = true;
-        console.log(
-          `  → session=${launched.sessionId} pid=${launched.pid} via=${launched.via}`
-        );
-        await notifyTelegram({
-          title: "已開新瀏覽器落單",
-          message: [
-            r.sku.name,
-            `庫存／可買：${r.stockQty ?? "?"}`,
-            `落單數量：×${r.buyQty}`,
-            `session：${launched.sessionId}`,
-            `via：${launched.via}`,
-          ].join("\n"),
-          url: r.sku.url,
-        });
-      } catch (err) {
-        console.error(
-          `  → 開瀏覽器失敗：`,
-          err instanceof Error ? err.message : String(err)
-        );
-        await notifyTelegram({
-          title: "開瀏覽器失敗",
-          message: `${r.sku.name}\n${err instanceof Error ? err.message : String(err)}`,
-          url: r.sku.url,
-        });
+    try {
+      await fs.mkdir(RUNTIME_DIR, { recursive: true });
+      const flagPath = path.join(RUNTIME_DIR, "stock-resume-all.flag");
+      const payload = {
+        at: new Date().toISOString(),
+        atMs: now,
+        skus: available.map((r) => ({
+          name: r.sku.name,
+          model: r.sku.model,
+          color: r.sku.color || "",
+          storage: r.sku.storage,
+          stockQty: r.stockQty ?? null,
+          buyQty: r.buyQty,
+        })),
+      };
+      // 每一輪有貨都更新 flag（預熱頁靠 atMs 辨認「新」通知）
+      await fs.writeFile(flagPath, JSON.stringify(payload), "utf8");
+      for (const r of available) {
+        getRuntime(r.sku.name).checkoutTriggered = true;
       }
+      if (wasIdle) {
+        console.log(
+          "  → 已寫 stock-resume-all.flag：通知預熱頁（同色同容量）refresh Fulfillment-init 落單"
+        );
+        await notifyTelegram({
+          title: "有貨 — 通知預熱瀏覽器加購",
+          message: [
+            "已通知 Fulfillment-init 待命 task：1 秒後 refresh，再跑完整加購",
+            "（只會跟進同色＋同容量）",
+            ...available.map(
+              (r) =>
+                `${r.sku.name}｜${r.sku.color || "—"}／${r.sku.storage}｜庫存=${r.stockQty ?? "?"}｜×${r.buyQty}`
+            ),
+          ].join("\n"),
+          url: available[0]?.sku.url,
+        });
+      } else {
+        console.log(
+          `  → 更新 stock-resume（仍有貨）：${available
+            .map((r) => `${r.sku.color || "?"}/${r.sku.storage}`)
+            .join(", ")}`
+        );
+      }
+    } catch (err) {
+      console.error(
+        "  → 寫 stock-resume flag 失敗：",
+        err instanceof Error ? err.message : String(err)
+      );
     }
     state.lastSpawnAt = Date.now();
     return state;
@@ -586,12 +577,8 @@ async function maybeSpawnCheckoutBrowsers(
       getRuntime(r.sku.name).checkoutTriggered = false;
     }
     console.log(
-      `  → 已 ${MONITOR_CONFIG.spawnIdleStopMs / 1000} 秒冇再見到有貨：停止再開新瀏覽器`
+      `  → 已 ${MONITOR_CONFIG.spawnIdleStopMs / 1000} 秒冇再見到有貨：預熱頁會返 Fulfillment-init 待命`
     );
-    await notifyTelegram({
-      title: "停止再開新瀏覽器",
-      message: `已連續 ${MONITOR_CONFIG.spawnIdleStopMs / 1000} 秒冇偵測到有貨，暫停自動開瀏覽器。監察會繼續。`,
-    });
   }
 
   return state;
@@ -740,14 +727,14 @@ async function main(): Promise<void> {
         if (!usingFastInterval) {
           usingFastInterval = true;
           console.log(
-            `  → 發現有貨：輪詢改為每 ${MONITOR_CONFIG.fastCheckIntervalMs / 1000} 秒；每輪再開一個瀏覽器`
+            `  → 發現有貨：輪詢改為每 ${MONITOR_CONFIG.fastCheckIntervalMs / 1000} 秒；通知預熱門市頁繼續`
           );
           await notifyTelegram({
             title: "發現有貨 — 加快監察",
             message: [
               `輪詢改為每 ${MONITOR_CONFIG.fastCheckIntervalMs / 1000} 秒`,
               MONITOR_CONFIG.autoCheckout.enabled
-                ? `會每 ${MONITOR_CONFIG.spawnBrowserGapMs / 1000} 秒再開一個瀏覽器`
+                ? "會通知停喺門市列表嘅預熱瀏覽器：refresh 後揀店繼續"
                 : "（未開自動購買）",
               ...results
                 .filter((r) => isPositiveAvailable(r.status))
@@ -774,7 +761,7 @@ async function main(): Promise<void> {
         });
       }
 
-      spawnState = await maybeSpawnCheckoutBrowsers(results, spawnState);
+      spawnState = await maybeResumeHeldCheckoutBrowsers(results, spawnState);
     } catch (err) {
       console.error(
         "本輪 cycle 失敗（會繼續下一輪）：",
