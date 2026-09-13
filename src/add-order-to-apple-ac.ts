@@ -43,6 +43,8 @@ const WINDOW_HEIGHT = 980;
 const STATUS_FILE = path.join(ROOT, "runtime", `status-${SESSION_ID}.json`);
 const SHOW_FLAG = path.join(ROOT, "runtime", `show-${SESSION_ID}.flag`);
 const HIDE_FLAG = path.join(ROOT, "runtime", `hide-${SESSION_ID}.flag`);
+/** 用戶撳過 Open browser：任何自動 minimize 都忽略，直至 Hide／Close */
+const KEEP_OPEN_FLAG = path.join(ROOT, "runtime", `keepopen-${SESSION_ID}.flag`);
 const RELEASE_FLAG = path.join(ROOT, "runtime", `release-${SESSION_ID}.flag`);
 const CONTINUE_FLAG = path.join(ROOT, "runtime", `continue-${SESSION_ID}.flag`);
 const CLOSE_FLAG = path.join(ROOT, "runtime", `close-${SESSION_ID}.flag`);
@@ -123,9 +125,17 @@ async function writeStatus(patch: Record<string, unknown>): Promise<void> {
   } catch {
     /* ignore */
   }
+  const keepOpen = userKeepBrowserOpen || (await flagExists(KEEP_OPEN_FLAG).catch(() => false));
   const next = {
     ...prev,
     ...patch,
+    ...(keepOpen
+      ? {
+          windowHidden: false,
+          keepOpen: true,
+          windowState: patch.windowState || prev.windowState || "maximized",
+        }
+      : {}),
     id: SESSION_ID,
     type: "add_order",
     updatedAt: new Date().toISOString(),
@@ -292,6 +302,8 @@ async function getPageWindowId(page: Page): Promise<number | null> {
 }
 
 async function applyCheckoutWindowBounds(page: Page, minimized: boolean): Promise<void> {
+  // 用戶要保持開啟時，唔好再套 minimized bounds
+  if (minimized && userKeepBrowserOpen) return;
   const windowId = await getPageWindowId(page);
   if (windowId == null) return;
   const cdp = await page.context().newCDPSession(page);
@@ -323,9 +335,47 @@ async function applyCheckoutWindowBounds(page: Page, minimized: boolean): Promis
   }
 }
 
+async function setKeepBrowserOpen(keep: boolean): Promise<void> {
+  userKeepBrowserOpen = keep;
+  windowHidden = !keep;
+  if (keep) {
+    await fs.mkdir(path.dirname(KEEP_OPEN_FLAG), { recursive: true }).catch(() => {});
+    await fs.writeFile(KEEP_OPEN_FLAG, new Date().toISOString(), "utf8").catch(() => {});
+  } else {
+    await fs.unlink(KEEP_OPEN_FLAG).catch(() => {});
+  }
+}
+
+async function loadKeepBrowserOpenFlag(): Promise<void> {
+  if (await flagExists(KEEP_OPEN_FLAG)) {
+    userKeepBrowserOpen = true;
+    windowHidden = false;
+  }
+}
+
+async function isBrowserWindowMinimized(page: Page): Promise<boolean> {
+  try {
+    const windowId = await getPageWindowId(page);
+    if (windowId == null) return false;
+    const cdp = await page.context().newCDPSession(page);
+    try {
+      const got = (await cdp.send("Browser.getWindowBounds", { windowId })) as {
+        bounds?: { windowState?: string };
+      };
+      return String(got?.bounds?.windowState || "") === "minimized";
+    } finally {
+      await cdp.detach().catch(() => {});
+    }
+  } catch {
+    return false;
+  }
+}
+
 async function maximizeBrowserWindow(page: Page, browser: Browser): Promise<void> {
+  // 一收到 Open browser 即刻鎖定，避免同時間 maybeMinimize 搶住收埋
+  await setKeepBrowserOpen(true);
   log(
-    `Open browser：用 Checkout 尺寸 ${windowBounds.width}x${windowBounds.height} @ (${windowBounds.left},${windowBounds.top})`
+    `Open browser：用 Checkout 尺寸 ${windowBounds.width}x${windowBounds.height} @ (${windowBounds.left},${windowBounds.top})（保持開啟）`
   );
   try {
     await page.bringToFront().catch(() => {});
@@ -335,18 +385,26 @@ async function maximizeBrowserWindow(page: Page, browser: Browser): Promise<void
   }
   winRestoreBrowserWindow(browser);
   await page.bringToFront().catch(() => {});
-  windowHidden = false;
-  userKeepBrowserOpen = true;
   await writeStatus({
     windowHidden: false,
     windowState: "maximized",
-    message: "browser opened",
+    message: "browser opened — kept open until Hide/Close",
+    keepOpen: true,
     windowBounds,
   });
 }
 
-/** 同 dashboard：視窗一開就 minimize 隱藏（用戶 Open browser 後唔會自動再收） */
-async function minimizeBrowserWindow(page: Page, browser: Browser): Promise<void> {
+/** 隱藏視窗（淨係 Hide 先會 force；Open browser 後自動呼叫會被拒絕） */
+async function minimizeBrowserWindow(
+  page: Page,
+  browser: Browser,
+  opts?: { force?: boolean }
+): Promise<void> {
+  if (userKeepBrowserOpen && !opts?.force) {
+    windowHidden = false;
+    log("略過 minimize：用戶已 Open browser，保持開啟");
+    return;
+  }
   try {
     const windowId = await getPageWindowId(page);
     if (windowId != null) {
@@ -362,12 +420,13 @@ async function minimizeBrowserWindow(page: Page, browser: Browser): Promise<void
   }
   winMinimizeBrowserWindow(browser);
   windowHidden = true;
-  await writeStatus({ windowHidden: true, windowState: "minimized" });
+  await writeStatus({ windowHidden: true, windowState: "minimized", keepOpen: false });
 }
 
 /** 自動化用：用戶已 Open browser 就保持開住 */
 async function maybeMinimizeBrowserWindow(page: Page, browser: Browser): Promise<void> {
-  if (userKeepBrowserOpen) {
+  if (userKeepBrowserOpen || (await flagExists(KEEP_OPEN_FLAG))) {
+    userKeepBrowserOpen = true;
     windowHidden = false;
     return;
   }
@@ -375,6 +434,7 @@ async function maybeMinimizeBrowserWindow(page: Page, browser: Browser): Promise
 }
 
 let flagPollTimer: ReturnType<typeof setInterval> | null = null;
+let lastKeepOpenReassertAt = 0;
 
 function startFlagPoller(): void {
   if (flagPollTimer) return;
@@ -394,6 +454,7 @@ async function syncWindowFlags(): Promise<void> {
   // Close：任何時候都即關
   if (await flagExists(CLOSE_FLAG)) {
     await fs.unlink(CLOSE_FLAG).catch(() => {});
+    await setKeepBrowserOpen(false);
     log("Close：收到關閉要求，結束 task");
     await writeStatus({ phase: "closed", message: "closed", windowHidden: true });
     try {
@@ -404,14 +465,35 @@ async function syncWindowFlags(): Promise<void> {
     process.exit(0);
   }
   if (!activePage || activePage.isClosed() || !activeBrowser) return;
+
+  // 一見到 show flag 即刻 lock keep-open（maximize 前）
+  if (await flagExists(SHOW_FLAG)) {
+    await setKeepBrowserOpen(true);
+  }
   if (await consumeFlag(SHOW_FLAG)) {
     await maximizeBrowserWindow(activePage, activeBrowser);
     log("Open browser：已顯示視窗（會保持開啟直至 Hide／Close）");
   }
   if (await consumeFlag(HIDE_FLAG)) {
-    userKeepBrowserOpen = false;
-    await minimizeBrowserWindow(activePage, activeBrowser);
+    await setKeepBrowserOpen(false);
+    await minimizeBrowserWindow(activePage, activeBrowser, { force: true });
     log("Hide：已隱藏視窗");
+    return;
+  }
+
+  // 用戶要求保持開啟：若被系統／其他步驟收埋，自動再打開
+  if (userKeepBrowserOpen || (await flagExists(KEEP_OPEN_FLAG))) {
+    userKeepBrowserOpen = true;
+    windowHidden = false;
+    const now = Date.now();
+    if (now - lastKeepOpenReassertAt > 1200) {
+      lastKeepOpenReassertAt = now;
+      const minimized = await isBrowserWindowMinimized(activePage).catch(() => false);
+      if (minimized) {
+        log("偵測到視窗被收埋 — 自動再 Open（keep-open）");
+        await maximizeBrowserWindow(activePage, activeBrowser).catch(() => {});
+      }
+    }
   }
 }
 
@@ -419,7 +501,8 @@ async function holdBrowserUntilClose(reason: string): Promise<"continue" | "clos
   await writeStatus({
     phase: "manual_control",
     message: reason,
-    windowHidden,
+    windowHidden: !userKeepBrowserOpen,
+    keepOpen: userKeepBrowserOpen,
   });
   log(`${reason} — 瀏覽器保持開啟（Stop 唔關窗）；Continue 繼續／Close 關閉`);
   while (true) {
@@ -2110,6 +2193,9 @@ async function main() {
   await fs.unlink(CONTINUE_FLAG).catch(() => {});
   await fs.unlink(SHOW_FLAG).catch(() => {});
   await fs.unlink(HIDE_FLAG).catch(() => {});
+  // 新 task 預設隱藏；舊 keepopen 清走（呢次 run 用戶再開先 lock）
+  await fs.unlink(KEEP_OPEN_FLAG).catch(() => {});
+  userKeepBrowserOpen = false;
 
   const cfg = await loadConfig();
   const account = cfg.accounts[ACCOUNT_INDEX];
@@ -2120,12 +2206,18 @@ async function main() {
     emailMasked: maskEmail(account.email),
     message: "starting",
     windowHidden: true,
+    keepOpen: false,
     pid: process.pid,
   });
 
   const browser = await launchBrowser();
   activeBrowser = browser;
   startFlagPoller();
+  // 若 dashboard 喺 spawn 後好快撳咗 Open，補讀 keepopen
+  await loadKeepBrowserOpenFlag();
+  if (userKeepBrowserOpen && activePage) {
+    await maximizeBrowserWindow(activePage, browser).catch(() => {});
+  }
 
   let closeBrowser = false;
   try {

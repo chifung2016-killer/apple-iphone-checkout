@@ -287,6 +287,8 @@ async function forceCloseAddOrderTask(id: string): Promise<void> {
     new Date().toISOString(),
     "utf8"
   );
+  await fs.unlink(path.join(RUNTIME_DIR, `keepopen-${nid}.flag`)).catch(() => {});
+  await fs.unlink(path.join(RUNTIME_DIR, `show-${nid}.flag`)).catch(() => {});
   const t = addOrderTasks.get(nid);
   if (t?.child) {
     killProc(t.child);
@@ -1872,6 +1874,13 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
         : new Date().toISOString();
     await fs.writeFile(path.join(RUNTIME_DIR, flagName), payload, "utf8");
     if (act === "show") {
+      // 即刻寫 keepopen，worker 就算慢啲都會拒絕 auto-minimize
+      await fs.writeFile(
+        path.join(RUNTIME_DIR, `keepopen-${id}.flag`),
+        new Date().toISOString(),
+        "utf8"
+      );
+      await fs.unlink(path.join(RUNTIME_DIR, `hide-${id}.flag`)).catch(() => {});
       try {
         const stPath = path.join(RUNTIME_DIR, `status-${id}.json`);
         const prev = JSON.parse(await fs.readFile(stPath, "utf8")) as Record<string, unknown>;
@@ -1882,7 +1891,8 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
               ...prev,
               windowHidden: false,
               windowState: "maximized",
-              message: "Open browser requested",
+              keepOpen: true,
+              message: "Open browser requested — kept open until Hide/Close",
               updatedAt: new Date().toISOString(),
             },
             null,
@@ -1894,7 +1904,11 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
         /* ignore */
       }
     }
+    if (act === "hide") {
+      await fs.unlink(path.join(RUNTIME_DIR, `keepopen-${id}.flag`)).catch(() => {});
+    }
     if (act === "close") {
+      await fs.unlink(path.join(RUNTIME_DIR, `keepopen-${id}.flag`)).catch(() => {});
       await forceCloseAddOrderTask(id);
     }
     void broadcastAddOrderStatus();
@@ -1964,6 +1978,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
         `continue-${id}.flag`,
         `show-${id}.flag`,
         `hide-${id}.flag`,
+        `keepopen-${id}.flag`,
       ]) {
         await fs.unlink(path.join(RUNTIME_DIR, f)).catch(() => {});
       }
