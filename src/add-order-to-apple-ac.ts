@@ -627,7 +627,72 @@ async function signInAppleIdOnOrderPage(
 }
 
 function isGmailInboxUrl(url: string): boolean {
-  return /mail\.google\.com/i.test(url) && !/accounts\.google\.com/i.test(url);
+  return (
+    /mail\.google\.com\/mail\//i.test(url) ||
+    (/mail\.google\.com/i.test(url) && !/accounts\.google\.com/i.test(url))
+  );
+}
+
+/** 確保已喺 Gmail 收件箱 UI（登入後有時停喺中轉頁） */
+async function ensureGmailInbox(page: Page): Promise<void> {
+  if (!isGmailInboxUrl(page.url())) {
+    log("導向 Gmail 收件箱…");
+    await page
+      .goto("https://mail.google.com/mail/u/0/#inbox", {
+        waitUntil: "domcontentloaded",
+        timeout: 90_000,
+      })
+      .catch(() => {});
+  }
+  // 處理「繼續」／帳戶選擇殘留
+  for (let i = 0; i < 8; i++) {
+    await throwIfStopped();
+    const url = page.url();
+    if (/accounts\.google\.com/i.test(url)) {
+      // 可能仲要撳繼續
+      await page
+        .getByRole("button", { name: /^(Next|下一步|繼續|Continue|我了解)$/i })
+        .first()
+        .click({ timeout: 1500 })
+        .catch(() => {});
+      await page
+        .goto("https://mail.google.com/mail/u/0/#inbox", {
+          waitUntil: "domcontentloaded",
+          timeout: 60_000,
+        })
+        .catch(() => {});
+    }
+    const search = page
+      .locator(
+        'input[aria-label*="Search" i], input[aria-label*="搜尋" i], input[name="q"], form[role="search"] input'
+      )
+      .first();
+    if ((await search.count().catch(() => 0)) > 0 && (await search.isVisible().catch(() => false))) {
+      log(`已入 Gmail 收件箱：${page.url()}`);
+      await writeStatus({ phase: "gmail_ready", message: "Gmail 已開啟", url: page.url() });
+      await sleep(800);
+      return;
+    }
+    // 左側 Inbox / 主要 都當入咗
+    const inboxUi = page.locator('div[role="main"], div.AO, div.nH').first();
+    if ((await inboxUi.count().catch(() => 0)) > 0) {
+      log(`已入 Gmail UI：${page.url()}`);
+      await sleep(800);
+      return;
+    }
+    await sleep(700);
+  }
+  // 最後再強制 refresh 一次
+  if (!isGmailInboxUrl(page.url())) {
+    await page
+      .goto("https://mail.google.com/mail/u/0/#inbox", {
+        waitUntil: "domcontentloaded",
+        timeout: 90_000,
+      })
+      .catch(() => {});
+  }
+  await sleep(1500);
+  log(`Gmail 現況：${page.url()}`);
 }
 
 /** 真正要額外驗證嘅 challenge（唔包括密碼頁 challenge/pwd、captcha 字元頁） */
@@ -639,29 +704,46 @@ function isExtraGoogleChallenge(url: string): boolean {
   ) || /\/signin\/challenge\/(?:totp|iap|selection)/i.test(url);
 }
 
-/** Google 畫面驗證碼：要輸入數字+英文字母 */
+/** Google 畫面驗證碼：要輸入數字+英文字母（唔好誤判密碼頁） */
 async function isCaptchaChallengePage(page: Page): Promise<boolean> {
   const url = page.url();
-  if (/captcha|recaptcha|challenge\/ipp|challenge\/bc/i.test(url)) return true;
+  // 密碼頁唔當 captcha
+  if (/\/challenge\/pwd\b/i.test(url)) return false;
+  const pwdVisible =
+    (await page
+      .locator('input[type="password"]:visible, input[name="Passwd"]:visible')
+      .count()
+      .catch(() => 0)) > 0;
+  if (pwdVisible) return false;
+
+  if (/[?&]captcha=|\/captcha|recaptcha|challenge\/ipp|challenge\/bc/i.test(url)) {
+    return true;
+  }
   const hit = await page
     .evaluate(() => {
-      const t = (document.body?.innerText || "").slice(0, 4000);
-      if (
-        /輸入你看到的字|輸入畫面中的字|Type the text|Enter the characters|characters you see|不是機器人|I'm not a robot|驗證碼/i.test(
-          t
-        )
-      ) {
-        return true;
-      }
-      // captcha 圖／輸入框
+      // 有密碼欄 = 唔係 captcha
       if (
         document.querySelector(
-          'img[src*="captcha" i], #captchaimg, input[name*="captcha" i], input[id*="captcha" i]'
+          'input[type="password"], input[name="Passwd"], #password'
+        )
+      ) {
+        const pwd = document.querySelector(
+          'input[type="password"], input[name="Passwd"]'
+        ) as HTMLElement | null;
+        if (pwd && pwd.offsetParent !== null) return false;
+      }
+      // 經典 captcha 圖／欄
+      if (
+        document.querySelector(
+          'img#captchaimg, img[src*="captcha" i], #captchaimg, input[name*="captcha" i], input[id*="captcha" i]'
         )
       ) {
         return true;
       }
-      return false;
+      const t = (document.body?.innerText || "").slice(0, 4000);
+      return /輸入你看到的字|輸入畫面中的字|Type the text|Enter the characters|characters you see|Enter the letters|輸入字元/i.test(
+        t
+      );
     })
     .catch(() => false);
   return Boolean(hit);
@@ -737,6 +819,7 @@ async function waitForManualCaptcha(
   page: Page,
   browser: Browser
 ): Promise<void> {
+  if (isGmailInboxUrl(page.url())) return;
   if (!(await isCaptchaChallengePage(page))) return;
   log("Google 要輸入數字+英文字母驗證碼");
   await maximizeBrowserWindow(page, browser);
@@ -761,8 +844,18 @@ async function waitForManualCaptcha(
   while (Date.now() < deadline) {
     await throwIfStopped();
     await syncWindowFlags().catch(() => {});
-    if (await consumeFlag(CONTINUE_FLAG)) {
+  if (await consumeFlag(CONTINUE_FLAG)) {
       log("Continue：繼續檢查是否已過驗證碼");
+    }
+    // 密碼欄已出 → 驗證碼完
+    if (
+      (await page
+        .locator('input[type="password"]:visible, input[name="Passwd"]:visible')
+        .count()
+        .catch(() => 0)) > 0
+    ) {
+      log("已見到密碼欄，離開驗證碼等待");
+      return;
     }
     if (isGmailInboxUrl(page.url())) {
       log("驗證碼後已入 Gmail");
@@ -804,7 +897,8 @@ async function clickGoogleNext(page: Page, which: "identifier" | "password"): Pr
 async function fillGoogleVisibleInput(
   page: Page,
   sels: string[],
-  value: string
+  value: string,
+  opts?: { isPassword?: boolean }
 ): Promise<boolean> {
   for (const sel of sels) {
     const loc = page.locator(sel).first();
@@ -812,21 +906,119 @@ async function fillGoogleVisibleInput(
     const visible = await loc.isVisible().catch(() => false);
     if (!visible) continue;
     await loc.click({ timeout: 2000 }).catch(() => {});
+    // Google 密碼欄有時要先 focus 先可入
+    await loc.focus().catch(() => {});
+    await page.keyboard.press("Control+A").catch(() => {});
+    await page.keyboard.press("Backspace").catch(() => {});
     await loc.fill("").catch(() => {});
-    // 模擬人手打字，減少被 Google 擋
-    const typed = await loc
-      .pressSequentially(value, { delay: 35, timeout: 20_000 })
+
+    let typed = await loc
+      .pressSequentially(value, { delay: 40, timeout: 30_000 })
       .then(() => true)
-      .catch(async () =>
-        loc
-          .fill(value, { timeout: 5000 })
-          .then(() => true)
-          .catch(() => false)
-      );
-    if (typed) {
-      const got = await loc.inputValue().catch(() => "");
-      if (got && got.length >= Math.min(3, value.length)) return true;
+      .catch(() => false);
+    if (!typed) {
+      typed = await loc
+        .fill(value, { timeout: 5000 })
+        .then(() => true)
+        .catch(() => false);
     }
+    if (!typed) {
+      typed = await page.keyboard.type(value, { delay: 35 }).then(() => true).catch(() => false);
+    }
+    if (!typed) {
+      typed = await loc
+        .evaluate((el, v) => {
+          const input = el as HTMLInputElement;
+          input.removeAttribute("readonly");
+          input.focus();
+          input.value = "";
+          input.value = v;
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          input.dispatchEvent(new Event("change", { bubbles: true }));
+          return true;
+        }, value)
+        .then(() => true)
+        .catch(() => false);
+    }
+    if (!typed) continue;
+
+    // 密碼欄多數讀唔到 inputValue（保安），打完就算成功
+    if (opts?.isPassword) return true;
+    const got = await loc.inputValue().catch(() => "");
+    if (got && got.length >= Math.min(3, value.length)) return true;
+    if (opts?.isPassword) return true;
+  }
+  return false;
+}
+
+/** 專門填 Gmail 密碼（Google 密碼欄好刁鑽） */
+async function fillGmailPassword(page: Page, password: string): Promise<boolean> {
+  const sels = [
+    'input[type="password"]',
+    'input[name="Passwd"]',
+    'input[name="password"]',
+    'input[autocomplete="current-password"]',
+    '#password input',
+    'div[id="password"] input',
+  ];
+  for (let round = 1; round <= 8; round++) {
+    // 等欄位出現
+    for (const sel of sels) {
+      const loc = page.locator(sel).first();
+      if ((await loc.count().catch(() => 0)) === 0) continue;
+      await loc.waitFor({ state: "visible", timeout: 3000 }).catch(() => {});
+      if (!(await loc.isVisible().catch(() => false))) continue;
+
+      await loc.click({ force: true, timeout: 2000 }).catch(() => {});
+      await loc.focus().catch(() => {});
+      await sleep(200);
+      await page.keyboard.press("Control+A").catch(() => {});
+      await page.keyboard.press("Backspace").catch(() => {});
+
+      // 優先人手式逐字
+      const okSeq = await loc
+        .pressSequentially(password, { delay: 45, timeout: 45_000 })
+        .then(() => true)
+        .catch(() => false);
+      if (okSeq) {
+        log(`Gmail 密碼已填（pressSequentially 第 ${round} 次）`);
+        return true;
+      }
+
+      const okType = await page.keyboard
+        .type(password, { delay: 45 })
+        .then(() => true)
+        .catch(() => false);
+      if (okType) {
+        log(`Gmail 密碼已填（keyboard.type 第 ${round} 次）`);
+        return true;
+      }
+
+      const okEval = await loc
+        .evaluate((el, v) => {
+          const input = el as HTMLInputElement;
+          const setter = Object.getOwnPropertyDescriptor(
+            HTMLInputElement.prototype,
+            "value"
+          )?.set;
+          input.removeAttribute("readonly");
+          input.focus();
+          if (setter) setter.call(input, v);
+          else input.value = v;
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          input.dispatchEvent(new Event("change", { bubbles: true }));
+          input.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true }));
+          input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true }));
+          return (input.value || "").length > 0;
+        }, password)
+        .catch(() => false);
+      if (okEval) {
+        log(`Gmail 密碼已填（DOM setter 第 ${round} 次）`);
+        return true;
+      }
+    }
+    log(`Gmail 密碼填寫重試 ${round}/8…`);
+    await sleep(500);
   }
   return false;
 }
@@ -842,6 +1034,7 @@ async function gmailLogin(page: Page, email: string, password: string): Promise<
   // 帳號選擇／已登入
   if (isGmailInboxUrl(page.url())) {
     log("已入 Gmail（既有 session）");
+    await ensureGmailInbox(page);
     return;
   }
 
@@ -865,11 +1058,21 @@ async function gmailLogin(page: Page, email: string, password: string): Promise<
   await clickGoogleNext(page, "identifier");
   log("已提交電郵，等密碼頁…");
 
-  // 等密碼頁（Google 而家係 /v3/signin/challenge/pwd —— 唔係 2FA）
+  // 等密碼頁；驗證碼後可能已直接入 Gmail，唔好再死等密碼欄
   const pwdDeadline = Date.now() + 45_000;
   let pwdReady = false;
   while (Date.now() < pwdDeadline) {
+    if (isGmailInboxUrl(page.url())) {
+      log("已入 Gmail（跳過密碼），繼續流程");
+      await ensureGmailInbox(page);
+      return;
+    }
     if (activeBrowser) await waitForManualCaptcha(page, activeBrowser);
+    if (isGmailInboxUrl(page.url())) {
+      log("驗證碼後已入 Gmail，繼續流程");
+      await ensureGmailInbox(page);
+      return;
+    }
     if (isExtraGoogleChallenge(page.url())) {
       if (activeBrowser) {
         await maximizeBrowserWindow(page, activeBrowser);
@@ -880,6 +1083,10 @@ async function gmailLogin(page: Page, email: string, password: string): Promise<
         });
         while (Date.now() < pwdDeadline) {
           await throwIfStopped();
+          if (isGmailInboxUrl(page.url())) {
+            await ensureGmailInbox(page);
+            return;
+          }
           if (await consumeFlag(CONTINUE_FLAG)) break;
           if (
             (await page.locator('input[type="password"]:visible').count().catch(() => 0)) > 0
@@ -906,22 +1113,73 @@ async function gmailLogin(page: Page, email: string, password: string): Promise<
     await sleep(350);
   }
   if (!pwdReady) {
+    if (isGmailInboxUrl(page.url()) || /mail\.google\.com/i.test(page.url())) {
+      log("未見密碼欄但已在 Gmail，繼續");
+      await ensureGmailInbox(page);
+      return;
+    }
+    log("未見密碼欄，嘗試直接打開 Gmail…");
+    await page
+      .goto("https://mail.google.com/mail/u/0/#inbox", {
+        waitUntil: "domcontentloaded",
+        timeout: 60_000,
+      })
+      .catch(() => {});
+    if (isGmailInboxUrl(page.url())) {
+      await ensureGmailInbox(page);
+      return;
+    }
     throw new Error(`等唔到密碼欄：${page.url()}`);
   }
 
   let passOk = false;
-  for (let round = 1; round <= 5; round++) {
-    passOk = await fillGoogleVisibleInput(page, [
-      'input[type="password"]',
-      'input[name="Passwd"]',
-      'input[name="password"]',
-      'input[autocomplete="current-password"]',
-    ], password);
+  for (let round = 1; round <= 3; round++) {
+    if (isGmailInboxUrl(page.url())) {
+      await ensureGmailInbox(page);
+      return;
+    }
+    passOk = await fillGmailPassword(page, password);
     if (passOk) break;
-    log(`密碼欄重試 ${round}/5…`);
-    await sleep(400);
+    log(`密碼欄重試包 ${round}/3…`);
+    await sleep(600);
+  }
+  if (!passOk) {
+    if (activeBrowser) {
+      await maximizeBrowserWindow(page, activeBrowser);
+      await writeStatus({
+        phase: "waiting_password",
+        message: "自動填密碼失敗 — 請人手輸入密碼後撳 Continue",
+        windowHidden: false,
+      });
+      log("自動填密碼失敗：請人手輸入密碼，然後撳 Continue");
+      const waitPwd = Date.now() + 15 * 60_000;
+      while (Date.now() < waitPwd) {
+        await throwIfStopped();
+        if (isGmailInboxUrl(page.url())) {
+          await ensureGmailInbox(page);
+          return;
+        }
+        if (await consumeFlag(CONTINUE_FLAG)) {
+          log("Continue：假設密碼已人手填好，繼續");
+          passOk = true;
+          break;
+        }
+        if (isGmailInboxUrl(page.url()) || !/\/challenge\/pwd\b/i.test(page.url())) {
+          if (!/accounts\.google\.com\/v3\/signin\/identifier/i.test(page.url())) {
+            passOk = true;
+            break;
+          }
+        }
+        await sleep(500);
+      }
+    }
   }
   if (!passOk) throw new Error("填唔入 Gmail 密碼");
+
+  if (isGmailInboxUrl(page.url())) {
+    await ensureGmailInbox(page);
+    return;
+  }
 
   await clickGoogleNext(page, "password");
   log("已提交密碼，等入 Gmail…");
@@ -931,11 +1189,15 @@ async function gmailLogin(page: Page, email: string, password: string): Promise<
     const url = page.url();
     if (isGmailInboxUrl(url)) {
       log("已入 Gmail");
-      await sleep(1500);
+      await ensureGmailInbox(page);
       return;
     }
     if (activeBrowser) await waitForManualCaptcha(page, activeBrowser);
-    if (isExtraGoogleChallenge(url)) {
+    if (isGmailInboxUrl(page.url())) {
+      await ensureGmailInbox(page);
+      return;
+    }
+    if (isExtraGoogleChallenge(page.url())) {
       if (activeBrowser) {
         await maximizeBrowserWindow(page, activeBrowser);
         await writeStatus({
@@ -946,20 +1208,27 @@ async function gmailLogin(page: Page, email: string, password: string): Promise<
         if (await consumeFlag(CONTINUE_FLAG)) continue;
       }
     }
-    // 仍喺密碼頁：可能 Next 未撳到，再試一次
     if (/\/challenge\/pwd\b/i.test(url)) {
-      const pwdEmpty = await page
-        .locator('input[type="password"]:visible, input[name="Passwd"]:visible')
-        .first()
-        .inputValue()
-        .catch(() => "");
-      if (!pwdEmpty) {
-        await fillGoogleVisibleInput(page, [
-          'input[type="password"]',
-          'input[name="Passwd"]',
-        ], password);
-      }
+      await fillGmailPassword(page, password).catch(() => false);
       await clickGoogleNext(page, "password");
+    }
+    if (await consumeFlag(CONTINUE_FLAG)) {
+      log("Continue：強制打開 Gmail");
+      await page
+        .goto("https://mail.google.com/mail/u/0/#inbox", {
+          waitUntil: "domcontentloaded",
+          timeout: 60_000,
+        })
+        .catch(() => {});
+    }
+    // 中轉頁：主動導去 inbox
+    if (/accounts\.google\.com/i.test(url) && !/challenge|identifier|pwd/i.test(url)) {
+      await page
+        .goto("https://mail.google.com/mail/u/0/#inbox", {
+          waitUntil: "domcontentloaded",
+          timeout: 60_000,
+        })
+        .catch(() => {});
     }
     const err = page.locator('[aria-live="assertive"], div[jsname="B34EJ"], span[jsname="B34EJ"]').first();
     if ((await err.count().catch(() => 0)) > 0) {
@@ -968,29 +1237,59 @@ async function gmailLogin(page: Page, email: string, password: string): Promise<
         throw new Error(`Gmail 登入被拒：${t}`);
       }
     }
-    if (await consumeFlag(CONTINUE_FLAG)) {
-      log("Continue：繼續等入 Gmail");
-    }
     await sleep(500);
+  }
+  await page
+    .goto("https://mail.google.com/mail/u/0/#inbox", {
+      waitUntil: "domcontentloaded",
+      timeout: 60_000,
+    })
+    .catch(() => {});
+  if (isGmailInboxUrl(page.url())) {
+    await ensureGmailInbox(page);
+    return;
   }
   throw new Error(`Gmail 登入逾時：${page.url()}`);
 }
 
 async function gmailSearchAndOpenOrderEmail(page: Page): Promise<void> {
+  await ensureGmailInbox(page);
   log('搜尋郵件：「apple store」或「出貨」…');
-  // 等 search box
-  const search = page.locator('input[aria-label*="Search" i], input[aria-label*="搜尋" i], input[name="q"]').first();
-  await search.waitFor({ state: "visible", timeout: 30_000 });
+  await writeStatus({ phase: "search_email", message: "搜尋訂單郵件…" });
+
+  const searchSelectors = [
+    'input[aria-label*="Search" i]',
+    'input[aria-label*="搜尋" i]',
+    'input[name="q"]',
+    'form[role="search"] input',
+    'input[placeholder*="Search" i]',
+    'input[placeholder*="搜尋" i]',
+  ];
+  let search = page.locator(searchSelectors.join(", ")).first();
+  const searchDeadline = Date.now() + 45_000;
+  while (Date.now() < searchDeadline) {
+    await throwIfStopped();
+    if ((await search.count().catch(() => 0)) > 0 && (await search.isVisible().catch(() => false))) {
+      break;
+    }
+    await page.keyboard.press("/").catch(() => {});
+    await sleep(800);
+    search = page.locator(searchSelectors.join(", ")).first();
+  }
+  await search.waitFor({ state: "visible", timeout: 15_000 });
   await search.click({ timeout: 3000 });
+  await search.fill("");
   await search.fill('("apple store" OR 出貨 OR "Apple Store")');
   await page.keyboard.press("Enter");
-  await sleep(2000);
+  await sleep(2500);
 
-  // 點第一封有關結果
-  const row = page.locator("tr.zA, div[role='main'] tr.zA, div.Cp tr.zA").first();
-  await row.waitFor({ state: "visible", timeout: 30_000 });
+  const row = page
+    .locator("tr.zA, div[role='main'] tr.zA, div.Cp tr.zA, div[role='list'] div[role='listitem']")
+    .first();
+  await row.waitFor({ state: "visible", timeout: 45_000 });
   await row.click({ timeout: 5000 });
   log("已開啟搜尋到嘅郵件");
+  await writeStatus({ phase: "email_opened", message: "已開啟訂單相關郵件" });
   await sleep(1500);
 }
 
@@ -1177,7 +1476,19 @@ async function processOneAccount(
         if (next === "close") throw new CloseRequestedError();
         continue;
       }
-      throw err;
+      // 其他錯誤：唔關瀏覽器，等 Continue 再試／Close 先關
+      log(`步驟錯誤：${err instanceof Error ? err.message : String(err)}`);
+      await writeStatus({
+        phase: "error",
+        message: err instanceof Error ? err.message : String(err),
+        windowHidden,
+      });
+      if (activeBrowser && activePage) {
+        await maximizeBrowserWindow(activePage, activeBrowser).catch(() => {});
+      }
+      const next = await holdBrowserUntilClose("出錯後保持瀏覽器開啟 — Continue 重試／Close 關閉");
+      if (next === "close") throw new CloseRequestedError();
+      continue;
     }
   }
   for (;;) {
@@ -1228,30 +1539,46 @@ async function main() {
   activeBrowser = browser;
   startFlagPoller();
 
+  let closeBrowser = false;
   try {
     await processOneAccount(browser, account, cfg.appleEmail, cfg.applePassword);
+    // 正常唔會走到呢度（會 hold 到 Close）
+    closeBrowser = true;
   } catch (err) {
     if (err instanceof CloseRequestedError) {
       log("Close：關閉瀏覽器");
       await writeStatus({ phase: "closed", message: "closed" });
+      closeBrowser = true;
     } else {
       log(`失敗：${err instanceof Error ? err.message : String(err)}`);
       await writeStatus({
         phase: "error",
         message: err instanceof Error ? err.message : String(err),
       });
-      try {
-        await holdBrowserUntilClose("出錯後保持瀏覽器開啟");
-      } catch {
-        /* close */
+      // 任何未預期錯誤都保持開住，淨係 Close 先關
+      for (;;) {
+        try {
+          const next = await holdBrowserUntilClose("出錯後保持瀏覽器開啟");
+          if (next === "close") {
+            closeBrowser = true;
+            break;
+          }
+        } catch (e2) {
+          if (e2 instanceof CloseRequestedError) {
+            closeBrowser = true;
+            break;
+          }
+        }
       }
     }
   } finally {
     stopFlagPoller();
-    await browser.close().catch(() => {});
+    if (closeBrowser) {
+      await browser.close().catch(() => {});
+      await writeStatus({ phase: "closed", message: "browser closed", windowHidden: true });
+    }
     activeBrowser = null;
     activePage = null;
-    await writeStatus({ phase: "closed", message: "browser closed", windowHidden: true });
   }
   log("task 結束");
 }
