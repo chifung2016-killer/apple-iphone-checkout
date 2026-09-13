@@ -587,10 +587,10 @@
       <div class="card-limits-head">
         <div>
           <h2><span class="live-dot" aria-hidden="true"></span>Live card limits</h2>
-          <p class="hint">同 Order summary 用同一份成功訂單資料（按訂單編號對齊）。Card／Company／Remaining／Amount 與摘要一致。</p>
+          <p class="hint">同 Order summary 用同一份成功訂單資料（按訂單編號對齊）。Email／Card／Company／Remaining／Amount 與摘要一致。</p>
         </div>
         <div class="card-limits-tools">
-              <input type="search" id="cardLimitSearch" placeholder="搜尋訂單／產品／卡號／公司" />
+              <input type="search" id="cardLimitSearch" placeholder="搜尋訂單／電郵／產品／卡號／公司" />
           <label class="chk"><input type="checkbox" id="cardLimitUsedOnly" />只顯示非 Apple Pay</label>
           <button type="button" class="btn-ghost btn-sm" id="btnCardLimitsRefresh" title="重新載入成功訂單／卡額">Refresh</button>
         </div>
@@ -601,6 +601,7 @@
           <thead>
             <tr>
               <th>Order</th>
+              <th>Email</th>
               <th>Placed</th>
               <th>Delivery method</th>
               <th>Product</th>
@@ -612,7 +613,7 @@
             </tr>
           </thead>
           <tbody id="cardLimitsBody">
-            <tr><td colspan="9" class="empty">載入訂單／卡額資料中…</td></tr>
+            <tr><td colspan="10" class="empty">載入訂單／卡額資料中…</td></tr>
           </tbody>
         </table>
       </div>
@@ -1133,12 +1134,25 @@
     }
 
     /** Order summary ↔ Live card limits 共用（同一訂單編號必須一致） */
+    function orderContactEmail(o) {
+      const contact = o?.checkoutContactUsed || {};
+      const ship = o?.confirmationPageShipping || {};
+      const sd = o?.shippingDetails || {};
+      const identity = o?.identity || {};
+      for (const v of [sd.email, contact.email, ship.email, identity.email, o?.email]) {
+        const e = String(v || "").trim();
+        if (e && e !== "—") return e;
+      }
+      return "";
+    }
+
     function orderDisplayFields(o) {
       const ship = o.confirmationPageShipping || {};
       const card = displayCardNumber(o.cardNumber || ship.cardNumber);
       const isApplePay = /apple\s*pay/i.test(card);
       return {
         orderNumber: String(o.orderNumber || "").trim(),
+        email: orderContactEmail(o) || "—",
         browser: o.browser || "—",
         orderPlacedAt: o.orderPlacedAt || "—",
         product: o.productType || o.productName || "—",
@@ -1364,7 +1378,7 @@
       const filtered = rows.filter((r) => {
         if (cardOnly && /apple\s*pay/i.test(String(r.cardNumber))) return false;
         if (!q) return true;
-        const hay = `${r.orderNumber} ${r.product} ${r.color} ${r.storage} ${r.cardNumber} ${r.cardCompany} ${r.browser} ${r.amountSpent} ${r.deliveryMethod}`.toLowerCase();
+        const hay = `${r.orderNumber} ${r.email} ${r.product} ${r.color} ${r.storage} ${r.cardNumber} ${r.cardCompany} ${r.browser} ${r.amountSpent} ${r.deliveryMethod}`.toLowerCase();
         return hay.includes(q);
       });
 
@@ -1375,7 +1389,7 @@
       }
 
       if (!filtered.length) {
-        body.innerHTML = `<tr><td colspan="9" class="empty">${
+        body.innerHTML = `<tr><td colspan="10" class="empty">${
           cardOnly
             ? "未有非 Apple Pay 嘅成功訂單。"
             : "未有成功訂單。Order summary 出現訂單編號後會即時顯示喺呢度。"
@@ -1397,6 +1411,7 @@
             .join(" ");
           return `<tr class="${cls}" data-order="${esc(r.orderNumber)}">
             <td>${esc(r.orderNumber)}</td>
+            <td>${esc(r.email || "—")}</td>
             <td>${esc(r.orderPlacedAt)}</td>
             <td>${esc(r.deliveryMethod || "—")}</td>
             <td>${esc(product || "—")}</td>

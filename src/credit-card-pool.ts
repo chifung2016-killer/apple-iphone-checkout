@@ -347,6 +347,8 @@ export type LiveOrderSpendRow = {
   orderNumber: string;
   orderPlacedAt: string;
   browser: string;
+  /** 落單用電郵（checkoutContact／shipping） */
+  email: string;
   product: string;
   color: string;
   storage: string;
@@ -359,6 +361,18 @@ export type LiveOrderSpendRow = {
   remainingLimit: number | null;
   remainingLabel: string;
 };
+
+function orderContactEmail(o: Record<string, unknown>): string {
+  const contact = (o.checkoutContactUsed as Record<string, unknown> | undefined) || {};
+  const ship = (o.confirmationPageShipping as Record<string, unknown> | undefined) || {};
+  const sd = (o.shippingDetails as Record<string, unknown> | undefined) || {};
+  const identity = (o.identity as Record<string, unknown> | undefined) || {};
+  for (const v of [sd.email, contact.email, ship.email, identity.email, o.email]) {
+    const e = String(v || "").trim();
+    if (e && e !== "—") return e;
+  }
+  return "";
+}
 
 function hasRealOrderNumber(o: Record<string, unknown>): boolean {
   const n = String(o.orderNumber || "").trim();
@@ -480,6 +494,7 @@ export async function getLiveCardLimits(
       orderNumber,
       orderPlacedAt: String(o.orderPlacedAt || o.scrapedAt || "") || "—",
       browser: String(o.browser || "") || "—",
+      email: orderContactEmail(o) || "—",
       product: String(o.productType || o.productName || "") || "—",
       color: String(o.color || "") || "—",
       storage: String(o.storage || "") || "—",

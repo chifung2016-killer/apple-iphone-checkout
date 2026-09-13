@@ -183,6 +183,91 @@ async function loadConfig(): Promise<JobConfig> {
   return { accounts, appleEmail, applePassword };
 }
 
+function normEmail(s: string): string {
+  return String(s || "").trim().toLowerCase();
+}
+
+/** 由 Order summary 記錄抽出聯絡電郵（同 Dashboard 顯示一致） */
+function orderContactEmail(o: Record<string, unknown>): string {
+  const contact = (o.checkoutContactUsed as Record<string, unknown> | undefined) || {};
+  const ship = (o.confirmationPageShipping as Record<string, unknown> | undefined) || {};
+  const sd = (o.shippingDetails as Record<string, unknown> | undefined) || {};
+  const identity = (o.identity as Record<string, unknown> | undefined) || {};
+  for (const v of [sd.email, contact.email, ship.email, identity.email, o.email]) {
+    const e = String(v || "").trim();
+    if (e && e !== "—") return e;
+  }
+  return "";
+}
+
+async function readJsonLoose(file: string): Promise<unknown> {
+  try {
+    return JSON.parse(await fs.readFile(file, "utf8")) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+/** 讀 Order summary（ROOT + runtime/order-*.json），同 Dashboard 對齊 */
+async function loadOrderSummaryRecords(): Promise<Record<string, unknown>[]> {
+  const merged: Record<string, unknown>[] = [];
+  const push = (data: unknown) => {
+    if (Array.isArray(data)) {
+      for (const item of data) {
+        if (item && typeof item === "object") merged.push(item as Record<string, unknown>);
+      }
+    } else if (data && typeof data === "object") {
+      merged.push(data as Record<string, unknown>);
+    }
+  };
+  push(await readJsonLoose(path.join(ROOT, "order-summary.json")));
+  const runtimeDir = path.join(ROOT, "runtime");
+  try {
+    const files = await fs.readdir(runtimeDir);
+    for (const f of files) {
+      if (!/^order-.*\.json$/i.test(f)) continue;
+      push(await readJsonLoose(path.join(runtimeDir, f)));
+    }
+  } catch {
+    /* empty */
+  }
+  return merged;
+}
+
+/**
+ * 用登入嘅 Gmail 對齊 Order summary 入面嘅電郵，攞最新一筆訂單編號。
+ */
+async function resolveOrderNumberForGmail(gmail: string): Promise<string> {
+  const want = normEmail(gmail);
+  if (!want) throw new Error("Gmail 電郵係空");
+  const orders = await loadOrderSummaryRecords();
+  const hits: { orderNumber: string; placedAt: string }[] = [];
+  for (const o of orders) {
+    const orderNumber = String(o.orderNumber || "").trim();
+    if (!orderNumber || /^W9876543210$/i.test(orderNumber)) continue;
+    if (normEmail(orderContactEmail(o)) !== want) continue;
+    hits.push({
+      orderNumber,
+      placedAt: String(o.orderPlacedAt || o.scrapedAt || ""),
+    });
+  }
+  if (!hits.length) {
+    throw new Error(
+      `Order summary 揾唔到電郵 ${maskEmail(gmail)} 對應嘅訂單編號（請確認落單時用咗呢個 Gmail）`
+    );
+  }
+  hits.sort((a, b) => b.placedAt.localeCompare(a.placedAt));
+  const pick = hits[0]!;
+  if (hits.length > 1) {
+    log(
+      `Gmail ${maskEmail(gmail)} 對應 ${hits.length} 筆訂單，用最新：${pick.orderNumber}`
+    );
+  } else {
+    log(`Gmail ${maskEmail(gmail)} → 訂單編號 ${pick.orderNumber}`);
+  }
+  return pick.orderNumber;
+}
+
 async function sleep(ms: number) {
   const end = Date.now() + ms;
   while (Date.now() < end) {
@@ -1677,25 +1762,35 @@ async function gmailLogin(page: Page, email: string, password: string): Promise<
   throw new Error(`Gmail 登入逾時：${page.url()}`);
 }
 
-async function gmailSearchAndOpenOrderEmail(page: Page): Promise<void> {
-  const keyword = "apple 出貨";
-  const searchUrl = `https://mail.google.com/mail/u/0/#search/${encodeURIComponent(keyword)}`;
-  log(`搜尋郵件：${keyword}…`);
+async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Promise<void> {
+  const keyword = String(orderNumber || "").trim();
+  if (!keyword) throw new Error("缺少訂單編號，無法搜尋 Gmail");
+  const enc = encodeURIComponent(keyword);
+  const searchUrl = `https://mail.google.com/mail/u/0/#search/${enc}`;
+  const urlHasKeyword = (url: string) => {
+    try {
+      return decodeURIComponent(url).includes(keyword) || url.includes(enc);
+    } catch {
+      return url.includes(enc) || url.includes(keyword);
+    }
+  };
+  log(`搜尋郵件（訂單編號）：${keyword}…`);
   await writeStatus({
     phase: "search_email",
-    message: `搜尋「${keyword}」…`,
+    message: `搜尋訂單「${keyword}」…`,
     url: page.url(),
+    orderNumber: keyword,
   });
 
   // 直接入 search hash（最快、最穩）
-  if (!/#search\//i.test(page.url()) || !page.url().includes(encodeURIComponent("出貨"))) {
+  if (!/#search\//i.test(page.url()) || !urlHasKeyword(page.url())) {
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
   }
   await dismissGmailOverlays(page);
   await sleep(800);
 
   // 若仍未係 search，再試 hash／搜尋欄一次
-  if (!/#search\//i.test(page.url())) {
+  if (!/#search\//i.test(page.url()) || !urlHasKeyword(page.url())) {
     await page
       .evaluate((q) => {
         location.hash = `#search/${encodeURIComponent(q)}`;
@@ -1703,7 +1798,7 @@ async function gmailSearchAndOpenOrderEmail(page: Page): Promise<void> {
       .catch(() => {});
     await sleep(600);
   }
-  if (!/#search\//i.test(page.url())) {
+  if (!/#search\//i.test(page.url()) || !urlHasKeyword(page.url())) {
     await page.keyboard.press("/").catch(() => {});
     await sleep(200);
     const box = page
@@ -1723,6 +1818,7 @@ async function gmailSearchAndOpenOrderEmail(page: Page): Promise<void> {
     phase: "search_email",
     message: `已搜尋「${keyword}」，開啟郵件…`,
     url: page.url(),
+    orderNumber: keyword,
   });
 
   const rowSelectors = [
@@ -1750,7 +1846,7 @@ async function gmailSearchAndOpenOrderEmail(page: Page): Promise<void> {
       .first()
       .isVisible()
       .catch(() => false);
-    if (empty) throw new Error(`Gmail 搜尋「${keyword}」冇結果`);
+    if (empty) throw new Error(`Gmail 搜尋訂單「${keyword}」冇結果`);
     await page
       .evaluate((q) => {
         location.hash = `#search/${encodeURIComponent(q)}`;
@@ -1767,11 +1863,12 @@ async function gmailSearchAndOpenOrderEmail(page: Page): Promise<void> {
     count = await rows.count().catch(() => 0);
   }
   if (count <= 0) {
-    throw new Error(`Gmail 搜尋「${keyword}」搵唔到郵件列`);
+    throw new Error(`Gmail 搜尋訂單「${keyword}」搵唔到郵件列`);
   }
   log(`搜尋到 ${count} 列，準備開啟…`);
 
-  const rowMatch = (text: string) => text.includes("出貨") && /apple/i.test(text);
+  const rowHasOrder = (text: string) =>
+    text.includes(keyword) || text.replace(/[\s-]/g, "").includes(keyword.replace(/[\s-]/g, ""));
   let opened = false;
   const openAt = async (i: number, why: string) => {
     const row = rows.nth(i);
@@ -1788,19 +1885,15 @@ async function gmailSearchAndOpenOrderEmail(page: Page): Promise<void> {
   for (let i = 0; i < Math.min(count, 30) && !opened; i++) {
     await throwIfStopped();
     const text = ((await rows.nth(i).innerText().catch(() => "")) || "").replace(/\s+/g, " ");
-    if (rowMatch(text)) await openAt(i, `已開啟「${keyword}」郵件`);
-  }
-  for (let i = 0; i < Math.min(count, 30) && !opened; i++) {
-    await throwIfStopped();
-    const text = ((await rows.nth(i).innerText().catch(() => "")) || "").replace(/\s+/g, " ");
-    if (text.includes("出貨")) await openAt(i, "已開啟含「出貨」郵件");
+    if (rowHasOrder(text)) await openAt(i, `已開啟含訂單「${keyword}」郵件`);
   }
   if (!opened) await openAt(0, "已開啟搜尋結果第一封");
 
   await writeStatus({
     phase: "email_opened",
-    message: `已開啟「${keyword}」郵件`,
+    message: `已開啟訂單「${keyword}」郵件`,
     url: page.url(),
+    orderNumber: keyword,
   });
   await waitForGmailMessageOpen(page);
 }
@@ -2100,8 +2193,25 @@ async function processOneAccount(
 
   const runSteps = async () => {
     // —— Gmail 之後步驟盡量短、可 resume ——
+    await writeStatus({ phase: "match_order", message: "對齊 Order summary 訂單編號…" });
+    const orderNumber = await resolveOrderNumberForGmail(account.email);
+    await writeStatus({
+      phase: "match_order",
+      message: `訂單編號 ${orderNumber}`,
+      orderNumber,
+      email: account.email,
+    });
+
     const onGmail = /mail\.google\.com/i.test(page.url());
-    const onSearch = /#search\//i.test(page.url()) && /出貨|%E5%87%BA%E8%B2%A8/i.test(page.url());
+    const urlHasOrder = (() => {
+      const u = page.url();
+      try {
+        return decodeURIComponent(u).includes(orderNumber);
+      } catch {
+        return u.includes(orderNumber) || u.includes(encodeURIComponent(orderNumber));
+      }
+    })();
+    const onSearch = /#search\//i.test(page.url()) && urlHasOrder;
     const mailOpen = await page
       .locator("div.a3s, h2.hP, div[data-message-id]")
       .first()
@@ -2116,33 +2226,38 @@ async function processOneAccount(
     }
 
     if (!mailOpen || /#search\//i.test(page.url()) || /#inbox/i.test(page.url())) {
-      // 已在 search 結果：直接開郵件；否則搜尋
-      await writeStatus({ phase: "search_email", message: "搜尋／開啟訂單郵件…" });
+      // 已在正確訂單搜尋結果：直接開郵件；否則用訂單編號搜尋
+      await writeStatus({
+        phase: "search_email",
+        message: `搜尋／開啟訂單「${orderNumber}」…`,
+        orderNumber,
+      });
       if (onSearch && mailOpen) {
         log("搜尋頁已有郵件打開，繼續訂單狀態");
       } else {
-        await gmailSearchAndOpenOrderEmail(page);
+        await gmailSearchAndOpenOrderEmail(page, orderNumber);
       }
     }
 
-    await writeStatus({ phase: "order_status", message: "撳訂單狀態…" });
+    await writeStatus({ phase: "order_status", message: "撳訂單狀態…", orderNumber });
     const orderPage = await clickOrderStatusInEmail(page, context);
     activePage = orderPage;
     await maybeMinimizeBrowserWindow(orderPage, browser);
 
-    await writeStatus({ phase: "apple_order", message: "等待 Apple 訂單頁…" });
+    await writeStatus({ phase: "apple_order", message: "等待 Apple 訂單頁…", orderNumber });
     await waitForAppleOrderGuestPage(orderPage);
 
-    await writeStatus({ phase: "add_to_apple_id", message: "加入至 Apple ID…" });
+    await writeStatus({ phase: "add_to_apple_id", message: "加入至 Apple ID…", orderNumber });
     await clickAddToAppleIdOnce(orderPage);
     await signInAppleIdOnOrderPage(orderPage, appleEmail, applePassword);
     await writeStatus({
       phase: "steps_complete",
-      message: "步驟完成",
+      message: `步驟完成（${orderNumber}）`,
+      orderNumber,
       windowHidden: !userKeepBrowserOpen,
       keepOpen: userKeepBrowserOpen,
     });
-    log(`完成：${maskEmail(account.email)} → 已嘗試加入 Apple ID`);
+    log(`完成：${maskEmail(account.email)} · ${orderNumber} → 已嘗試加入 Apple ID`);
   };
 
   for (;;) {
