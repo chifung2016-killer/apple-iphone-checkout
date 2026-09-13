@@ -77,7 +77,7 @@ let CONFIG = {
     "New Town Plaza",
   ],
   /** 每個自動撳掣前暫停，降低被偵測為機械操作嘅機會 */
-  clickDelayMs: 100,
+  clickDelayMs: 500,
   /** 每個瀏覽器視窗大小（並排、互唔重疊） */
   windowWidth: 960,
   windowHeight: 980,
