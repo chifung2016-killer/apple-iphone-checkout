@@ -19,6 +19,13 @@ import {
   fulfillmentLabelFromPreference,
   resolveDeliveryMethodLabel,
 } from "./fulfillment-label.js";
+import {
+  decryptFromFile,
+  encryptToFile,
+  redactSecrets,
+  rotateKey,
+  secureWipeFile,
+} from "./add-order-secrets.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PUBLIC = path.join(ROOT, "dashboard");
@@ -27,6 +34,12 @@ const RUNTIME_CONFIG = path.join(ROOT, "runtime-config.json");
 const ORDERS_FILE = path.join(ROOT, "order-summary.json");
 const CONTINUE_ALL_FLAG = path.join(ROOT, "dashboard-continue.flag");
 const PROXY_BLACKLIST_FILE = path.join(RUNTIME_DIR, "proxy-blacklist.json");
+const GMAIL_ACCOUNTS_ENC = path.join(RUNTIME_DIR, "gmail-accounts.enc");
+const GMAIL_ACCOUNTS_LEGACY = path.join(RUNTIME_DIR, "gmail-accounts-saved.txt");
+const ADD_ORDER_KEY = path.join(RUNTIME_DIR, ".add-order-key");
+const ADD_ORDER_JOB_ENC = path.join(RUNTIME_DIR, "add-order-job.enc");
+const ADD_ORDER_JOB_LEGACY = path.join(RUNTIME_DIR, "add-order-apple-ac.json");
+const ADD_ORDER_STOP_FLAG = path.join(RUNTIME_DIR, "add-order-stop.flag");
 const PORT = Number(process.env.DASHBOARD_PORT || 8787);
 /** 每次 server 啟動／tsx watch 重載都會變 → 瀏覽器自動 refresh */
 const DASHBOARD_BUILD_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -1599,19 +1612,26 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
       pid: addOrderJob.pid,
       startedAt: addOrderJob.startedAt,
       lastExitCode: addOrderJob.lastExitCode,
-      logs: addOrderJob.logs.slice(-400),
+      logs: addOrderJob.logs.slice(-400).map(redactSecrets),
     });
   }
-
-  const gmailAccountsFile = path.join(RUNTIME_DIR, "gmail-accounts-saved.txt");
 
   if (pathname === "/api/add-order-apple-ac/accounts" && req.method === "GET") {
     await ensureRuntimeDir();
     let text = "";
     try {
-      text = await fs.readFile(gmailAccountsFile, "utf8");
+      text = await decryptFromFile(GMAIL_ACCOUNTS_ENC, ADD_ORDER_KEY);
     } catch {
-      text = "";
+      try {
+        // 舊版明文 → 升格加密後刪明文
+        text = await fs.readFile(GMAIL_ACCOUNTS_LEGACY, "utf8");
+        if (text.trim()) {
+          await encryptToFile(GMAIL_ACCOUNTS_ENC, ADD_ORDER_KEY, text);
+        }
+        await secureWipeFile(GMAIL_ACCOUNTS_LEGACY);
+      } catch {
+        text = "";
+      }
     }
     return sendJson(res, 200, { ok: true, text });
   }
@@ -1625,20 +1645,56 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
       return sendJson(res, 400, { ok: false, error: "invalid JSON" });
     }
     const text = String(body.text ?? "");
-    await fs.writeFile(gmailAccountsFile, text, "utf8");
-    return sendJson(res, 200, { ok: true });
+    await encryptToFile(GMAIL_ACCOUNTS_ENC, ADD_ORDER_KEY, text);
+    await secureWipeFile(GMAIL_ACCOUNTS_LEGACY);
+    return sendJson(res, 200, { ok: true, encrypted: true });
   }
 
   if (pathname === "/api/add-order-apple-ac/accounts/clear" && req.method === "POST") {
     await ensureRuntimeDir();
-    await fs.writeFile(gmailAccountsFile, "", "utf8");
-    return sendJson(res, 200, { ok: true });
+    // 先停 job，避免仲寫 config／log
+    const child = addOrderJob.child;
+    const pid = child?.pid || addOrderJob.pid;
+    await fs.writeFile(ADD_ORDER_STOP_FLAG, new Date().toISOString(), "utf8").catch(() => {});
+    if (child) killProc(child);
+    else if (process.platform === "win32" && pid) {
+      spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+        stdio: "ignore",
+        shell: true,
+      });
+    }
+    addOrderJob.running = false;
+    addOrderJob.child = null;
+    addOrderJob.pid = null;
+    addOrderJob.lastExitCode = null;
+    addOrderJob.logs = [];
+    addOrderJob.startedAt = null;
+
+    // 清晒所有相關歷史／密文／明文殘留，並換 key
+    await secureWipeFile(GMAIL_ACCOUNTS_ENC);
+    await secureWipeFile(GMAIL_ACCOUNTS_LEGACY);
+    await secureWipeFile(ADD_ORDER_JOB_ENC);
+    await secureWipeFile(ADD_ORDER_JOB_LEGACY);
+    await secureWipeFile(ADD_ORDER_STOP_FLAG);
+    await rotateKey(ADD_ORDER_KEY);
+
+    return sendJson(res, 200, {
+      ok: true,
+      cleared: [
+        "ui",
+        "gmail-accounts.enc",
+        "gmail-accounts-saved.txt",
+        "add-order-job.enc",
+        "add-order-apple-ac.json",
+        "logs",
+        "key-rotated",
+      ],
+    });
   }
 
   if (pathname === "/api/add-order-apple-ac/stop" && req.method === "POST") {
     await ensureRuntimeDir();
-    const stopFlag = path.join(RUNTIME_DIR, "add-order-stop.flag");
-    await fs.writeFile(stopFlag, new Date().toISOString(), "utf8");
+    await fs.writeFile(ADD_ORDER_STOP_FLAG, new Date().toISOString(), "utf8");
     const child = addOrderJob.child;
     const pid = child?.pid || addOrderJob.pid;
     if (child) {
@@ -1687,18 +1743,20 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     }
 
     await ensureRuntimeDir();
-    const stopFlag = path.join(RUNTIME_DIR, "add-order-stop.flag");
-    await fs.unlink(stopFlag).catch(() => {});
-    const configPath = path.join(RUNTIME_DIR, "add-order-apple-ac.json");
-    await fs.writeFile(
-      configPath,
-      JSON.stringify({ accounts, appleEmail, applePassword }, null, 2),
-      "utf8"
+    await fs.unlink(ADD_ORDER_STOP_FLAG).catch(() => {});
+    // 加密 job config（唔再寫明文 JSON）
+    await encryptToFile(
+      ADD_ORDER_JOB_ENC,
+      ADD_ORDER_KEY,
+      JSON.stringify({ accounts, appleEmail, applePassword })
     );
+    await secureWipeFile(ADD_ORDER_JOB_LEGACY);
 
     const tsxCli = path.join(ROOT, "node_modules", "tsx", "dist", "cli.mjs");
     const script = path.join(ROOT, "src", "add-order-to-apple-ac.ts");
-    addOrderJob.logs = [`[dashboard] start ${new Date().toISOString()} · ${accounts.length} Gmail`];
+    addOrderJob.logs = [
+      `[dashboard] start ${new Date().toISOString()} · ${accounts.length} Gmail (encrypted job)`,
+    ];
     addOrderJob.lastExitCode = null;
     addOrderJob.startedAt = new Date().toISOString();
     addOrderJob.running = true;
@@ -1706,8 +1764,9 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     const proc = spawn(process.execPath, [tsxCli, script], {
       cwd: ROOT,
       env: envForCheckoutChild({
-        ADD_ORDER_CONFIG_PATH: configPath,
-        ADD_ORDER_STOP_FLAG: stopFlag,
+        ADD_ORDER_JOB_ENC: ADD_ORDER_JOB_ENC,
+        ADD_ORDER_KEY_PATH: ADD_ORDER_KEY,
+        ADD_ORDER_STOP_FLAG: ADD_ORDER_STOP_FLAG,
       }),
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -1718,7 +1777,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
       const text = buf.toString("utf8");
       for (const line of text.split(/\r?\n/)) {
         if (!line.trim()) continue;
-        addOrderJob.logs.push(line);
+        addOrderJob.logs.push(redactSecrets(line));
         if (addOrderJob.logs.length > 800) {
           addOrderJob.logs.splice(0, addOrderJob.logs.length - 800);
         }
@@ -1732,6 +1791,9 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
       addOrderJob.child = null;
       addOrderJob.pid = null;
       addOrderJob.logs.push(`[dashboard] exit=${code}`);
+      // 跑完即抹走 job 密文，減少落地時間
+      void secureWipeFile(ADD_ORDER_JOB_ENC);
+      void secureWipeFile(ADD_ORDER_JOB_LEGACY);
     });
 
     return sendJson(res, 200, { ok: true, pid: addOrderJob.pid });

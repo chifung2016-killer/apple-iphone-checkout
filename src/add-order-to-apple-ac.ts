@@ -11,6 +11,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { chromium, type Browser, type BrowserContext, type Frame, type Page } from "playwright";
+import { decryptFromFile, maskEmail, redactSecrets } from "./add-order-secrets.js";
 
 type Account = { email: string; password: string };
 
@@ -21,7 +22,11 @@ type JobConfig = {
 };
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const CONFIG_PATH =
+const JOB_ENC =
+  process.env.ADD_ORDER_JOB_ENC || path.join(ROOT, "runtime", "add-order-job.enc");
+const KEY_PATH =
+  process.env.ADD_ORDER_KEY_PATH || path.join(ROOT, "runtime", ".add-order-key");
+const LEGACY_CONFIG =
   process.env.ADD_ORDER_CONFIG_PATH ||
   process.env.CHECKOUT_CONFIG_PATH ||
   "";
@@ -37,7 +42,7 @@ class StopRequestedError extends Error {
 }
 
 function log(msg: string) {
-  console.log(`[add-order] ${msg}`);
+  console.log(`[add-order] ${redactSecrets(msg)}`);
 }
 
 async function stopRequested(): Promise<boolean> {
@@ -54,10 +59,14 @@ async function throwIfStopped(): Promise<void> {
 }
 
 async function loadConfig(): Promise<JobConfig> {
-  if (!CONFIG_PATH) {
-    throw new Error("缺少 ADD_ORDER_CONFIG_PATH");
+  let raw: Partial<JobConfig> = {};
+  try {
+    const plain = await decryptFromFile(JOB_ENC, KEY_PATH);
+    raw = JSON.parse(plain) as Partial<JobConfig>;
+  } catch {
+    if (!LEGACY_CONFIG) throw new Error("缺少加密 job config（ADD_ORDER_JOB_ENC）");
+    raw = JSON.parse(await fs.readFile(LEGACY_CONFIG, "utf8")) as Partial<JobConfig>;
   }
-  const raw = JSON.parse(await fs.readFile(CONFIG_PATH, "utf8")) as Partial<JobConfig>;
   const accounts = Array.isArray(raw.accounts)
     ? raw.accounts
         .map((a) => ({
@@ -314,7 +323,7 @@ async function signInAppleIdOnOrderPage(
   appleEmail: string,
   applePassword: string
 ): Promise<void> {
-  log(`Apple ID 登入：${appleEmail}`);
+  log(`Apple ID 登入：${maskEmail(appleEmail)}`);
   await sleep(600);
 
   let emailOk = false;
@@ -432,7 +441,7 @@ async function fillGoogleVisibleInput(
 }
 
 async function gmailLogin(page: Page, email: string, password: string): Promise<void> {
-  log(`Gmail 登入：${email}`);
+  log(`Gmail 登入：${maskEmail(email)}`);
   await page.goto(
     "https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Fmail.google.com%2Fmail%2Fu%2F0%2F&service=mail&flowName=GlifWebSignIn&flowEntry=ServiceLogin",
     { waitUntil: "domcontentloaded", timeout: 90_000 }
@@ -692,7 +701,7 @@ async function processOneAccount(
   applePassword: string
 ): Promise<void> {
   await throwIfStopped();
-  log(`======== 開始處理 ${account.email} ========`);
+  log(`======== 開始處理 ${maskEmail(account.email)} ========`);
   const context = await browser.newContext({
     locale: "zh-HK",
     viewport: { width: 1280, height: 900 },
@@ -715,7 +724,7 @@ async function processOneAccount(
     await waitForAppleOrderGuestPage(orderPage);
     await clickAddToAppleIdOnce(orderPage);
     await signInAppleIdOnOrderPage(orderPage, appleEmail, applePassword);
-    log(`完成：${account.email} → 已嘗試加入 Apple ID`);
+    log(`完成：${maskEmail(account.email)} → 已嘗試加入 Apple ID`);
     await sleep(2000);
   } finally {
     await context.close().catch(() => {});
@@ -743,7 +752,7 @@ async function launchBrowser(): Promise<Browser> {
 async function main() {
   await fs.unlink(STOP_FLAG).catch(() => {});
   const cfg = await loadConfig();
-  log(`共 ${cfg.accounts.length} 個 Gmail；Apple ID=${cfg.appleEmail}`);
+  log(`共 ${cfg.accounts.length} 個 Gmail；Apple ID=${maskEmail(cfg.appleEmail)}`);
 
   const browser = await launchBrowser();
 
@@ -761,7 +770,7 @@ async function main() {
         await processOneAccount(browser, acc, cfg.appleEmail, cfg.applePassword);
       } catch (err) {
         if (err instanceof StopRequestedError) throw err;
-        log(`失敗 ${acc.email}：${err instanceof Error ? err.message : String(err)}`);
+        log(`失敗 ${maskEmail(acc.email)}：${err instanceof Error ? err.message : String(err)}`);
       }
     }
   } catch (err) {

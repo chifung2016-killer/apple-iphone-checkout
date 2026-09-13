@@ -115,12 +115,12 @@
       <h2>Gmail accounts</h2>
       <div class="field">
         <label for="accounts">每行一個：email password（空格或 : 或 , 分隔）</label>
-        <textarea id="accounts" placeholder="chifung2016@gmail.com myGmailPassword&#10;other@gmail.com otherPassword"></textarea>
+        <textarea id="accounts" autocomplete="off" spellcheck="false" placeholder="you@gmail.com yourPassword&#10;other@gmail.com otherPassword"></textarea>
         <div class="actions" style="margin-top:10px">
           <button type="button" class="btn-primary" id="btnSaveAccounts">Save</button>
           <button type="button" class="btn-danger" id="btnClearAccounts">Clear all</button>
         </div>
-        <p class="hint">會逐個自動登入 Gmail，搜尋含「apple store」或「出貨」嘅郵件，撳「訂單狀態」一次。撳 Save 會存去 server，之後更新頁面都唔會清走。</p>
+        <p class="hint">Save 會用 AES 加密存喺本機 runtime（唔寫明文）。Clear all 會停 job、抹走加密檔／舊明文／job config／logs，並換密鑰。</p>
       </div>
     </section>
 
@@ -129,11 +129,11 @@
       <div class="row2">
         <div class="field">
           <label for="appleEmail">Apple ID email</label>
-          <input id="appleEmail" type="email" value="chifung2010@yahoo.com.hk" autocomplete="username" />
+          <input id="appleEmail" type="email" value="chifung2010@yahoo.com.hk" autocomplete="off" />
         </div>
         <div class="field">
           <label for="applePassword">Apple ID password</label>
-          <input id="applePassword" type="password" value="yY6594083" autocomplete="current-password" />
+          <input id="applePassword" type="password" value="yY6594083" autocomplete="new-password" />
         </div>
       </div>
       <p class="hint">撳「加入至 Apple ID」後：填呢個電郵 →「繼續使用密碼登入」→ 密碼 → 右箭頭（同 delivery apple ac apple pay訪客模式）。</p>
@@ -303,16 +303,30 @@
     });
 
     $("btnClearAccounts").addEventListener("click", async () => {
-      if (!confirm("Clear all saved Gmail accounts？")) return;
+      if (!confirm("Clear all？會清：輸入框、已存 Gmail、job config、live logs，並換加密 key。")) return;
       $("accounts").value = "";
-      await fetch("/api/add-order-apple-ac/accounts/clear", { method: "POST" });
+      logsEl.textContent = "";
+      setStatus("Cleared", "ok");
+      try {
+        const res = await fetch("/api/add-order-apple-ac/accounts/clear", { method: "POST" });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.ok) {
+          alert(data.error || "Clear failed");
+          return;
+        }
+        // 再拉一次 status，確認 logs 已空
+        await refreshStatus();
+        setStatus("Cleared — all Gmail history wiped", "ok");
+      } catch (err) {
+        alert(err instanceof Error ? err.message : String(err));
+      }
     });
 
     async function loadSavedAccounts() {
       try {
         const res = await fetch("/api/add-order-apple-ac/accounts");
         const data = await res.json();
-        if (data.ok && typeof data.text === "string" && data.text.trim()) {
+        if (data.ok && typeof data.text === "string") {
           $("accounts").value = data.text;
         }
       } catch {
