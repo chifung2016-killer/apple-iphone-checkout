@@ -534,6 +534,37 @@ function appleAuthFrames(page: Page): Frame[] {
   return out;
 }
 
+/** 淨係 auth iframe；唔好喺 store 主頁撳（左上角 Apple logo → apple.com/hk） */
+function authActionFrames(page: Page): Frame[] {
+  const auth = appleAuthFrames(page);
+  if (auth.length) return auth;
+  const mainUrl = page.url() || "";
+  if (/idmsa\.apple\.com|appleauth|account\.apple\.com/i.test(mainUrl)) {
+    return [page.mainFrame()];
+  }
+  return [];
+}
+
+function isAppleMarketingHome(url: string): boolean {
+  return /^https?:\/\/(www\.)?apple\.com\/(hk|hk-zh)\/?(\?|#|$)/i.test(String(url || ""));
+}
+
+/** 若誤跳去 apple.com/hk 官網，即刻返回登入頁 */
+async function recoverIfLeftAppleSignIn(page: Page, signInUrl: string): Promise<boolean> {
+  const url = page.url();
+  if (/\/shop\/signIn/i.test(url) || /idmsa\.apple\.com/i.test(url)) return false;
+  if (isAppleMarketingHome(url) || /^https?:\/\/(www\.)?apple\.com\/hk(\/|$)/i.test(url)) {
+    log(`誤入官網 ${url}（多半撳咗 Apple logo）— 返回登入頁`);
+    await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => {});
+    await sleep(500);
+    if (!/\/shop\/signIn/i.test(page.url()) && signInUrl) {
+      await page.goto(signInUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+    }
+    return true;
+  }
+  return false;
+}
+
 async function fillInAppleAuthFrame(
   page: Page,
   kind: "email" | "password",
@@ -602,8 +633,6 @@ async function clickAppleAuthContinue(page: Page): Promise<boolean> {
     'button[type="submit"]',
     "button.aid-continue-button",
     "button.button-primary",
-    'button:has-text("Continue")',
-    'button:has-text("繼續")',
   ];
 
   for (const iframeSel of APPLE_AUTH_IFRAME_SELS) {
@@ -622,40 +651,52 @@ async function clickAppleAuthContinue(page: Page): Promise<boolean> {
             .catch(() => false)
         );
       if (ok) {
-        log(`已撳登入繼續（${sel}）`);
-        return true;
-      }
-    }
-    const arrow = frame.locator("button.icon-button, button.move, button:has(svg)").first();
-    if ((await arrow.count().catch(() => 0)) > 0) {
-      const ok = await arrow
-        .click({ force: true, timeout: 1200 })
-        .then(() => true)
-        .catch(() => false);
-      if (ok) {
-        log("已撳登入右箭頭");
+        log(`已撳登入繼續（iframe ${sel}）`);
         return true;
       }
     }
   }
 
-  for (const fr of [...appleAuthFrames(page), page.mainFrame(), ...page.frames()]) {
-    for (const sel of [...btnSels, "button.icon-button", "button.move", "button:has(svg)"]) {
+  // 只喺 auth iframe 撳，唔好掃 store 主頁（避免 Apple logo）
+  for (const fr of authActionFrames(page)) {
+    for (const sel of btnSels) {
       const btn = fr.locator(sel).first();
       if ((await btn.count().catch(() => 0)) === 0) continue;
       const ok = await btn
         .click({ force: true, timeout: 1000 })
         .then(() => true)
         .catch(() => false);
-      if (ok) return true;
+      if (ok) {
+        log(`已撳登入繼續（auth ${sel}）`);
+        return true;
+      }
     }
   }
   return false;
 }
 
 async function clickLeftAuthActionButton(page: Page): Promise<boolean> {
-  // signIn/orders：兩個掣並排時撳最左（通常係「繼續使用密碼登入」），避開右邊通行密鑰／#sign-in 箭嘴
-  for (const fr of [...appleAuthFrames(page), page.mainFrame(), ...page.frames()]) {
+  // 只喺 auth iframe 入面揀密碼掣；絕對唔好掃 store 主頁（左上角 Apple logo → apple.com/hk）
+  for (const iframeSel of APPLE_AUTH_IFRAME_SELS) {
+    if ((await page.locator(iframeSel).count().catch(() => 0)) === 0) continue;
+    const frame = page.frameLocator(iframeSel);
+    const pwd = frame
+      .locator("#continue-password")
+      .or(
+        frame.getByRole("button", {
+          name: /繼續使用密碼|使用密碼|Continue with Password|Use Password/i,
+        })
+      )
+      .or(frame.getByText(/繼續使用密碼登入|使用密碼登入/i))
+      .first();
+    if ((await pwd.count().catch(() => 0)) === 0) continue;
+    if (await pwd.click({ force: true, timeout: 1500 }).then(() => true).catch(() => false)) {
+      log("已撳左邊／密碼登入掣（iframe）");
+      return true;
+    }
+  }
+
+  for (const fr of authActionFrames(page)) {
     const hit = await fr
       .evaluate(() => {
         const visible = (el: Element) => {
@@ -670,7 +711,7 @@ async function clickLeftAuthActionButton(page: Page): Promise<boolean> {
           );
         };
         const labelOf = (el: HTMLElement) =>
-          `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${el.id || ""} ${el.className || ""}`;
+          `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${el.id || ""}`;
 
         const nodes = Array.from(
           document.querySelectorAll("button, a, [role='button']")
@@ -678,25 +719,27 @@ async function clickLeftAuthActionButton(page: Page): Promise<boolean> {
         const actions = nodes.filter((el) => {
           if (!visible(el)) return false;
           const t = labelOf(el);
+          const href = (el as HTMLAnchorElement).href || el.getAttribute("href") || "";
+          if (/www\.apple\.com\/(hk|hk-zh)\/?$/i.test(href)) return false;
+          if (/globalnav|ac-gn|logo|apple-logo/i.test(`${t} ${href} ${el.className}`)) return false;
           if (/取消|cancel|close|關閉|返回|back/i.test(t)) return false;
-          // 唔好撳電郵欄右邊藍色箭嘴 #sign-in（通常係最右）
-          if (el.id === "sign-in" || /aid-continue|icon-button|move/i.test(el.className)) {
-            // 除非佢文字本身係密碼
-            if (!/密碼|password/i.test(t)) return false;
-          }
-          return true;
+          if (el.id === "sign-in" && !/密碼|password/i.test(t)) return false;
+          // 必須同密碼／其他選項相關
+          return (
+            el.id === "continue-password" ||
+            /密碼|password|其他選項|other options|try another/i.test(t)
+          );
         });
         if (!actions.length) return "";
-
-        // 優先：含密碼字樣
-        const pwdBtns = actions.filter((el) => /密碼|password/i.test(labelOf(el)));
+        const pwdBtns = actions.filter((el) =>
+          /密碼|password|continue-password/i.test(labelOf(el) + el.id)
+        );
         const pool = pwdBtns.length ? pwdBtns : actions;
         pool.sort(
           (a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left
         );
-        const target = pool[0]!;
-        target.click();
-        return (labelOf(target) || "left-button").trim().slice(0, 80);
+        pool[0]!.click();
+        return (labelOf(pool[0]!) || "left-button").trim().slice(0, 80);
       })
       .catch(() => "");
     if (hit) {
@@ -708,7 +751,7 @@ async function clickLeftAuthActionButton(page: Page): Promise<boolean> {
 }
 
 async function hasVisibleApplePasswordField(page: Page): Promise<boolean> {
-  for (const fr of [...appleAuthFrames(page), page.mainFrame(), ...page.frames()]) {
+  for (const fr of authActionFrames(page)) {
     const loc = fr
       .locator(
         "#password_text_field:visible, input[type='password']:visible, input[name='password']:visible, input[autocomplete='current-password']:visible"
@@ -716,6 +759,16 @@ async function hasVisibleApplePasswordField(page: Page): Promise<boolean> {
       .first();
     if ((await loc.count().catch(() => 0)) === 0) continue;
     if (await loc.isVisible().catch(() => false)) return true;
+  }
+  for (const iframeSel of APPLE_AUTH_IFRAME_SELS) {
+    if ((await page.locator(iframeSel).count().catch(() => 0)) === 0) continue;
+    const loc = page
+      .frameLocator(iframeSel)
+      .locator("#password_text_field, input[type='password']")
+      .first();
+    if ((await loc.count().catch(() => 0)) > 0 && (await loc.isVisible().catch(() => false))) {
+      return true;
+    }
   }
   return false;
 }
@@ -733,7 +786,9 @@ async function clickContinueWithPasswordFast(page: Page): Promise<boolean> {
   const otherNeedles = ["其他選項", "其他选项", "Other Options", "Other Option", "Try Another Way"];
 
   const clickByTexts = async (needles: string[], loosePassword = false): Promise<boolean> => {
-    for (const fr of [...appleAuthFrames(page), page.mainFrame(), ...page.frames()]) {
+    const frames = authActionFrames(page);
+    if (!frames.length) return false;
+    for (const fr of frames) {
       const hit = await fr
         .evaluate(
           ({ texts, loose }) => {
@@ -745,6 +800,9 @@ async function clickContinueWithPasswordFast(page: Page): Promise<boolean> {
             ) as HTMLElement[];
             for (const el of nodes) {
               const raw = `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""}`;
+              const href = (el as HTMLAnchorElement).href || el.getAttribute("href") || "";
+              if (/www\.apple\.com\/(hk|hk-zh)\/?$/i.test(href)) continue;
+              if (/globalnav|ac-gn|logo/i.test(`${raw} ${href}`)) continue;
               const t = norm(raw);
               if (!t || t.length > 120) continue;
               const match = wanted.some((w) => t.includes(w) || w.includes(t));
@@ -755,7 +813,6 @@ async function clickContinueWithPasswordFast(page: Page): Promise<boolean> {
               if (!match && !looseHit) continue;
               const clickable =
                 (el.closest("button, a, [role='button']") as HTMLElement | null) || el;
-              // 避開電郵步右邊 #sign-in 箭嘴
               if (clickable.id === "sign-in" && !/密碼|password/i.test(raw)) continue;
               clickable.click();
               return true;
@@ -770,11 +827,11 @@ async function clickContinueWithPasswordFast(page: Page): Promise<boolean> {
     return false;
   };
 
-  // 0) 左邊掣（密碼選項通常在左）
+  // 0) 左邊掣（只喺 auth iframe）
   if (await clickLeftAuthActionButton(page)) return true;
 
   // 1) #continue-password（idmsa）
-  for (const fr of [...appleAuthFrames(page), page.mainFrame(), ...page.frames()]) {
+  for (const fr of authActionFrames(page)) {
     const byId = fr
       .locator(
         "#continue-password, button#continue-password, [id*='continue-password' i], button[data-test*='password' i]"
@@ -795,7 +852,7 @@ async function clickContinueWithPasswordFast(page: Page): Promise<boolean> {
     if (ok) return true;
   }
 
-  // 2) iframe + 主頁 role／text
+  // 2) iframe frameLocator only（唔撳 store 主頁）
   for (const iframeSel of APPLE_AUTH_IFRAME_SELS) {
     if ((await page.locator(iframeSel).count().catch(() => 0)) === 0) continue;
     const frame = page.frameLocator(iframeSel);
@@ -823,50 +880,12 @@ async function clickContinueWithPasswordFast(page: Page): Promise<boolean> {
     }
   }
 
-  const pageCandidates = [
-    page.locator("#continue-password"),
-    page.getByRole("button", {
-      name: /繼續使用密碼登入|繼續使用密碼|使用密碼登入|Continue with Password|Use Password/i,
-    }),
-    page.getByRole("link", {
-      name: /繼續使用密碼登入|繼續使用密碼|使用密碼登入|Continue with Password|Use Password/i,
-    }),
-    page.getByText(/繼續使用密碼登入|使用密碼登入/i),
-  ];
-  for (const loc of pageCandidates) {
-    const el = loc.first();
-    if ((await el.count().catch(() => 0)) === 0) continue;
-    if (!(await el.isVisible().catch(() => false))) continue;
-    if (
-      await el
-        .click({ force: true, timeout: 2000 })
-        .then(() => true)
-        .catch(async () =>
-          el
-            .evaluate((n) => {
-              (n as HTMLElement).click();
-              return true;
-            })
-            .catch(() => false)
-        )
-    ) {
-      return true;
-    }
-  }
-
   if (await clickByTexts(pwdNeedles, true)) return true;
 
   if (await clickByTexts(otherNeedles)) {
     await sleep(500);
     if (await clickLeftAuthActionButton(page)) return true;
     if (await clickByTexts(pwdNeedles, true)) return true;
-    for (const loc of pageCandidates) {
-      const el = loc.first();
-      if ((await el.count().catch(() => 0)) === 0) continue;
-      if (await el.click({ force: true, timeout: 1500 }).then(() => true).catch(() => false)) {
-        return true;
-      }
-    }
   }
   return false;
 }
@@ -876,7 +895,7 @@ async function pressEnterOnAppleAuthField(page: Page, kind: "email" | "password"
     kind === "email"
       ? ["#account_name_text_field", 'input[type="email"]', 'input[name="accountName"]']
       : ["#password_text_field", 'input[type="password"]', 'input[name="password"]'];
-  for (const fr of [...appleAuthFrames(page), page.mainFrame(), ...page.frames()]) {
+  for (const fr of authActionFrames(page)) {
     for (const sel of sels) {
       const loc = fr.locator(sel).first();
       if ((await loc.count().catch(() => 0)) === 0) continue;
@@ -884,6 +903,14 @@ async function pressEnterOnAppleAuthField(page: Page, kind: "email" | "password"
       await page.keyboard.press("Enter").catch(() => {});
       return;
     }
+  }
+  for (const iframeSel of APPLE_AUTH_IFRAME_SELS) {
+    if ((await page.locator(iframeSel).count().catch(() => 0)) === 0) continue;
+    const loc = page.frameLocator(iframeSel).locator(sels.join(", ")).first();
+    if ((await loc.count().catch(() => 0)) === 0) continue;
+    await loc.focus().catch(() => {});
+    await page.keyboard.press("Enter").catch(() => {});
+    return;
   }
 }
 
@@ -894,16 +921,18 @@ async function signInAppleIdOnOrderPage(
 ): Promise<void> {
   log(`Apple ID 登入：${maskEmail(appleEmail)}`);
   await sleep(600);
+  const signInUrl = page.url();
   await writeStatus({
     phase: "apple_sign_in",
     message: "Apple ID 登入中…",
-    url: page.url(),
+    url: signInUrl,
   });
 
   let emailOk = false;
   for (let i = 0; i < 12; i++) {
     await throwIfStopped();
     await syncWindowFlags().catch(() => {});
+    await recoverIfLeftAppleSignIn(page, signInUrl);
     emailOk = await fillInAppleAuthFrame(page, "email", appleEmail);
     if (emailOk) break;
     await sleep(400);
@@ -917,6 +946,7 @@ async function signInAppleIdOnOrderPage(
   }
   log("已提交電郵，等左邊「繼續使用密碼登入」…");
   await sleep(900);
+  await recoverIfLeftAppleSignIn(page, signInUrl);
 
   const pwdDeadline = Date.now() + 50_000;
   let sawPassword = false;
@@ -924,13 +954,18 @@ async function signInAppleIdOnOrderPage(
   while (Date.now() < pwdDeadline) {
     await throwIfStopped();
     await syncWindowFlags().catch(() => {});
+    if (await recoverIfLeftAppleSignIn(page, signInUrl)) {
+      await fillInAppleAuthFrame(page, "email", appleEmail).catch(() => false);
+      await clickAppleAuthContinue(page).catch(() => false);
+      await sleep(600);
+      continue;
+    }
 
     if (await hasVisibleApplePasswordField(page)) {
       sawPassword = true;
       break;
     }
 
-    // 唔好再撳右邊 #sign-in；專門撳左邊／密碼掣
     const clicked =
       (await clickContinueWithPasswordFast(page)) || (await clickLeftAuthActionButton(page));
     if (clicked) {
@@ -942,6 +977,7 @@ async function signInAppleIdOnOrderPage(
         url: page.url(),
       });
       await sleep(700);
+      await recoverIfLeftAppleSignIn(page, signInUrl);
     } else {
       await sleep(400);
     }
@@ -949,6 +985,7 @@ async function signInAppleIdOnOrderPage(
 
   if (!sawPassword) {
     for (let i = 0; i < 8; i++) {
+      await recoverIfLeftAppleSignIn(page, signInUrl);
       await clickLeftAuthActionButton(page);
       await clickContinueWithPasswordFast(page);
       await sleep(500);
@@ -967,6 +1004,7 @@ async function signInAppleIdOnOrderPage(
   for (let round = 1; round <= 12; round++) {
     await throwIfStopped();
     await syncWindowFlags().catch(() => {});
+    await recoverIfLeftAppleSignIn(page, signInUrl);
     passOk = await fillInAppleAuthFrame(page, "password", applePassword);
     if (passOk) break;
     await clickContinueWithPasswordFast(page).catch(() => {});
@@ -979,18 +1017,22 @@ async function signInAppleIdOnOrderPage(
   await pressEnterOnAppleAuthField(page, "password");
   log("已提交密碼（右箭頭／繼續）");
 
-  // 確認離開 signIn，唔好假完成
   const leaveDeadline = Date.now() + 45_000;
   while (Date.now() < leaveDeadline) {
     await throwIfStopped();
     await syncWindowFlags().catch(() => {});
+    if (await recoverIfLeftAppleSignIn(page, signInUrl)) {
+      await fillInAppleAuthFrame(page, "password", applePassword).catch(() => false);
+      await clickAppleAuthContinue(page).catch(() => false);
+      await sleep(600);
+      continue;
+    }
     const url = page.url();
-    if (!/\/shop\/signIn/i.test(url)) {
+    if (!/\/shop\/signIn/i.test(url) && !isAppleMarketingHome(url)) {
       log(`Apple ID 登入後頁面：${url}`);
       await writeStatus({ phase: "apple_signed_in", message: "Apple ID 已登入", url });
       return;
     }
-    // 可能仲要撳一次繼續
     if (await hasVisibleApplePasswordField(page)) {
       await clickAppleAuthContinue(page).catch(() => {});
     } else {
@@ -998,8 +1040,8 @@ async function signInAppleIdOnOrderPage(
     }
     await sleep(600);
   }
-  if (/\/shop\/signIn/i.test(page.url())) {
-    throw new Error(`Apple ID 登入後仍停喺 signIn：${page.url()}`);
+  if (/\/shop\/signIn/i.test(page.url()) || isAppleMarketingHome(page.url())) {
+    throw new Error(`Apple ID 登入後仍停喺：${page.url()}`);
   }
 }
 
