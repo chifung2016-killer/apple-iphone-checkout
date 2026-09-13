@@ -1760,6 +1760,29 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
         ? `takeover\n${new Date().toISOString()}`
         : new Date().toISOString();
     await fs.writeFile(path.join(RUNTIME_DIR, flagName), payload, "utf8");
+    if (act === "show") {
+      try {
+        const stPath = path.join(RUNTIME_DIR, `status-${id}.json`);
+        const prev = JSON.parse(await fs.readFile(stPath, "utf8")) as Record<string, unknown>;
+        await fs.writeFile(
+          stPath,
+          JSON.stringify(
+            {
+              ...prev,
+              windowHidden: false,
+              windowState: "maximized",
+              message: "Open browser requested",
+              updatedAt: new Date().toISOString(),
+            },
+            null,
+            2
+          ),
+          "utf8"
+        );
+      } catch {
+        /* ignore */
+      }
+    }
     if (act === "close") {
       const t = addOrderTasks.get(id);
       if (t?.child) killProc(t.child);

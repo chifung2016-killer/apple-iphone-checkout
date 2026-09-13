@@ -142,73 +142,206 @@ async function sleep(ms: number) {
   }
 }
 
-async function maximizeBrowserWindow(page: Page, browser: Browser): Promise<void> {
+/** Windows：用 process tree 搵有 MainWindow 嘅 Chrome／Chromium 再還原／最大化 */
+function winRestoreBrowserWindow(browser: Browser): void {
+  if (process.platform !== "win32") return;
+  const proc = (browser as unknown as { process?: () => { pid?: number } | null }).process?.();
+  const pid = proc?.pid;
+  if (!pid) return;
+  const ps = `
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class W {
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h, int n);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+}
+'@ -ErrorAction SilentlyContinue
+$root = ${pid}
+$all = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+$queue = [System.Collections.Generic.Queue[int]]::new()
+$queue.Enqueue([int]$root)
+$seen = @{}
+while ($queue.Count -gt 0) {
+  $id = $queue.Dequeue()
+  if ($seen.ContainsKey($id)) { continue }
+  $seen[$id] = $true
+  $p = Get-Process -Id $id -ErrorAction SilentlyContinue
+  if ($p -and $p.MainWindowHandle -ne [IntPtr]::Zero) {
+    $h = $p.MainWindowHandle
+    if ([W]::IsIconic($h)) { [void][W]::ShowWindowAsync($h, 9) } # SW_RESTORE
+    [void][W]::ShowWindowAsync($h, 3) # SW_MAXIMIZE
+    [void][W]::SetForegroundWindow($h)
+  }
+  foreach ($c in @($all | Where-Object { $_.ParentProcessId -eq $id })) {
+    $queue.Enqueue([int]$c.ProcessId)
+  }
+}
+`.trim();
+  spawn("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], {
+    stdio: "ignore",
+    windowsHide: true,
+  });
+}
+
+function winMinimizeBrowserWindow(browser: Browser): void {
+  if (process.platform !== "win32") return;
+  const proc = (browser as unknown as { process?: () => { pid?: number } | null }).process?.();
+  const pid = proc?.pid;
+  if (!pid) return;
+  const ps = `
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class W {
+  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h, int n);
+}
+'@ -ErrorAction SilentlyContinue
+$root = ${pid}
+$all = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+$queue = [System.Collections.Generic.Queue[int]]::new()
+$queue.Enqueue([int]$root)
+$seen = @{}
+while ($queue.Count -gt 0) {
+  $id = $queue.Dequeue()
+  if ($seen.ContainsKey($id)) { continue }
+  $seen[$id] = $true
+  $p = Get-Process -Id $id -ErrorAction SilentlyContinue
+  if ($p -and $p.MainWindowHandle -ne [IntPtr]::Zero) {
+    [void][W]::ShowWindowAsync($p.MainWindowHandle, 6) # SW_MINIMIZE
+  }
+  foreach ($c in @($all | Where-Object { $_.ParentProcessId -eq $id })) {
+    $queue.Enqueue([int]$c.ProcessId)
+  }
+}
+`.trim();
+  spawn("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], {
+    stdio: "ignore",
+    windowsHide: true,
+  });
+}
+
+async function getPageWindowId(page: Page): Promise<number | null> {
   try {
     const cdp = await page.context().newCDPSession(page);
-    const { windowId } = (await cdp.send("Browser.getWindowForTarget")) as {
-      windowId: number;
-    };
-    await cdp.send("Browser.setWindowBounds", {
-      windowId,
-      bounds: { windowState: "normal" },
-    });
-    await cdp
-      .send("Browser.setWindowBounds", {
-        windowId,
-        bounds: { windowState: "maximized" },
-      })
-      .catch(() => {});
-    await cdp.detach().catch(() => {});
-  } catch {
-    /* ignore */
-  }
-  if (process.platform === "win32") {
-    const proc = (browser as unknown as { process?: () => { pid?: number } | null }).process?.();
-    const pid = proc?.pid;
-    if (pid) {
-      const ps = `Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class W{[DllImport("user32.dll")]public static extern bool SetForegroundWindow(IntPtr h);[DllImport("user32.dll")]public static extern bool ShowWindowAsync(IntPtr h,int n);}' -ErrorAction SilentlyContinue; $p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if($p -and $p.MainWindowHandle -ne 0){[void][W]::ShowWindowAsync($p.MainWindowHandle,3);[void][W]::SetForegroundWindow($p.MainWindowHandle)}`;
-      spawn("powershell", ["-NoProfile", "-Command", ps], {
-        stdio: "ignore",
-        windowsHide: true,
-      });
+    let windowId: number | undefined;
+    try {
+      const info = (await cdp.send("Target.getTargetInfo")) as {
+        targetInfo?: { targetId?: string };
+      };
+      const targetId = info?.targetInfo?.targetId;
+      if (targetId) {
+        const got = (await cdp.send("Browser.getWindowForTarget", { targetId })) as {
+          windowId?: number;
+        };
+        windowId = got.windowId;
+      }
+    } catch {
+      /* fallback */
     }
+    if (windowId == null) {
+      const got = (await cdp.send("Browser.getWindowForTarget")) as { windowId?: number };
+      windowId = got.windowId;
+    }
+    await cdp.detach().catch(() => {});
+    return windowId ?? null;
+  } catch {
+    return null;
   }
+}
+
+async function maximizeBrowserWindow(page: Page, browser: Browser): Promise<void> {
+  log("Open browser：還原／最大化視窗…");
+  try {
+    await page.bringToFront().catch(() => {});
+    const windowId = await getPageWindowId(page);
+    if (windowId != null) {
+      const cdp = await page.context().newCDPSession(page);
+      await cdp.send("Browser.setWindowBounds", {
+        windowId,
+        bounds: { windowState: "normal" },
+      });
+      await new Promise((r) => setTimeout(r, 120));
+      const screen = await page
+        .evaluate(() => ({
+          aw: Math.max(window.screen?.availWidth || 0, 1280),
+          ah: Math.max(window.screen?.availHeight || 0, 720),
+        }))
+        .catch(() => ({ aw: 1920, ah: 1080 }));
+      await cdp
+        .send("Browser.setWindowBounds", {
+          windowId,
+          bounds: {
+            left: 0,
+            top: 0,
+            width: screen.aw,
+            height: screen.ah,
+            windowState: "normal",
+          },
+        })
+        .catch(() => {});
+      await cdp
+        .send("Browser.setWindowBounds", {
+          windowId,
+          bounds: { windowState: "maximized" },
+        })
+        .catch(() => {});
+      await cdp.detach().catch(() => {});
+    } else {
+      log("Open browser：CDP 無 windowId，改用 Windows API");
+    }
+  } catch (err) {
+    log(`Open browser CDP 失敗：${err instanceof Error ? err.message : String(err)}`);
+  }
+  winRestoreBrowserWindow(browser);
+  await page.bringToFront().catch(() => {});
   windowHidden = false;
-  await writeStatus({ windowHidden: false, windowState: "maximized" });
+  await writeStatus({
+    windowHidden: false,
+    windowState: "maximized",
+    message: "browser opened",
+  });
 }
 
 /** 同 dashboard：視窗一開就 minimize 隱藏 */
 async function minimizeBrowserWindow(page: Page, browser: Browser): Promise<void> {
   try {
-    const cdp = await page.context().newCDPSession(page);
-    const { windowId } = (await cdp.send("Browser.getWindowForTarget")) as {
-      windowId: number;
-    };
-    await cdp.send("Browser.setWindowBounds", {
-      windowId,
-      bounds: { windowState: "minimized" },
-    });
-    await cdp.detach().catch(() => {});
+    const windowId = await getPageWindowId(page);
+    if (windowId != null) {
+      const cdp = await page.context().newCDPSession(page);
+      await cdp.send("Browser.setWindowBounds", {
+        windowId,
+        bounds: { windowState: "minimized" },
+      });
+      await cdp.detach().catch(() => {});
+    }
   } catch {
     /* ignore CDP fail */
   }
-  if (process.platform === "win32") {
-    const proc = (browser as unknown as { process?: () => { pid?: number } | null }).process?.();
-    const pid = proc?.pid;
-    if (pid) {
-      const ps = `Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class W{[DllImport("user32.dll")]public static extern bool ShowWindowAsync(IntPtr h,int n);}' -ErrorAction SilentlyContinue; $p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if($p -and $p.MainWindowHandle -ne 0){[void][W]::ShowWindowAsync($p.MainWindowHandle,6)}`;
-      spawn("powershell", ["-NoProfile", "-Command", ps], {
-        stdio: "ignore",
-        windowsHide: true,
-      });
-    }
-  }
+  winMinimizeBrowserWindow(browser);
   windowHidden = true;
   await writeStatus({ windowHidden: true, windowState: "minimized" });
 }
 
+let flagPollTimer: ReturnType<typeof setInterval> | null = null;
+
+function startFlagPoller(): void {
+  if (flagPollTimer) return;
+  flagPollTimer = setInterval(() => {
+    void syncWindowFlags().catch(() => {});
+  }, 350);
+}
+
+function stopFlagPoller(): void {
+  if (flagPollTimer) {
+    clearInterval(flagPollTimer);
+    flagPollTimer = null;
+  }
+}
+
 async function syncWindowFlags(): Promise<void> {
-  if (!activePage || !activeBrowser) return;
+  if (!activePage || activePage.isClosed() || !activeBrowser) return;
   if (await consumeFlag(SHOW_FLAG)) {
     await maximizeBrowserWindow(activePage, activeBrowser);
     log("Open browser：已顯示視窗");
@@ -534,19 +667,96 @@ async function isCaptchaChallengePage(page: Page): Promise<boolean> {
   return Boolean(hit);
 }
 
+async function tryOcrCaptchaText(imagePath: string): Promise<string | null> {
+  // 需要本機已裝 tesseract（PATH）。冇就返回 null → 人手填。
+  return await new Promise((resolve) => {
+    const child = spawn(
+      "tesseract",
+      [imagePath, "stdout", "-l", "eng", "--psm", "7"],
+      { windowsHide: true }
+    );
+    let out = "";
+    let err = "";
+    child.stdout?.on("data", (b) => {
+      out += b.toString("utf8");
+    });
+    child.stderr?.on("data", (b) => {
+      err += b.toString("utf8");
+    });
+    child.on("error", () => resolve(null));
+    child.on("exit", (code) => {
+      if (code !== 0) {
+        if (err) log(`tesseract：${err.trim().slice(0, 120)}`);
+        resolve(null);
+        return;
+      }
+      const text = out
+        .replace(/[^a-zA-Z0-9]/g, "")
+        .trim();
+      resolve(text.length >= 4 ? text : null);
+    });
+  });
+}
+
+/** 經典圖片驗證碼（數字+英文字母）盡力 OCR；reCAPTCHA／勾選式做唔到 */
+async function tryAutoSolveImageCaptcha(page: Page): Promise<boolean> {
+  const img = page
+    .locator(
+      'img#captchaimg, img[src*="captcha" i], img[alt*="captcha" i], #captcha img, form img[src*="Captcha" i]'
+    )
+    .first();
+  if ((await img.count().catch(() => 0)) === 0) {
+    log("驗證碼：唔係經典圖片 captcha（可能係 reCAPTCHA），要人手");
+    return false;
+  }
+  const tmp = path.join(ROOT, "runtime", `captcha-${SESSION_ID}.png`);
+  await fs.mkdir(path.dirname(tmp), { recursive: true }).catch(() => {});
+  await img.screenshot({ path: tmp }).catch(() => null);
+  const text = await tryOcrCaptchaText(tmp);
+  await fs.unlink(tmp).catch(() => {});
+  if (!text) {
+    log("驗證碼：OCR 失敗／未裝 tesseract — 請人手輸入");
+    return false;
+  }
+  log(`驗證碼：OCR 結果 ${text}，嘗試自動填入…`);
+  const input = page
+    .locator(
+      'input[name*="captcha" i], input[id*="captcha" i], input[aria-label*="captcha" i], input[type="text"]:visible'
+    )
+    .first();
+  if ((await input.count().catch(() => 0)) === 0) return false;
+  await input.click({ timeout: 2000 }).catch(() => {});
+  await input.fill(text, { timeout: 3000 }).catch(() => {});
+  await clickGoogleNext(page, "identifier").catch(() => {});
+  await page.keyboard.press("Enter").catch(() => {});
+  await sleep(1200);
+  return !(await isCaptchaChallengePage(page));
+}
+
 async function waitForManualCaptcha(
   page: Page,
   browser: Browser
 ): Promise<void> {
   if (!(await isCaptchaChallengePage(page))) return;
-  log("Google 要輸入數字+英文字母驗證碼 — 已開瀏覽器，請人手輸入後撳 Next；或撳 Continue");
+  log("Google 要輸入數字+英文字母驗證碼");
   await maximizeBrowserWindow(page, browser);
   await writeStatus({
     phase: "waiting_captcha",
-    message: "請輸入 Google 畫面驗證碼（數字+英文字母），完成後可撳 Continue",
+    message: "嘗試自動 OCR／請人手輸入驗證碼，完成後可撳 Continue",
     windowHidden: false,
   });
 
+  // 先試自動 OCR（有 tesseract 先得）
+  try {
+    if (await tryAutoSolveImageCaptcha(page)) {
+      log("驗證碼：自動填入成功");
+      return;
+    }
+  } catch (err) {
+    log(`驗證碼自動填入失敗：${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  log("請人手輸入驗證碼後撳 Next；或撳 Continue");
   const deadline = Date.now() + 15 * 60_000;
   while (Date.now() < deadline) {
     await throwIfStopped();
@@ -559,7 +769,6 @@ async function waitForManualCaptcha(
       return;
     }
     if (!(await isCaptchaChallengePage(page))) {
-      // 可能去咗密碼頁或下一步
       log("已離開驗證碼頁");
       return;
     }
@@ -932,6 +1141,7 @@ async function processOneAccount(
   const page = await context.newPage();
   activePage = page;
   activeBrowser = browser;
+  startFlagPoller();
   await minimizeBrowserWindow(page, browser);
   log("瀏覽器已隱藏（minimized）");
 
@@ -1016,6 +1226,7 @@ async function main() {
 
   const browser = await launchBrowser();
   activeBrowser = browser;
+  startFlagPoller();
 
   try {
     await processOneAccount(browser, account, cfg.appleEmail, cfg.applePassword);
@@ -1036,6 +1247,7 @@ async function main() {
       }
     }
   } finally {
+    stopFlagPoller();
     await browser.close().catch(() => {});
     activeBrowser = null;
     activePage = null;
