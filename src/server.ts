@@ -294,6 +294,7 @@ async function snapshotAddOrderTasks() {
       url: st?.url || "",
       windowHidden: st?.windowHidden !== false,
       keepOpen: st?.keepOpen === true,
+      shipping: (st?.shipping as Record<string, unknown> | undefined) || null,
       logs: t.logs.slice(-80).map(redactSecrets),
     });
   }

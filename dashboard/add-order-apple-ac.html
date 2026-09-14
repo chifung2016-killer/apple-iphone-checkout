@@ -155,6 +155,16 @@
     .phase-pill.done { background: color-mix(in srgb, var(--ok) 40%, var(--field)); color: #062816; border-color: transparent; }
     .task-meta { font-size: 0.85rem; color: var(--muted); margin-bottom: 10px; }
     .task-meta:last-child { margin-bottom: 0; }
+    .shipping-block {
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px dashed var(--line);
+      display: grid;
+      gap: 3px;
+      color: var(--text);
+      font-size: 0.84rem;
+    }
+    .shipping-block b { color: var(--muted); font-weight: 600; }
     .task-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
     .account-list {
@@ -475,6 +485,24 @@
             <div class="task-meta">
               <div><b>Gmail</b> ${gmailLabel}</div>
               <div><b>Order</b> ${esc(t.orderNumber || "—")}</div>
+              ${
+                finishedCard
+                  ? (() => {
+                      const s = t.shipping || {};
+                      const firstName = s.firstName || "Chi Fung";
+                      const lastName = s.lastName || "Leung";
+                      const area = s.areaStreet || "37 ko shing steet, sai ying pun";
+                      const building = s.building || "11b, tai fat building";
+                      return `<div class="shipping-block">
+                  <div><b>送貨資料</b></div>
+                  <div>名字：${esc(firstName)}</div>
+                  <div>姓名：${esc(lastName)}</div>
+                  <div>區域：${esc(area)}</div>
+                  <div>屋苑或大廈：${esc(building)}</div>
+                </div>`;
+                    })()
+                  : ""
+              }
               <div><b>Status</b> ${esc(t.message || t.phase || "—")}</div>
             </div>
             ${actions}

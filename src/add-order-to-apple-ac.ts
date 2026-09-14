@@ -2545,6 +2545,23 @@ const ORDER_SHIPPING_EDIT = {
   building: "11b, tai fat building", // 屋苑或大廈
 } as const;
 
+function shippingStatusFields() {
+  return {
+    shipping: {
+      firstName: ORDER_SHIPPING_EDIT.firstName,
+      lastName: ORDER_SHIPPING_EDIT.lastName,
+      areaStreet: ORDER_SHIPPING_EDIT.areaStreet,
+      building: ORDER_SHIPPING_EDIT.building,
+      labels: {
+        firstName: "名字",
+        lastName: "姓名",
+        areaStreet: "區域",
+        building: "屋苑或大廈",
+      },
+    },
+  };
+}
+
 async function fillLabeledField(
   page: Page,
   labels: Array<string | RegExp>,
@@ -3049,6 +3066,7 @@ async function editOrderShippingAddress(page: Page): Promise<void> {
     phase: "shipping_saved",
     message: "送貨地址已儲存",
     url: page.url(),
+    ...shippingStatusFields(),
   });
 }
 
@@ -3522,6 +3540,7 @@ async function processOneAccount(
             orderNumber,
             email: account.email,
             emailMasked: maskEmail(account.email),
+            ...shippingStatusFields(),
             windowHidden: !userKeepBrowserOpen,
             keepOpen: userKeepBrowserOpen,
           });
@@ -3540,6 +3559,7 @@ async function processOneAccount(
           orderNumber,
           email: account.email,
           emailMasked: maskEmail(account.email),
+          ...shippingStatusFields(),
           windowHidden: !userKeepBrowserOpen,
           keepOpen: userKeepBrowserOpen,
         });
@@ -3631,6 +3651,7 @@ async function processOneAccount(
       orderNumber,
       email: account.email,
       emailMasked: maskEmail(account.email),
+      ...shippingStatusFields(),
       windowHidden: !userKeepBrowserOpen,
       keepOpen: userKeepBrowserOpen,
     });
@@ -3694,6 +3715,7 @@ async function processOneAccount(
         orderNumber,
         email: account.email,
         emailMasked: maskEmail(account.email),
+        ...shippingStatusFields(),
       });
     } catch (err) {
       if (err instanceof CloseRequestedError) throw err;
