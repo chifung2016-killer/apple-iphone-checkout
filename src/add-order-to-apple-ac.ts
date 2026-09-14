@@ -2635,184 +2635,228 @@ async function editOrderShippingAddress(page: Page): Promise<void> {
 
   await sleep(500);
 
-  // 喺「送貨：／標準運送／梁 Jason／Hennessy…」區塊撳有底線嘅「編輯」連結
-  const clickedEdit = await page
-    .evaluate(() => {
-      const norm = (s: string) => (s || "").replace(/[\s\u00a0\u200b\u200c\u200d\ufeff]+/g, " ").trim();
-      const compact = (s: string) => norm(s).replace(/\s+/g, "");
-
-      const isEditLabel = (el: HTMLElement): boolean => {
-        const t = compact(
-          `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""}`
-        );
-        return t === "編輯" || t === "Edit";
-      };
-
-      const hasUnderline = (el: HTMLElement): boolean => {
-        const st = window.getComputedStyle(el);
-        const td = `${st.textDecorationLine || ""} ${st.textDecoration || ""}`.toLowerCase();
-        if (td.includes("underline")) return true;
-        // Apple 連結有時 underline 喺偽元素／子 span
-        for (const child of Array.from(el.querySelectorAll("*")).slice(0, 6) as HTMLElement[]) {
-          const cs = window.getComputedStyle(child);
-          const ctd = `${cs.textDecorationLine || ""} ${cs.textDecoration || ""}`.toLowerCase();
-          if (ctd.includes("underline")) return true;
-        }
-        return el.tagName === "A" || el.getAttribute("role") === "link";
-      };
-
-      const scoreBlock = (text: string): number => {
-        const t = norm(text).slice(0, 900);
-        let score = 0;
-        if (/送貨\s*[:：]/.test(t) || t.includes("送貨：") || t.includes("送貨:")) score += 40;
-        if (t.includes("標準運送")) score += 50;
-        if (/44\s*Hennessy|Hennessy\s*Road|軒尼詩/i.test(t)) score += 30;
-        if (/大廈\s*6\s*座|大廈6座|17\s*樓|11\s*室/.test(t)) score += 20;
-        if (/梁\s*Jason|梁Jason|Jason/i.test(t)) score += 20;
-        if (/•{2,}\s*07|••••••07|••07/.test(t)) score += 15;
-        if (compact(t).includes("編輯") || /\bEdit\b/.test(t)) score += 15;
-        return score;
-      };
-
-      type Cand = { el: HTMLElement; score: number; why: string };
-      const cands: Cand[] = [];
-
-      const blocks = Array.from(
-        document.querySelectorAll("section, article, li, div, tr, td, as-order-detail, as-shipping")
-      ) as HTMLElement[];
-      let best: HTMLElement | null = null;
-      let bestScore = 0;
-      for (const el of blocks) {
-        if (el.querySelectorAll("*").length > 500) continue;
-        const score = scoreBlock(el.innerText || "");
-        if (score > bestScore && score >= 80) {
-          bestScore = score;
-          best = el;
-        }
-      }
-
-      const collectEdits = (root: ParentNode | null, base: number, why: string) => {
-        if (!root) return;
-        for (const el of Array.from(root.querySelectorAll("a, button, [role='button'], [role='link'], span, u")) as HTMLElement[]) {
-          if (el.closest("#globalnav, header, nav, footer")) continue;
-          if (!isEditLabel(el)) continue;
-          // 只要淨係「編輯」兩個字（唔好整段文字）
-          const visible = compact(el.innerText || "");
-          if (visible !== "編輯" && visible !== "Edit") continue;
-          let s = base;
-          if (el.tagName === "A") s += 40;
-          if (hasUnderline(el)) s += 35;
-          if (el.closest("a")) s += 20;
-          cands.push({ el: (el.closest("a") as HTMLElement) || el, score: s, why });
-        }
-      };
-
-      if (best) {
-        collectEdits(best, bestScore + 100, "shipping-block");
-        let p: HTMLElement | null = best.parentElement;
-        for (let i = 0; i < 4 && p; i++) {
-          collectEdits(p, bestScore + 60 - i * 10, `parent-${i}`);
-          p = p.parentElement;
-        }
-      }
-
-      // 「標準運送」錨點附近
-      for (const el of Array.from(document.querySelectorAll("body *")) as HTMLElement[]) {
-        const t = compact(el.childNodes.length ? Array.from(el.childNodes).map((n) => (n.nodeType === 3 ? n.textContent : "")).join("") : el.innerText || "");
-        const own = compact(
-          Array.from(el.childNodes)
-            .filter((n) => n.nodeType === 3)
-            .map((n) => n.textContent || "")
-            .join("")
-        );
-        if (own !== "標準運送" && compact(el.innerText || "") !== "標準運送") continue;
-        if (compact(el.innerText || "").length > 30 && own !== "標準運送") continue;
-        let p: HTMLElement | null = el;
-        for (let d = 0; d < 10 && p; d++) {
-          collectEdits(p, 90 - d * 5, "near-標準運送");
-          p = p.parentElement;
-        }
-      }
-
-      // 全頁：有底線嘅「編輯」a，且祖先含送貨關鍵字
-      for (const el of Array.from(document.querySelectorAll("a")) as HTMLAnchorElement[]) {
-        if (!isEditLabel(el)) continue;
-        if (compact(el.innerText || "") !== "編輯" && compact(el.innerText || "") !== "Edit") continue;
-        let p: HTMLElement | null = el.parentElement;
-        let ctx = "";
-        for (let i = 0; i < 8 && p; i++) {
-          ctx = p.innerText || "";
-          const sc = scoreBlock(ctx);
-          if (sc >= 80) {
-            collectEdits(el.parentElement, sc + (hasUnderline(el) ? 50 : 20), "anchor-in-shipping");
-            break;
-          }
-          p = p.parentElement;
-        }
-      }
-
-      cands.sort((a, b) => b.score - a.score);
-      const top = cands[0];
-      if (!top) return { ok: false, how: "none", score: bestScore, n: 0 };
-
-      const target = top.el;
-      target.scrollIntoView({ block: "center", inline: "nearest" });
-      // 優先真實 click；若係 span 包住就撳外層 a
-      const clickable = (target.closest("a") as HTMLElement) || target;
-      clickable.click();
-      return { ok: true, how: top.why, score: top.score, n: cands.length, tag: clickable.tagName };
-    })
-    .catch(() => ({ ok: false, how: "eval-fail", score: 0, n: 0, tag: "" }));
-
-  if (!clickedEdit.ok) {
-    // Playwright：送貨區塊內有底線嘅「編輯」link
-    const shippingScope = page
-      .locator("section, article, li, div")
-      .filter({ hasText: /標準運送/ })
-      .filter({ hasText: /送貨\s*[:：]|送貨/ })
-      .filter({ hasText: /Hennessy|軒尼詩|梁|Jason|大廈6座|大廈\s*6/i })
-      .first();
-    let target = shippingScope.locator("a").filter({ hasText: /^[\s]*編輯[\s]*$/ }).first();
-    if ((await target.count().catch(() => 0)) === 0) {
-      target = shippingScope.getByRole("link", { name: /^編輯$|^Edit$/i }).first();
-    }
-    if ((await target.count().catch(() => 0)) === 0) {
-      target = page
-        .getByText(/標準運送/)
-        .first()
-        .locator(
-          "xpath=ancestor::*[.//text()[contains(.,'送貨')]][1]//a[normalize-space()='編輯' or normalize-space()='Edit']"
-        )
-        .first();
-    }
-    if ((await target.count().catch(() => 0)) === 0) {
-      throw new Error("揾唔到「送貨／標準運送」底下有底線嘅「編輯」連結");
-    }
-    await target.scrollIntoViewIfNeeded().catch(() => {});
-    await target.click({ force: true, timeout: 4000 });
-    log("已撳送貨區塊底線「編輯」（Playwright link）");
-  } else {
-    log(
-      `已撳送貨底線「編輯」（${clickedEdit.how}·score=${clickedEdit.score}·${(clickedEdit as { tag?: string }).tag || "A"}·n=${(clickedEdit as { n?: number }).n || 0}）`
-    );
-  }
-  await sleep(800);
-
-  const formDeadline = Date.now() + 20_000;
-  while (Date.now() < formDeadline) {
-    await throwIfStopped();
-    const ready =
+  /** 送貨區塊底線「編輯」——重試直至表單出現 */
+  const shippingFormVisible = async (): Promise<boolean> => {
+    return (
       (await page
-        .getByLabel(/名字|姓氏|姓名|First name|Last name/i)
+        .getByLabel(/名字|姓氏|姓名|First name|Last name|區域|屋苑/i)
         .first()
         .isVisible()
         .catch(() => false)) ||
       (await page
-        .locator('input[id*="firstName" i], input[id*="lastName" i]')
+        .locator(
+          'input[id*="firstName" i], input[id*="lastName" i], input[id*="street" i], input[name*="firstName" i]'
+        )
         .first()
         .isVisible()
-        .catch(() => false));
-    if (ready) break;
+        .catch(() => false)) ||
+      (await page.getByRole("button", { name: /^儲存$|^Save$/i }).first().isVisible().catch(() => false))
+    );
+  };
+
+  const tryClickShippingEditOnce = async (
+    attempt: number
+  ): Promise<{ ok: boolean; how: string }> => {
+    // A) DOM 掃描：送貨關鍵字區塊 + 底線「編輯」a
+    const dom = await page
+      .evaluate((attemptNo) => {
+        const norm = (s: string) => (s || "").replace(/[\s\u00a0\u200b\u200c\u200d\ufeff]+/g, " ").trim();
+        const compact = (s: string) => norm(s).replace(/\s+/g, "");
+
+        const scoreBlock = (text: string): number => {
+          const t = norm(text).slice(0, 1200);
+          let score = 0;
+          if (/送貨\s*[:：]/.test(t) || t.includes("送貨：") || t.includes("送貨:")) score += 40;
+          if (t.includes("標準運送")) score += 50;
+          if (/44\s*Hennessy|Hennessy\s*Road|軒尼詩/i.test(t)) score += 30;
+          if (/大廈\s*6\s*座|大廈6座|17\s*樓|11\s*室/.test(t)) score += 20;
+          if (/梁\s*Jason|梁Jason|\bJason\b/i.test(t)) score += 20;
+          if (/•{2,}\s*07|••••••07|••07|\*{2,}07/.test(t)) score += 15;
+          if (compact(t).includes("編輯") || /\bEdit\b/.test(t)) score += 10;
+          return score;
+        };
+
+        const isEditOnly = (el: Element): boolean => {
+          const h = el as HTMLElement;
+          const t = compact(`${h.innerText || ""} ${h.getAttribute("aria-label") || ""}`);
+          return t === "編輯" || t === "Edit";
+        };
+
+        const underlineBoost = (el: HTMLElement): number => {
+          let boost = 0;
+          if (el.tagName === "A") boost += 40;
+          const st = window.getComputedStyle(el);
+          const td = `${st.textDecorationLine || ""} ${st.textDecoration || ""}`.toLowerCase();
+          if (td.includes("underline")) boost += 40;
+          if (/link|as-buttonlink|more|edit/i.test(el.className || "")) boost += 25;
+          return boost;
+        };
+
+        type Cand = { el: HTMLElement; score: number; why: string };
+        const cands: Cand[] = [];
+        const seen = new Set<HTMLElement>();
+
+        const addCand = (el: HTMLElement, score: number, why: string) => {
+          const clickable = (el.closest("a") as HTMLElement) || el;
+          if (seen.has(clickable)) return;
+          seen.add(clickable);
+          cands.push({ el: clickable, score, why });
+        };
+
+        // 所有可能係「編輯」嘅可點元素
+        const editNodes = Array.from(
+          document.querySelectorAll("a, button, [role='link'], [role='button'], span, u, div")
+        ) as HTMLElement[];
+        for (const el of editNodes) {
+          if (el.closest("#globalnav, header, nav, footer")) continue;
+          if (!isEditOnly(el)) continue;
+          // 祖先上下文分數
+          let ctxScore = 0;
+          let p: HTMLElement | null = el;
+          for (let i = 0; i < 10 && p; i++) {
+            ctxScore = Math.max(ctxScore, scoreBlock(p.innerText || ""));
+            p = p.parentElement;
+          }
+          // 放寬：有標準運送+送貨就夠；有地址字更好
+          if (ctxScore < 50 && attemptNo > 3) {
+            // 後期重試放得更寬：只要頁面有標準運送就接受附近編輯
+            const pageHas = scoreBlock(document.body.innerText || "");
+            if (pageHas < 90) continue;
+            ctxScore = Math.max(ctxScore, 55);
+          } else if (ctxScore < 70) {
+            continue;
+          }
+          addCand(el, ctxScore + underlineBoost(el), `ctx-${ctxScore}`);
+        }
+
+        cands.sort((a, b) => b.score - a.score);
+        const top = cands[attemptNo % Math.max(1, Math.min(cands.length, 5))] || cands[0];
+        if (!top) {
+          return {
+            ok: false,
+            how: "none",
+            score: 0,
+            n: 0,
+            sample: Array.from(document.querySelectorAll("a"))
+              .slice(0, 12)
+              .map((a) => compact(a.innerText || "").slice(0, 20)),
+          };
+        }
+
+        top.el.scrollIntoView({ block: "center", inline: "nearest" });
+        try {
+          top.el.focus();
+        } catch {
+          /* ignore */
+        }
+        top.el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+        top.el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+        top.el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+        top.el.click();
+        return {
+          ok: true,
+          how: top.why,
+          score: top.score,
+          n: cands.length,
+          tag: top.el.tagName,
+          href: (top.el as HTMLAnchorElement).href || "",
+        };
+      }, attempt)
+      .catch(() => ({ ok: false, how: "eval-fail", score: 0, n: 0, sample: [] as string[], tag: "", href: "" }));
+
+    if (dom.ok) {
+      log(`嘗試撳送貨「編輯」（DOM ${attempt}：${dom.how}·${dom.score}·n=${dom.n}）`);
+      return { ok: true, how: `dom:${dom.how}` };
+    }
+
+    // B) Playwright locators
+    const scopes = [
+      page
+        .locator("section, article, li, div")
+        .filter({ hasText: /標準運送/ })
+        .filter({ hasText: /送貨/ })
+        .filter({ hasText: /Hennessy|軒尼詩|梁|Jason|大廈/i }),
+      page.locator("section, article, li, div").filter({ hasText: /標準運送/ }).filter({ hasText: /送貨/ }),
+      page.locator("body"),
+    ];
+    for (const scope of scopes) {
+      const locators = [
+        scope.locator("a").filter({ hasText: /^[\s]*編輯[\s]*$/ }).first(),
+        scope.getByRole("link", { name: /^編輯$|^Edit$/i }).first(),
+        scope.getByText(/^編輯$/, { exact: true }).first(),
+        scope.locator("a.as-buttonlink, a[class*='link'], a[class*='more']").filter({ hasText: /編輯/ }).first(),
+      ];
+      for (const loc of locators) {
+        if ((await loc.count().catch(() => 0)) === 0) continue;
+        if (!(await loc.isVisible().catch(() => false))) continue;
+        await loc.scrollIntoViewIfNeeded().catch(() => {});
+        const box = await loc.boundingBox().catch(() => null);
+        if (box) {
+          await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2).catch(() => {});
+        }
+        await loc.click({ force: true, timeout: 2500 }).catch(() => {});
+        log(`嘗試撳送貨「編輯」（PW ${attempt}）`);
+        return { ok: true, how: "playwright" };
+      }
+    }
+
+    if (dom.sample?.length) {
+      log(`未見送貨「編輯」（${attempt}）sample links=${JSON.stringify(dom.sample)}`);
+    }
+    return { ok: false, how: "miss" };
+  };
+
+  const editClickDeadline = Date.now() + 90_000;
+  let editOpened = await shippingFormVisible();
+  let attempt = 0;
+  while (!editOpened && Date.now() < editClickDeadline) {
+    await throwIfStopped();
+    await syncWindowFlags().catch(() => {});
+    if (activeBrowser) {
+      await maximizeBrowserWindow(page, activeBrowser).catch(() => {});
+    }
+    attempt += 1;
+    await writeStatus({
+      phase: "edit_shipping",
+      message: `重試撳送貨「編輯」 ${attempt}…`,
+      url: page.url(),
+    });
+
+    // 滾動露出送貨區塊
+    await page
+      .getByText(/標準運送|送貨\s*[:：]/i)
+      .first()
+      .scrollIntoViewIfNeeded()
+      .catch(() => {});
+    await page.evaluate(() => window.scrollBy(0, attempt % 2 === 0 ? 120 : -80)).catch(() => {});
+
+    const hit = await tryClickShippingEditOnce(attempt);
+    await sleep(700);
+    editOpened = await shippingFormVisible();
+    if (editOpened) {
+      log(`已打開送貨編輯表單（第 ${attempt} 次·${hit.how}）`);
+      break;
+    }
+    // 有時 click 有反應但慢
+    if (hit.ok) {
+      await sleep(900);
+      editOpened = await shippingFormVisible();
+      if (editOpened) {
+        log(`已打開送貨編輯表單（延遲確認·第 ${attempt} 次）`);
+        break;
+      }
+    }
+    await sleep(400 + Math.min(800, attempt * 40));
+  }
+
+  if (!editOpened) {
+    throw new Error("重試後仍撳唔到「送貨／標準運送」底下有底線嘅「編輯」連結");
+  }
+
+  const formDeadline = Date.now() + 15_000;
+  while (Date.now() < formDeadline) {
+    await throwIfStopped();
+    if (await shippingFormVisible()) break;
     await sleep(300);
   }
 
@@ -3481,9 +3525,12 @@ async function processOneAccount(
     log(`完成：${maskEmail(account.email)} · ${orderNumber} → Apple ID + 送貨已儲存`);
   };
 
+  const orderNumber = String(account.orderNumber || "").trim();
+  let shippingEditAutoRetries = 0;
   for (;;) {
     try {
       await runSteps();
+      shippingEditAutoRetries = 0;
       break;
     } catch (err) {
       if (err instanceof CloseRequestedError) throw err;
@@ -3492,16 +3539,32 @@ async function processOneAccount(
         if (next === "close") throw new CloseRequestedError();
         continue;
       }
-      // 其他錯誤：唔關瀏覽器，等 Continue 再試／Close 先關
-      log(`步驟錯誤：${err instanceof Error ? err.message : String(err)}`);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      log(`步驟錯誤：${errMsg}`);
       await writeStatus({
         phase: "error",
-        message: err instanceof Error ? err.message : String(err),
+        message: errMsg,
         windowHidden,
       });
-      // 唔自動開窗；要睇就撳 Open browser
+
+      const onDetail = /\/shop\/order\/detail\//i.test(page.url());
+      const shippingEditFail = /編輯|送貨|shipping|儲存|姓名|名字|區域|屋苑/i.test(errMsg);
+      if (onDetail && shippingEditFail && shippingEditAutoRetries < 6) {
+        shippingEditAutoRetries += 1;
+        log(`送貨「編輯」自動重試 ${shippingEditAutoRetries}/6…`);
+        await writeStatus({
+          phase: "edit_shipping",
+          message: `自動重試撳「編輯」 ${shippingEditAutoRetries}/6`,
+          url: page.url(),
+          orderNumber,
+        });
+        await sleep(1000);
+        continue;
+      }
+
       const next = await holdBrowserUntilClose("出錯後保持瀏覽器開啟 — Continue 重試／Close 關閉");
       if (next === "close") throw new CloseRequestedError();
+      shippingEditAutoRetries = 0;
       continue;
     }
   }
