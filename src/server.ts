@@ -1991,11 +1991,6 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
         await fs.unlink(path.join(RUNTIME_DIR, f)).catch(() => {});
       }
 
-      // Start 即刻 keep-open：Gmail 虛擬列表喺 minimized 時 tr.zA 會空，開唔到信
-      const startTs = new Date().toISOString();
-      await fs.writeFile(path.join(RUNTIME_DIR, `keepopen-${id}.flag`), startTs, "utf8");
-      await fs.writeFile(path.join(RUNTIME_DIR, `show-${id}.flag`), startTs, "utf8");
-
       const proc = spawn(process.execPath, [tsxCli, script], {
         cwd: ROOT,
         env: envForCheckoutChild({
