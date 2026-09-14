@@ -3178,11 +3178,33 @@ async function waitForAppleGuestOrderPage(page: Page): Promise<void> {
     await throwIfStopped();
     await syncWindowFlags().catch(() => {});
     const url = page.url();
+
+    // 已喺 guest／detail：等「登入」掣出現先走（唔好淨睇 URL）
     if (isAppleGuestOrderUrl(url) || /\/shop\/order\/detail\//i.test(url)) {
-      await sleep(300);
-      return;
+      const loginReady = await page
+        .locator(
+          [
+            '[data-autom="signin_orderpage"]',
+            'a[href*="signIn"]',
+            'a[href*="/shop/signIn"]',
+          ].join(", ")
+        )
+        .or(page.getByRole("link", { name: /^登入$/ }))
+        .or(page.getByRole("button", { name: /^登入$/ }))
+        .or(page.getByText(/加入至\s*Apple\s*ID|Add to Apple ID/i))
+        .first()
+        .isVisible()
+        .catch(() => false);
+      if (loginReady || /\/shop\/order\/detail\//i.test(url)) {
+        await sleep(300);
+        return;
+      }
+      // guest URL 已到但掣未出 — 繼續等
+      await sleep(400);
+      continue;
     }
-    // 訪客頁而家用「登入」／signin_orderpage；舊頁用「加入至 Apple ID」
+
+    // 未到 guest：用掣出現判斷
     const ready = await page
       .locator('[data-autom="signin_orderpage"]')
       .or(page.getByRole("link", { name: /^登入$/ }))
@@ -3223,11 +3245,11 @@ async function waitForAppleGuestOrderPage(page: Page): Promise<void> {
 }
 
 /**
- * 訪客／訂單頁：撳「加入至 Apple ID」或新版「登入」(data-autom=signin_orderpage)
+ * 訪客／訂單頁：撳「登入」→ 必須去到 /shop/signIn/…
+ * （舊版「加入至 Apple ID」一樣）
  */
 async function clickAddToAppleIdOnce(page: Page): Promise<void> {
   log("撳訂單頁「登入／加入至 Apple ID」…");
-  await sleep(200);
 
   // 已喺 signIn／idmsa：唔使再撳
   if (/\/shop\/signIn|idmsa\.apple\.com/i.test(page.url())) {
@@ -3247,75 +3269,212 @@ async function clickAddToAppleIdOnce(page: Page): Promise<void> {
     }
   }
 
-  const tryClick = async (loc: Locator, label: string): Promise<boolean> => {
-    const el = loc.first();
-    if (!(await el.count().catch(() => 0))) return false;
-    if (!(await el.isVisible().catch(() => false))) return false;
-    await el.scrollIntoViewIfNeeded().catch(() => {});
-    await el.click({ force: true, timeout: 4000 }).catch(async () => {
-      await el.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
-    });
-    log(`已撳：${label}`);
-    return true;
+  const onSignIn = () =>
+    /\/shop\/signIn|idmsa\.apple\.com/i.test(page.url()) ||
+    appleAuthFrames(page).length > 0;
+
+  /** 從 DOM 抽「登入」掣／href（避開頂欄） */
+  const findLoginTarget = async (): Promise<{
+    found: boolean;
+    how: string;
+    href: string;
+    text: string;
+  }> => {
+    return page
+      .evaluate(() => {
+        const norm = (s: string) => (s || "").replace(/[\s\u00a0\u200b\ufeff]+/g, "");
+        const inNav = (el: Element) =>
+          !!(
+            el.closest("#globalnav, nav, header, .ac-gn-content, [data-analytics-region='global nav']") ||
+            el.id?.toLowerCase().includes("globalnav")
+          );
+
+        // 1) data-autom
+        const autom = document.querySelector(
+          '[data-autom="signin_orderpage"], [data-autom*="signin" i][data-autom*="order" i]'
+        ) as HTMLAnchorElement | HTMLButtonElement | null;
+        if (autom && !inNav(autom)) {
+          return {
+            found: true,
+            how: "data-autom",
+            href: (autom as HTMLAnchorElement).href || autom.getAttribute("href") || "",
+            text: norm(autom.innerText || autom.getAttribute("aria-label") || ""),
+          };
+        }
+
+        // 2) href 含 signIn（訂單頁主 CTA）
+        for (const a of Array.from(document.querySelectorAll("a[href]")) as HTMLAnchorElement[]) {
+          if (inNav(a)) continue;
+          const href = a.href || a.getAttribute("href") || "";
+          if (!/\/shop\/signIn|signIn\/orders|idmsa\.apple\.com/i.test(href)) continue;
+          const t = norm(a.innerText || a.getAttribute("aria-label") || "");
+          // 優先短「登入」／Add to Apple ID
+          if (
+            t === "登入" ||
+            t === "SignIn" ||
+            t === "Signin" ||
+            /加入至AppleID|AddtoAppleID|登入至你的AppleID|SignInwithAppleID/i.test(t) ||
+            t.length <= 24
+          ) {
+            return { found: true, how: "href-signIn", href, text: t };
+          }
+        }
+
+        // 3) 文字正好係「登入」
+        for (const el of Array.from(
+          document.querySelectorAll("a, button, [role='button'], input[type='submit'], span, div")
+        ) as HTMLElement[]) {
+          if (inNav(el)) continue;
+          const t = norm(
+            `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${(el as HTMLInputElement).value || ""}`
+          );
+          if (t !== "登入" && t !== "SignIn" && t !== "Signin" && t !== "Sign In") continue;
+          const clickable =
+            (el.closest("a, button, [role='button']") as HTMLElement | null) || el;
+          if (inNav(clickable)) continue;
+          const href =
+            (clickable as HTMLAnchorElement).href ||
+            clickable.getAttribute("href") ||
+            "";
+          return { found: true, how: "text-登入", href, text: t };
+        }
+
+        // 4) 加入至 Apple ID
+        for (const el of Array.from(
+          document.querySelectorAll("a, button, [role='button']")
+        ) as HTMLElement[]) {
+          if (inNav(el)) continue;
+          const t = norm(
+            `${el.innerText || ""} ${el.getAttribute("aria-label") || ""}`
+          );
+          if (!/加入至AppleID|AddtoAppleID|登入至你的AppleID/i.test(t)) continue;
+          return {
+            found: true,
+            how: "add-to-apple-id",
+            href: (el as HTMLAnchorElement).href || el.getAttribute("href") || "",
+            text: t,
+          };
+        }
+
+        return { found: false, how: "", href: "", text: "" };
+      })
+      .catch(() => ({ found: false, how: "", href: "", text: "" }));
   };
 
-  // 1) 新版訪客頁：data-autom="signin_orderpage"（文字「登入」）
-  if (await tryClick(page.locator('a[data-autom="signin_orderpage"], button[data-autom="signin_orderpage"]'), "signin_orderpage（登入）")) {
-    await sleep(500);
-    return;
+  // 等掣出現（訪客頁有時慢）
+  const waitDeadline = Date.now() + 20_000;
+  let target = await findLoginTarget();
+  while (!target.found && Date.now() < waitDeadline) {
+    await throwIfStopped();
+    await sleep(400);
+    target = await findLoginTarget();
+  }
+  if (!target.found) {
+    // 診斷
+    const diag = await page
+      .evaluate(() => {
+        const sample = Array.from(document.querySelectorAll("a, button"))
+          .slice(0, 40)
+          .map((el) => {
+            const h = el as HTMLAnchorElement;
+            return {
+              tag: el.tagName,
+              autom: el.getAttribute("data-autom") || "",
+              href: (h.href || "").slice(0, 80),
+              text: (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 40),
+            };
+          });
+        return { url: location.href, sample };
+      })
+      .catch(() => ({ url: page.url(), sample: [] }));
+    log(`登入掣診斷：${JSON.stringify(diag).slice(0, 800)}`);
+    throw new Error("揾唔到「登入／加入至 Apple ID」（訪客訂單頁）");
+  }
+  log(`定位登入掣：${target.how} text="${target.text}" href=${(target.href || "").slice(0, 120)}`);
+
+  // 多策略撳，直到去到 signIn
+  const clickDeadline = Date.now() + 25_000;
+  let attempt = 0;
+  while (Date.now() < clickDeadline && !onSignIn()) {
+    await throwIfStopped();
+    attempt += 1;
+
+    // A) Playwright selectors
+    const locs = [
+      page.locator('[data-autom="signin_orderpage"]').first(),
+      page.locator('a[data-autom*="signin" i]').first(),
+      page.locator('a[href*="signIn"]').filter({ hasText: /登入|Sign\s*In|Apple\s*ID/i }).first(),
+      page.locator('a[href*="/shop/signIn"]').first(),
+      page.getByRole("link", { name: /^登入$/ }).first(),
+      page.getByRole("button", { name: /^登入$/ }).first(),
+      page.getByRole("link", { name: /加入至\s*Apple\s*ID|Add to Apple ID/i }).first(),
+      page.getByRole("button", { name: /加入至\s*Apple\s*ID|Add to Apple ID/i }).first(),
+    ];
+    for (const loc of locs) {
+      if ((await loc.count().catch(() => 0)) === 0) continue;
+      await loc.scrollIntoViewIfNeeded().catch(() => {});
+      await loc.click({ force: true, timeout: 3500 }).catch(() => {});
+      await sleep(600);
+      if (onSignIn()) {
+        log(`已撳登入（Playwright · 第 ${attempt} 次）→ ${page.url()}`);
+        return;
+      }
+    }
+
+    // B) DOM click + 清 target=_blank（唔開新窗）
+    await page
+      .evaluate(() => {
+        const norm = (s: string) => (s || "").replace(/[\s\u00a0\u200b]+/g, "");
+        const inNav = (el: Element) =>
+          !!el.closest("#globalnav, nav, header, .ac-gn-content");
+        const candidates: HTMLElement[] = [];
+        const autom = document.querySelector(
+          '[data-autom="signin_orderpage"]'
+        ) as HTMLElement | null;
+        if (autom && !inNav(autom)) candidates.push(autom);
+        for (const a of Array.from(document.querySelectorAll("a[href*='signIn'], a[href*='SignIn']")) as HTMLElement[]) {
+          if (!inNav(a)) candidates.push(a);
+        }
+        for (const el of Array.from(document.querySelectorAll("a, button, [role='button']")) as HTMLElement[]) {
+          if (inNav(el)) continue;
+          const t = norm(el.innerText || el.getAttribute("aria-label") || "");
+          if (t === "登入" || /加入至AppleID|AddtoAppleID/i.test(t)) candidates.push(el);
+        }
+        const el = candidates[0];
+        if (!el) return false;
+        el.removeAttribute("target");
+        if (el.tagName === "A") (el as HTMLAnchorElement).target = "_self";
+        el.scrollIntoView({ block: "center" });
+        el.click();
+        return true;
+      })
+      .catch(() => false);
+    await sleep(700);
+    if (onSignIn()) {
+      log(`已撳登入（DOM · 第 ${attempt} 次）→ ${page.url()}`);
+      return;
+    }
+
+    // C) 直接 goto href（最穩）
+    target = await findLoginTarget();
+    if (target.href && /signIn|idmsa/i.test(target.href)) {
+      log(`登入 click 未跳轉，改 goto：${target.href.slice(0, 140)}`);
+      await page.goto(target.href, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+      await sleep(500);
+      if (onSignIn()) {
+        log(`已用 goto 到達登入頁：${page.url()}`);
+        return;
+      }
+    }
+
+    await sleep(400);
   }
 
-  // 2) 舊版「加入至 Apple ID」
-  const addLoc = page
-    .getByRole("button", { name: /加入至\s*Apple\s*ID|Add to Apple ID/i })
-    .or(page.getByRole("link", { name: /加入至\s*Apple\s*ID|Add to Apple ID/i }));
-  if (await tryClick(addLoc, "加入至 Apple ID")) {
-    await sleep(500);
+  if (onSignIn()) {
+    log(`已到達 Apple 登入頁：${page.url()}`);
     return;
   }
-
-  // 3) DOM：優先 signin_orderpage，再文字匹配（避開頂欄亂撳）
-  const clicked = await page
-    .evaluate(() => {
-      const autom = document.querySelector(
-        '[data-autom="signin_orderpage"]'
-      ) as HTMLElement | null;
-      if (autom) {
-        autom.click();
-        return "signin_orderpage";
-      }
-      const norm = (s: string) => (s || "").replace(/[\s\u00a0\u200b]+/g, "");
-      const needles = ["加入至AppleID", "加入至 Apple ID", "Add to Apple ID", "加入 Apple ID"];
-      for (const el of Array.from(
-        document.querySelectorAll("button, a, [role='button'], input[type='submit']")
-      ) as HTMLElement[]) {
-        if (el.closest("#globalnav") || el.id?.includes("globalnav")) continue;
-        const t = norm(
-          `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${(el as HTMLInputElement).value || ""}`
-        );
-        if (needles.some((n) => t.includes(norm(n)))) {
-          el.click();
-          return "add_to_apple_id";
-        }
-      }
-      // 訪客頁主 CTA：短文字「登入」+ button/form-button class
-      for (const el of Array.from(
-        document.querySelectorAll("a.button, a.form-button, button.button, button.form-button")
-      ) as HTMLElement[]) {
-        if (el.closest("#globalnav")) continue;
-        const t = norm(el.innerText || el.getAttribute("aria-label") || "");
-        if (t === "登入" || t === "SignIn" || t === "Signin") {
-          el.click();
-          return "登入";
-        }
-      }
-      return "";
-    })
-    .catch(() => "");
-
-  if (!clicked) throw new Error("揾唔到「登入／加入至 Apple ID」（訪客訂單頁）");
-  log(`已撳訂單登入掣（${clicked}）`);
-  await sleep(500);
+  throw new Error(`撳咗「登入」但仍未去到 signIn（${page.url()}）`);
 }
 
 async function processOneAccount(
