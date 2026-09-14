@@ -98,20 +98,82 @@ let addOrderNextIndex = 1;
 
 async function readAddOrderStatus(id: string): Promise<Record<string, unknown> | null> {
   try {
-    return JSON.parse(
-      await fs.readFile(path.join(RUNTIME_DIR, `status-${id}.json`), "utf8")
-    ) as Record<string, unknown>;
+    let raw = await fs.readFile(path.join(RUNTIME_DIR, `status-${id}.json`), "utf8");
+    if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
+    return JSON.parse(raw) as Record<string, unknown>;
   } catch {
     return null;
   }
 }
 
+/** server／tsx watch 重啟後由 status-ao*.json 還原 Tasks（含 Finished） */
+async function recoverAddOrderTasksFromDisk(): Promise<void> {
+  await ensureRuntimeDir();
+  let files: string[] = [];
+  try {
+    files = (await fs.readdir(RUNTIME_DIR)).filter((f) => /^status-ao\d+\.json$/i.test(f));
+  } catch {
+    return;
+  }
+  let maxIdx = addOrderNextIndex - 1;
+  for (const file of files) {
+    const m = /^status-(ao\d+)\.json$/i.exec(file);
+    if (!m) continue;
+    const id = m[1]!;
+    const num = Number(/^ao(\d+)$/i.exec(id)?.[1] || 0);
+    if (num > maxIdx) maxIdx = num;
+    if (addOrderTasks.has(id)) continue;
+    const st = await readAddOrderStatus(id);
+    if (!st) continue;
+    const phase = String(st.phase || "");
+    if (/^closed$/i.test(phase)) continue;
+    // 仲有 pid 且 process 存活 → running
+    const pid = typeof st.pid === "number" ? st.pid : null;
+    let running = false;
+    if (pid && pid > 0) {
+      try {
+        process.kill(pid, 0);
+        running = true;
+      } catch {
+        running = false;
+      }
+    }
+    addOrderTasks.set(id, {
+      id,
+      emailMasked: String(st.emailMasked || "—"),
+      orderNumber: String(st.orderNumber || ""),
+      index: Math.max(0, num - 1),
+      pid: running ? pid : null,
+      running,
+      startedAt: String(st.updatedAt || new Date().toISOString()),
+      logs: [`[dashboard] recovered ${id} · ${phase || "idle"}`],
+      child: null,
+      exitCode: running ? null : 0,
+    });
+  }
+  addOrderNextIndex = Math.max(addOrderNextIndex, maxIdx + 1);
+}
+
 async function snapshotAddOrderTasks() {
+  await recoverAddOrderTasksFromDisk();
   const tasks = [];
   for (const t of addOrderTasks.values()) {
     const st = await readAddOrderStatus(t.id);
     const phase = String(st?.phase || (t.running ? "running" : "idle"));
-    if (/^closed$/i.test(phase) && !t.running) continue;
+    if (/^closed$/i.test(phase) && !t.running) {
+      addOrderTasks.delete(t.id);
+      continue;
+    }
+    // 對齊 running 狀態（process 可能已死）
+    if (t.running && t.pid) {
+      try {
+        process.kill(t.pid, 0);
+      } catch {
+        t.running = false;
+        t.pid = null;
+        t.child = null;
+      }
+    }
     tasks.push({
       id: t.id,
       emailMasked: t.emailMasked || st?.emailMasked || "—",
@@ -122,7 +184,9 @@ async function snapshotAddOrderTasks() {
       exitCode: t.exitCode,
       phase,
       message: st?.message || "",
+      url: st?.url || "",
       windowHidden: st?.windowHidden !== false,
+      keepOpen: st?.keepOpen === true,
       logs: t.logs.slice(-80).map(redactSecrets),
     });
   }
@@ -1876,7 +1940,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
         : new Date().toISOString();
     await fs.writeFile(path.join(RUNTIME_DIR, flagName), payload, "utf8");
     if (act === "show") {
-      // 即刻寫 keepopen，worker 就算慢啲都會拒絕 auto-minimize
+      // 即刻寫 keepopen，worker 就算慢啲都會拒絕 auto-minimize／自動關窗
       await fs.writeFile(
         path.join(RUNTIME_DIR, `keepopen-${id}.flag`),
         new Date().toISOString(),
@@ -1886,6 +1950,8 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
       try {
         const stPath = path.join(RUNTIME_DIR, `status-${id}.json`);
         const prev = JSON.parse(await fs.readFile(stPath, "utf8")) as Record<string, unknown>;
+        const prevPhase = String(prev.phase || "");
+        const keepFinished = /^(finished|steps_complete|shipping_saved)$/i.test(prevPhase);
         await fs.writeFile(
           stPath,
           JSON.stringify(
@@ -1894,7 +1960,11 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
               windowHidden: false,
               windowState: "maximized",
               keepOpen: true,
-              message: "Open browser requested — kept open until Hide/Close",
+              // Finished task 開窗唔改 phase
+              ...(keepFinished ? { phase: "finished" } : {}),
+              message: keepFinished
+                ? String(prev.message || "Finished — browser kept open until Hide/Close")
+                : "Open browser requested — kept open until Hide/Close",
               updatedAt: new Date().toISOString(),
             },
             null,

@@ -133,9 +133,17 @@ async function writeStatus(patch: Record<string, unknown>): Promise<void> {
     /* ignore */
   }
   const keepOpen = userKeepBrowserOpen || (await flagExists(KEEP_OPEN_FLAG).catch(() => false));
+  const prevPhase = String(prev.phase || "");
+  const patchPhase = patch.phase != null ? String(patch.phase) : "";
+  // Open browser／視窗更新唔好蓋過 finished
+  const preserveFinished =
+    /^(finished|steps_complete|shipping_saved)$/i.test(prevPhase) &&
+    (!patchPhase || /^(manual_control|running)$/i.test(patchPhase)) &&
+    (patch.windowHidden === false || patch.keepOpen === true || patch.windowState != null);
   const next = {
     ...prev,
     ...patch,
+    ...(preserveFinished ? { phase: prevPhase } : {}),
     ...(keepOpen
       ? {
           windowHidden: false,
@@ -748,9 +756,13 @@ async function syncWindowFlags(): Promise<void> {
   }
 }
 
-async function holdBrowserUntilClose(reason: string): Promise<"continue" | "close"> {
+async function holdBrowserUntilClose(
+  reason: string,
+  opts?: { phase?: string }
+): Promise<"continue" | "close"> {
+  const holdPhase = opts?.phase || "manual_control";
   await writeStatus({
-    phase: "manual_control",
+    phase: holdPhase,
     message: reason,
     windowHidden: !userKeepBrowserOpen,
     keepOpen: userKeepBrowserOpen,
@@ -3505,8 +3517,8 @@ async function processOneAccount(
         if (/\/shop\/order\/detail\//i.test(applePage.url())) {
           await editOrderShippingAddress(applePage);
           await writeStatus({
-            phase: "steps_complete",
-            message: `步驟完成（${orderNumber}）· 送貨已儲存`,
+            phase: "finished",
+            message: `Finished · ${orderNumber} · 送貨已儲存`,
             orderNumber,
             windowHidden: !userKeepBrowserOpen,
             keepOpen: userKeepBrowserOpen,
@@ -3521,8 +3533,8 @@ async function processOneAccount(
         await signInAppleIdOnOrderPage(applePage, appleEmail, applePassword);
         await editOrderShippingAddress(applePage);
         await writeStatus({
-          phase: "steps_complete",
-          message: `步驟完成（${orderNumber}）· 送貨已儲存`,
+          phase: "finished",
+          message: `Finished · ${orderNumber} · 送貨已儲存`,
           orderNumber,
           windowHidden: !userKeepBrowserOpen,
           keepOpen: userKeepBrowserOpen,
@@ -3610,8 +3622,8 @@ async function processOneAccount(
     await signInAppleIdOnOrderPage(orderPage, appleEmail, applePassword);
     await editOrderShippingAddress(orderPage);
     await writeStatus({
-      phase: "steps_complete",
-      message: `步驟完成（${orderNumber}）· 送貨已儲存`,
+      phase: "finished",
+      message: `Finished · ${orderNumber} · 送貨已儲存`,
       orderNumber,
       windowHidden: !userKeepBrowserOpen,
       keepOpen: userKeepBrowserOpen,
@@ -3662,12 +3674,19 @@ async function processOneAccount(
       continue;
     }
   }
-  // 步驟完成後若仍喺 verify／訂單頁，Continue 會再跑 runSteps（唔好淨係空等）
+  // 步驟完成：標 Finished，留喺 Tasks；等 Close（Open browser 保持開住）
   for (;;) {
-    const next = await holdBrowserUntilClose("步驟完成，瀏覽器保持開啟");
+    const next = await holdBrowserUntilClose(`Finished · ${orderNumber} · 送貨已儲存`, {
+      phase: "finished",
+    });
     if (next === "close") throw new CloseRequestedError();
     try {
       await runSteps();
+      await writeStatus({
+        phase: "finished",
+        message: `Finished · ${orderNumber} · 送貨已儲存`,
+        orderNumber,
+      });
     } catch (err) {
       if (err instanceof CloseRequestedError) throw err;
       if (err instanceof StopRequestedError) continue;

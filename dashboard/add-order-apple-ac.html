@@ -118,6 +118,10 @@
       border-color: color-mix(in srgb, #60a5fa 55%, var(--line));
       box-shadow: 0 0 0 1px color-mix(in srgb, #3b82f6 25%, transparent);
     }
+    .task-card.is-finished {
+      border-color: color-mix(in srgb, var(--ok) 55%, var(--line));
+      box-shadow: 0 0 0 1px color-mix(in srgb, var(--ok) 28%, transparent);
+    }
     .task-head {
       display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 8px;
     }
@@ -240,8 +244,12 @@
           $("btnStop").disabled = true;
         }
         if (!running && pollTimer) {
-          // 仍有 task（manual_control）繼續 poll
-          const alive = (data.tasks || []).some((t) => t.running || /manual|captcha|waiting/i.test(String(t.phase || "")));
+          // 仍有 task（manual_control／Finished）繼續 poll
+          const alive = (data.tasks || []).some(
+            (t) =>
+              t.running ||
+              /manual|captcha|waiting|finished|steps_complete|shipping_saved/i.test(String(t.phase || ""))
+          );
           if (!alive) {
             clearInterval(pollTimer);
             pollTimer = null;
@@ -255,8 +263,8 @@
     function phasePill(phase) {
       const p = String(phase || "");
       if (/waiting_captcha/i.test(p)) return { cls: "captcha", label: "captcha — enter letters" };
+      if (/finished|steps_complete|shipping_saved/i.test(p)) return { cls: "done", label: "Finished" };
       if (/manual_control/i.test(p)) return { cls: "manual", label: "manual / stopped" };
-      if (/steps_complete/i.test(p)) return { cls: "done", label: "steps complete" };
       if (/error|closed/i.test(p)) return { cls: "", label: p };
       return { cls: "run", label: p || "running" };
     }
@@ -271,18 +279,27 @@
 
     function renderTasks(tasks) {
       const box = $("taskList");
+      // 保留 Finished／running／manual；淨係 closed 先唔顯示
       const list = (tasks || []).filter((t) => !/^closed$/i.test(String(t.phase || "")));
       if (!list.length) {
         box.innerHTML = '<p class="hint">未有 task。填 Gmail 後撳 Start。</p>';
         return;
       }
+      // Finished 排前，方便喺 Tasks 見到
+      list.sort((a, b) => {
+        const af = /finished|steps_complete|shipping_saved/i.test(String(a.phase || "")) ? 0 : 1;
+        const bf = /finished|steps_complete|shipping_saved/i.test(String(b.phase || "")) ? 0 : 1;
+        if (af !== bf) return af - bf;
+        return String(a.id).localeCompare(String(b.id), undefined, { numeric: true });
+      });
       box.innerHTML = list
         .map((t) => {
           const pill = phasePill(t.phase);
           const captcha = /waiting_captcha/i.test(String(t.phase || ""));
-          return `<article class="task-card ${captcha ? "is-captcha" : ""}" data-id="${esc(t.id)}">
+          const finished = /finished|steps_complete|shipping_saved/i.test(String(t.phase || ""));
+          return `<article class="task-card ${captcha ? "is-captcha" : ""} ${finished ? "is-finished" : ""}" data-id="${esc(t.id)}">
             <div class="task-head">
-              <strong>${esc(t.id)}</strong>
+              <strong>${esc(t.id)}${finished ? " · Finished" : ""}</strong>
               <span class="phase-pill ${pill.cls}">${esc(pill.label)}</span>
             </div>
             <div class="task-meta">
@@ -295,7 +312,7 @@
               <button type="button" class="btn-ghost btn-sm" data-act="hide" data-id="${esc(t.id)}">Hide</button>
               <button type="button" class="btn-danger btn-sm" data-act="stop" data-id="${esc(t.id)}">Stop</button>
               <button type="button" class="btn-ghost btn-sm" data-act="close" data-id="${esc(t.id)}">Close</button>
-              <button type="button" class="btn-warn btn-sm" data-act="continue" data-id="${esc(t.id)}">Continue</button>
+              ${finished ? "" : `<button type="button" class="btn-warn btn-sm" data-act="continue" data-id="${esc(t.id)}">Continue</button>`}
             </div>
           </article>`;
         })
