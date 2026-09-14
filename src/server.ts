@@ -106,8 +106,110 @@ async function readAddOrderStatus(id: string): Promise<Record<string, unknown> |
   }
 }
 
+/** 判斷 status 係咪 Finished（唔應被 Clear all 清走） */
+function isAddOrderFinishedPhase(phase: unknown): boolean {
+  return /^(finished|steps_complete|shipping_saved)$/i.test(String(phase || ""));
+}
+
+function finishedArchivePath(id: string): string {
+  return path.join(RUNTIME_DIR, "finished-archive", `${id}.json`);
+}
+
+/** 寫入永久 Finished 存檔（Clear all 唔會刪） */
+async function archiveFinishedAddOrderTask(
+  id: string,
+  st: Record<string, unknown>
+): Promise<void> {
+  const nid = String(id || "").trim();
+  if (!nid) return;
+  await fs.mkdir(path.join(RUNTIME_DIR, "finished-archive"), { recursive: true }).catch(() => {});
+  const payload = {
+    ...st,
+    phase: "finished",
+    id: nid,
+    type: "add_order",
+    archivedAt: new Date().toISOString(),
+  };
+  await fs.writeFile(finishedArchivePath(nid), JSON.stringify(payload, null, 2), "utf8");
+}
+
+/** 誤被 Clear／Close 標成 closed 但已到 order/detail → 還原 Finished */
+async function recoverMistakenlyClosedFinished(): Promise<void> {
+  await ensureRuntimeDir();
+  let files: string[] = [];
+  try {
+    files = (await fs.readdir(RUNTIME_DIR)).filter((f) => /^status-ao\d+\.json$/i.test(f));
+  } catch {
+    return;
+  }
+  for (const file of files) {
+    const m = /^status-(ao\d+)\.json$/i.exec(file);
+    if (!m) continue;
+    const id = m[1]!;
+    const st = await readAddOrderStatus(id);
+    if (!st) continue;
+    const phase = String(st.phase || "");
+    if (!/^closed$/i.test(phase)) continue;
+    const url = String(st.url || "");
+    const looksFinished =
+      /\/shop\/order\/detail\//i.test(url) ||
+      /Finished|送貨已儲存|steps_complete|shipping_saved/i.test(String(st.message || ""));
+    if (!looksFinished) continue;
+    const restored = {
+      ...st,
+      phase: "finished",
+      message:
+        String(st.orderNumber || "").trim()
+          ? `Finished · ${String(st.orderNumber).trim()} · 送貨已儲存`
+          : "Finished",
+      windowHidden: true,
+      keepOpen: false,
+      updatedAt: new Date().toISOString(),
+    };
+    await fs.writeFile(
+      path.join(RUNTIME_DIR, `status-${id}.json`),
+      JSON.stringify(restored, null, 2),
+      "utf8"
+    );
+    await archiveFinishedAddOrderTask(id, restored);
+  }
+
+  // 由 finished-archive 補返 status（若 status 已冇／仍係 closed）
+  let archives: string[] = [];
+  try {
+    archives = (await fs.readdir(path.join(RUNTIME_DIR, "finished-archive"))).filter((f) =>
+      /^ao\d+\.json$/i.test(f)
+    );
+  } catch {
+    archives = [];
+  }
+  for (const file of archives) {
+    const id = file.replace(/\.json$/i, "");
+    const stPath = path.join(RUNTIME_DIR, `status-${id}.json`);
+    let cur = await readAddOrderStatus(id);
+    if (cur && isAddOrderFinishedPhase(cur.phase)) continue;
+    if (cur && !/^closed$/i.test(String(cur.phase || "")) && cur.phase) continue;
+    try {
+      let raw = await fs.readFile(path.join(RUNTIME_DIR, "finished-archive", file), "utf8");
+      if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
+      const arch = JSON.parse(raw) as Record<string, unknown>;
+      const restored = {
+        ...arch,
+        phase: "finished",
+        id,
+        type: "add_order",
+        updatedAt: new Date().toISOString(),
+      };
+      await fs.writeFile(stPath, JSON.stringify(restored, null, 2), "utf8");
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 /** server／tsx watch 重啟後由 status-ao*.json 還原 Tasks（含 Finished） */
 async function recoverAddOrderTasksFromDisk(): Promise<void> {
+  await recoverMistakenlyClosedFinished();
   await ensureRuntimeDir();
   let files: string[] = [];
   try {
@@ -173,6 +275,9 @@ async function snapshotAddOrderTasks() {
         t.pid = null;
         t.child = null;
       }
+    }
+    if (isAddOrderFinishedPhase(phase) && st) {
+      await archiveFinishedAddOrderTask(t.id, { ...st, phase: "finished" }).catch(() => {});
     }
     tasks.push({
       id: t.id,
@@ -1883,10 +1988,22 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
 
   if (pathname === "/api/add-order-apple-ac/accounts/clear" && req.method === "POST") {
     await ensureRuntimeDir();
+    // Clear Gmail／active tasks；保留 Finished（唔 forceClose、唔刪 status／archive）
     for (const id of [...addOrderTasks.keys()]) {
+      const st = await readAddOrderStatus(id);
+      if (st && isAddOrderFinishedPhase(st.phase)) {
+        await archiveFinishedAddOrderTask(id, st).catch(() => {});
+        continue;
+      }
       await forceCloseAddOrderTask(id);
     }
-    addOrderTasks.clear();
+    // 只移除非 Finished 出 map；Finished 留低
+    for (const id of [...addOrderTasks.keys()]) {
+      const st = await readAddOrderStatus(id);
+      if (!st || !isAddOrderFinishedPhase(st.phase)) {
+        addOrderTasks.delete(id);
+      }
+    }
     await secureWipeFile(GMAIL_ACCOUNTS_ENC);
     await secureWipeFile(GMAIL_ACCOUNTS_LEGACY);
     await secureWipeFile(ADD_ORDER_JOB_ENC);
@@ -1897,11 +2014,13 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
       ok: true,
       cleared: [
         "ui",
-        "tasks",
+        "active-tasks",
         "gmail-accounts.enc",
         "logs",
         "key-rotated",
       ],
+      kept: "finished-tasks",
+      tasks: await snapshotAddOrderTasks(),
     });
   }
 
