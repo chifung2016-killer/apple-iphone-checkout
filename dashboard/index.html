@@ -427,6 +427,22 @@
     table.card-limits tr.touched td { background: color-mix(in srgb, var(--accent) 6%, transparent); }
     table.card-limits tr.low td.remaining { color: var(--danger); font-weight: 700; }
     table.card-limits td.num { font-variant-numeric: tabular-nums; }
+    table.card-limits tbody tr[data-selectable="1"] { cursor: pointer; }
+    table.card-limits tbody tr[data-selectable="1"]:hover td {
+      background: color-mix(in srgb, var(--accent) 8%, transparent);
+    }
+    table.card-limits tr.is-selected td {
+      background: color-mix(in srgb, var(--accent) 16%, transparent);
+    }
+    table.card-limits td.sel { width: 28px; text-align: center; }
+    table.card-limits td.sel .tick {
+      display: inline-block; width: 16px; height: 16px; border-radius: 4px;
+      border: 1.5px solid var(--line); vertical-align: middle;
+    }
+    table.card-limits tr.is-selected td.sel .tick {
+      background: var(--accent); border-color: transparent;
+      box-shadow: inset 0 0 0 3px #121916;
+    }
     .live-dot {
       display: inline-block; width: 7px; height: 7px; border-radius: 50%;
       background: var(--ok); box-shadow: 0 0 0 3px rgba(110,231,168,.15);
@@ -590,8 +606,10 @@
           <p class="hint">同 Order summary／Finished tab 對齊（同一訂單編號）。Email／Card／Company／Remaining／Amount 與摘要一致。</p>
         </div>
         <div class="card-limits-tools">
-              <input type="search" id="cardLimitSearch" placeholder="搜尋訂單／電郵／產品／卡號／公司" />
+          <input type="search" id="cardLimitSearch" placeholder="搜尋訂單／電郵／產品／卡號／公司" />
           <label class="chk"><input type="checkbox" id="cardLimitUsedOnly" />只顯示非 Apple Pay</label>
+          <button type="button" class="btn-ghost btn-sm" id="btnCardLimitsSelectAll">Select all</button>
+          <button type="button" class="btn-primary btn-sm" id="btnCardLimitsCopyInfo" title="複製已選列：email:password:order number（密碼本機加密）">Copy info</button>
           <button type="button" class="btn-ghost btn-sm" id="btnCardLimitsRefresh" title="重新載入成功訂單／卡額">Refresh</button>
         </div>
       </div>
@@ -600,6 +618,7 @@
         <table class="card-limits">
           <thead>
             <tr>
+              <th class="sel" aria-label="select"></th>
               <th>Order</th>
               <th>Email</th>
               <th>Placed</th>
@@ -613,7 +632,7 @@
             </tr>
           </thead>
           <tbody id="cardLimitsBody">
-            <tr><td colspan="10" class="empty">載入訂單／卡額資料中…</td></tr>
+            <tr><td colspan="11" class="empty">載入訂單／卡額資料中…</td></tr>
           </tbody>
         </table>
       </div>
@@ -1398,6 +1417,12 @@
     }
 
     let lastCardLimits = null;
+    /** @type {Set<string>} orderNumber keys selected in Live card limits */
+    const cardLimitSelected = new Set();
+
+    function cardLimitRowKey(r) {
+      return `${String(r.orderNumber || "").trim()}|||${String(r.email || "").trim().toLowerCase()}`;
+    }
 
     function fmtLimit(n) {
       if (n == null || n === "" || Number.isNaN(Number(n))) return "—";
@@ -1422,14 +1447,19 @@
         return hay.includes(q);
       });
 
+      const validKeys = new Set(filtered.map(cardLimitRowKey));
+      for (const k of [...cardLimitSelected]) {
+        if (!validKeys.has(k)) cardLimitSelected.delete(k);
+      }
+
       if (meta) {
         const withAmt = rows.filter((r) => r.amountSpent && r.amountSpent !== "—").length;
         const updated = new Date().toLocaleTimeString("zh-HK", { hour12: false });
-        meta.innerHTML = `Live · 同 Order summary／Finished 對齊 · 成功訂單 <b>${rows.length}</b> · 有金額 ${withAmt} · 顯示 ${filtered.length} · 更新 ${esc(updated)}`;
+        meta.innerHTML = `Live · 同 Order summary／Finished 對齊 · 成功訂單 <b>${rows.length}</b> · 有金額 ${withAmt} · 顯示 ${filtered.length} · 已選 <b>${cardLimitSelected.size}</b> · 更新 ${esc(updated)}`;
       }
 
       if (!filtered.length) {
-        body.innerHTML = `<tr><td colspan="10" class="empty">${
+        body.innerHTML = `<tr><td colspan="11" class="empty">${
           cardOnly
             ? "未有非 Apple Pay 嘅成功訂單。"
             : "未有成功訂單。Finished tab 出現訂單編號後會即時顯示喺呢度。"
@@ -1443,13 +1473,17 @@
           const remNum = remRaw ? Number(remRaw) : NaN;
           const low = Number.isFinite(remNum) && remNum < 11500;
           const product = [r.product, r.storage, r.color].filter((x) => x && x !== "—").join(" · ");
+          const key = cardLimitRowKey(r);
+          const selected = cardLimitSelected.has(key);
           const cls = [
             r.cardNumber && !/apple\s*pay/i.test(r.cardNumber) ? "touched" : "",
             low ? "low" : "",
+            selected ? "is-selected" : "",
           ]
             .filter(Boolean)
             .join(" ");
-          return `<tr class="${cls}" data-order="${esc(r.orderNumber)}">
+          return `<tr class="${cls}" data-selectable="1" data-key="${esc(key)}" data-order="${esc(r.orderNumber)}" data-email="${esc(r.email || "")}">
+            <td class="sel"><span class="tick" aria-hidden="true"></span></td>
             <td>${esc(r.orderNumber)}</td>
             <td>${esc(r.email || "—")}</td>
             <td>${esc(r.orderPlacedAt)}</td>
@@ -1838,6 +1872,78 @@
     $("cardLimitUsedOnly")?.addEventListener("change", () => {
       renderCardLimitsFromOrders(lastSuccessfulOrders);
     });
+
+    $("cardLimitsBody")?.addEventListener("click", (e) => {
+      const tr = e.target.closest("tr[data-selectable='1']");
+      if (!tr) return;
+      const key = tr.getAttribute("data-key");
+      if (!key) return;
+      if (cardLimitSelected.has(key)) cardLimitSelected.delete(key);
+      else cardLimitSelected.add(key);
+      renderCardLimitsFromOrders(lastSuccessfulOrders);
+    });
+
+    $("btnCardLimitsSelectAll")?.addEventListener("click", () => {
+      const body = $("cardLimitsBody");
+      if (!body) return;
+      const rows = body.querySelectorAll("tr[data-selectable='1']");
+      if (!rows.length) return;
+      const allSelected = [...rows].every((tr) =>
+        cardLimitSelected.has(tr.getAttribute("data-key") || "")
+      );
+      if (allSelected) {
+        for (const tr of rows) cardLimitSelected.delete(tr.getAttribute("data-key") || "");
+      } else {
+        for (const tr of rows) {
+          const key = tr.getAttribute("data-key");
+          if (key) cardLimitSelected.add(key);
+        }
+      }
+      renderCardLimitsFromOrders(lastSuccessfulOrders);
+    });
+
+    $("btnCardLimitsCopyInfo")?.addEventListener("click", async () => {
+      const btn = $("btnCardLimitsCopyInfo");
+      const body = $("cardLimitsBody");
+      if (!body) return;
+      const rows = [];
+      for (const tr of body.querySelectorAll("tr[data-selectable='1'].is-selected")) {
+        const email = String(tr.getAttribute("data-email") || "").trim();
+        const orderNumber = String(tr.getAttribute("data-order") || "").trim();
+        if (email && orderNumber) rows.push({ email, orderNumber });
+      }
+      if (!rows.length) {
+        alert("請先選取至少一行 Live card limits，再撳 Copy info。");
+        return;
+      }
+      const prev = btn?.textContent || "Copy info";
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "Copying…";
+      }
+      try {
+        const res = await fetch("/api/live-card-limits/copy-info", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ rows }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.ok || !data.text) {
+          alert(data.error || `Copy failed (${res.status})`);
+          return;
+        }
+        await navigator.clipboard.writeText(String(data.text));
+        if (btn) btn.textContent = `Copied ${data.count || rows.length}`;
+        setTimeout(() => {
+          if (btn) btn.textContent = prev;
+        }, 1400);
+      } catch (err) {
+        alert(err instanceof Error ? err.message : String(err));
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    });
+
     $("btnCardLimitsRefresh")?.addEventListener("click", async () => {
       const btn = $("btnCardLimitsRefresh");
       const prev = btn?.textContent || "Refresh";

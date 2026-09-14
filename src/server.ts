@@ -24,6 +24,7 @@ import {
   decryptFromFile,
   encryptToBlob,
   encryptToFile,
+  loadGmailCopyPassword,
   loadShippingAddress,
   maskEmail,
   redactSecrets,
@@ -43,6 +44,9 @@ const GMAIL_ACCOUNTS_ENC = path.join(RUNTIME_DIR, "gmail-accounts.enc");
 const GMAIL_ACCOUNTS_LEGACY = path.join(RUNTIME_DIR, "gmail-accounts-saved.txt");
 const ADD_ORDER_KEY = path.join(RUNTIME_DIR, ".add-order-key");
 const SHIPPING_ENC = path.join(RUNTIME_DIR, "shipping-address.enc");
+const GMAIL_COPY_PASSWORD_ENC = path.join(RUNTIME_DIR, "gmail-copy-password.enc");
+/** 只用作首次 seed 寫入加密檔；之後只由密文檔讀 */
+const GMAIL_COPY_PASSWORD_BOOTSTRAP = "yY6594083";
 const ADD_ORDER_JOB_ENC = path.join(RUNTIME_DIR, "add-order-job.enc");
 const ADD_ORDER_JOB_LEGACY = path.join(RUNTIME_DIR, "add-order-apple-ac.json");
 const ADD_ORDER_STOP_FLAG = path.join(RUNTIME_DIR, "add-order-stop.flag");
@@ -1798,6 +1802,45 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     return sendJson(res, 200, await getLiveCardLimits(ROOT, await collectOrders()));
   }
 
+  /** Live card limits → 複製 email:password:order（密碼由本機加密檔讀出） */
+  if (pathname === "/api/live-card-limits/copy-info" && req.method === "POST") {
+    let body: { rows?: Array<{ email?: string; orderNumber?: string }> } = {};
+    try {
+      body = JSON.parse(await readBody(req)) as typeof body;
+    } catch {
+      return sendJson(res, 400, { ok: false, error: "invalid JSON" });
+    }
+    const rows = Array.isArray(body.rows) ? body.rows : [];
+    const password = await loadGmailCopyPassword(
+      GMAIL_COPY_PASSWORD_ENC,
+      ADD_ORDER_KEY,
+      GMAIL_COPY_PASSWORD_BOOTSTRAP
+    );
+    if (!password) {
+      return sendJson(res, 500, { ok: false, error: "缺少加密 Gmail 密碼檔" });
+    }
+    const lines: string[] = [];
+    const seen = new Set<string>();
+    for (const r of rows) {
+      const email = String(r?.email || "").trim();
+      const orderNumber = String(r?.orderNumber || "").trim();
+      if (!email || email === "—" || !orderNumber || orderNumber === "—") continue;
+      if (!email.includes("@")) continue;
+      const key = `${email.toLowerCase()}|||${orderNumber}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      lines.push(`${email}:${password}:${orderNumber}`);
+    }
+    if (!lines.length) {
+      return sendJson(res, 400, { ok: false, error: "未有有效選取列（需要 email + order number）" });
+    }
+    return sendJson(res, 200, {
+      ok: true,
+      count: lines.length,
+      text: lines.join("\n"),
+    });
+  }
+
   if (pathname === "/api/orders/export-google-sheet" && req.method === "POST") {
     try {
       await ensureRuntimeDir();
@@ -2095,18 +2138,31 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     await secureWipeFile(ADD_ORDER_JOB_ENC);
     await secureWipeFile(ADD_ORDER_JOB_LEGACY);
     await secureWipeFile(ADD_ORDER_STOP_FLAG);
-    // 換 key 前保留送貨地址明文於記憶體，換完再加密寫返
+    // 換 key 前保留送貨地址／Gmail 複製密碼於記憶體，換完再加密寫返
     let shippingPlain = "";
+    let gmailCopyPwd = "";
     try {
       shippingPlain = await decryptFromFile(SHIPPING_ENC, ADD_ORDER_KEY);
     } catch {
       shippingPlain = "";
+    }
+    try {
+      gmailCopyPwd = await loadGmailCopyPassword(
+        GMAIL_COPY_PASSWORD_ENC,
+        ADD_ORDER_KEY,
+        GMAIL_COPY_PASSWORD_BOOTSTRAP
+      );
+    } catch {
+      gmailCopyPwd = "";
     }
     await rotateKey(ADD_ORDER_KEY);
     if (shippingPlain) {
       await encryptToFile(SHIPPING_ENC, ADD_ORDER_KEY, shippingPlain).catch(() => {});
     } else {
       await loadShippingAddress(SHIPPING_ENC, ADD_ORDER_KEY).catch(() => {});
+    }
+    if (gmailCopyPwd) {
+      await encryptToFile(GMAIL_COPY_PASSWORD_ENC, ADD_ORDER_KEY, gmailCopyPwd).catch(() => {});
     }
     // Finished status 內 shippingEnc 要用新 key 重加密
     for (const id of [...addOrderTasks.keys()]) {

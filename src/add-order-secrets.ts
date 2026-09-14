@@ -51,6 +51,7 @@ export function redactSecrets(line: string): string {
   out = out.replace(/37\s*ko\s*shing\s*stee?t[^,\n]*/gi, "[address]");
   out = out.replace(/11b\s*,?\s*tai\s*fat\s*building/gi, "[building]");
   out = out.replace(/sai\s*ying\s*pun/gi, "[district]");
+  out = out.replace(/\byY6594083\b/g, "***");
   return out;
 }
 
@@ -166,6 +167,24 @@ export async function saveShippingAddress(
   shipping: ShippingAddress
 ): Promise<void> {
   await encryptToFile(encPath, keyPath, JSON.stringify(shipping));
+}
+
+/** Gmail accounts 複製用預設密碼（AES 存檔；唔寫死喺前端） */
+export async function loadGmailCopyPassword(
+  encPath: string,
+  keyPath: string,
+  bootstrap = ""
+): Promise<string> {
+  try {
+    const plain = (await decryptFromFile(encPath, keyPath)).trim();
+    if (plain) return plain;
+  } catch {
+    /* seed */
+  }
+  const seed = String(bootstrap || "").trim();
+  if (!seed) return "";
+  await encryptToFile(encPath, keyPath, seed);
+  return seed;
 }
 
 /** 覆寫隨機資料再刪，減少殘留 */
