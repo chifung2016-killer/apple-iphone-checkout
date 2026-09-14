@@ -1940,14 +1940,17 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
       return url.includes(enc) || url.includes(keyword);
     }
   };
-  /** 已由 search list 入咗某一封 thread（hash 後面多咗 thread id） */
-  const isThreadOpenUrl = (url: string) => {
-    // #search/QUERY/THREADID 或 #inbox/THREADID
+  /** 淨係 #search/訂單編號/threadId 先算「正確訂單郵件已開」——唔好將 #inbox/亂 thread 當完成 */
+  const isCorrectOrderThreadUrl = (url: string) => {
     const hash = url.split("#")[1] || "";
     const parts = hash.split("/").filter(Boolean);
-    if (parts[0] === "search" && parts.length >= 3) return true;
-    if ((parts[0] === "inbox" || parts[0] === "all") && parts.length >= 2) return true;
-    return false;
+    if (parts[0] !== "search" || parts.length < 3) return false;
+    try {
+      const q = decodeURIComponent(parts[1] || "");
+      return q.includes(keyword) || parts[1] === enc || urlHasKeyword(url);
+    } catch {
+      return urlHasKeyword(url);
+    }
   };
 
   log(`搜尋郵件（訂單編號）：${keyword}…`);
@@ -1958,11 +1961,13 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
     orderNumber: keyword,
   });
 
+  // 喺 #inbox/… 或非本單 search：強制去 search（唔好停喺 inbox 亂開嘅信）
   if (!/#search\//i.test(page.url()) || !urlHasKeyword(page.url())) {
+    log(`離開 ${page.url()} → 搜尋 ${keyword}`);
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
   }
   await dismissGmailOverlays(page);
-  await sleep(600);
+  await sleep(500);
 
   if (!/#search\//i.test(page.url()) || !urlHasKeyword(page.url())) {
     await page
@@ -1970,6 +1975,11 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
         location.hash = `#search/${encodeURIComponent(q)}`;
       }, keyword)
       .catch(() => {});
+    await sleep(600);
+  }
+  // 仍唔係 search：再 goto 一次
+  if (!/#search\//i.test(page.url()) || !urlHasKeyword(page.url())) {
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
     await sleep(500);
   }
 
@@ -2014,9 +2024,9 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
   }
   if (!hasRows) throw new Error(`Gmail 搜尋訂單「${keyword}」搵唔到郵件列`);
 
-  // 若已經喺 thread 詳情，唔使再撳
-  if (isThreadOpenUrl(page.url()) && (await isGmailMessageOpen(page))) {
-    log("搜尋結果已打開郵件詳情");
+  // 只有「正確 search thread」先跳過再開；#inbox/xxx 唔算
+  if (isCorrectOrderThreadUrl(page.url()) && (await isGmailMessageOpen(page))) {
+    log("搜尋結果已打開訂單郵件詳情");
   } else {
     log("點開選中／第一封搜尋結果…");
     const opened = await openSelectedOrFirstGmailResult(page, keyword);
@@ -3320,21 +3330,6 @@ async function processOneAccount(
     }
 
     const onGmail = /mail\.google\.com/i.test(page.url());
-    const urlHasOrder = (() => {
-      const u = page.url();
-      try {
-        return decodeURIComponent(u).includes(orderNumber);
-      } catch {
-        return u.includes(orderNumber) || u.includes(encodeURIComponent(orderNumber));
-      }
-    })();
-    const searchHash = (page.url().split("#")[1] || "").split("/").filter(Boolean);
-    const onSearchList =
-      /#search\//i.test(page.url()) && urlHasOrder && searchHash[0] === "search" && searchHash.length < 3;
-    const onSearchThread =
-      /#search\//i.test(page.url()) && urlHasOrder && searchHash[0] === "search" && searchHash.length >= 3;
-    const mailOpen = await isGmailMessageOpen(page);
-
     if (!onGmail) {
       await writeStatus({ phase: "gmail_login", message: "Gmail 登入中…", orderNumber });
       await gmailLogin(page, account.email, account.password);
@@ -3342,21 +3337,49 @@ async function processOneAccount(
       log(`已在 Gmail（${page.url()}），跳過登入`);
     }
 
-    // 停喺 #search/訂單編號 列表：必須點開選中／第一封，再繼續
-    if (onSearchList || !mailOpen || /#inbox/i.test(page.url())) {
+    // 登入後先再判斷 URL（唔好用登入前嘅 inbox／舊 hash）
+    const afterLoginUrl = page.url();
+    const urlHasOrder = (() => {
+      const u = afterLoginUrl;
+      try {
+        return decodeURIComponent(u).includes(orderNumber);
+      } catch {
+        return u.includes(orderNumber) || u.includes(encodeURIComponent(orderNumber));
+      }
+    })();
+    const searchHash = (afterLoginUrl.split("#")[1] || "").split("/").filter(Boolean);
+    const onSearchList =
+      /#search\//i.test(afterLoginUrl) &&
+      urlHasOrder &&
+      searchHash[0] === "search" &&
+      searchHash.length < 3;
+    const onSearchThread =
+      /#search\//i.test(afterLoginUrl) &&
+      urlHasOrder &&
+      searchHash[0] === "search" &&
+      searchHash.length >= 3;
+    const onInboxAny = /#inbox/i.test(afterLoginUrl) || /#all\//i.test(afterLoginUrl);
+    const mailOpen = await isGmailMessageOpen(page);
+
+    // #inbox/thread 唔等於已搵到訂單信 —— 一律搜尋訂單編號
+    const needSearch =
+      onInboxAny ||
+      onSearchList ||
+      !onSearchThread ||
+      !urlHasOrder ||
+      !mailOpen;
+
+    if (needSearch) {
       await writeStatus({
         phase: "search_email",
         message: `搜尋／開啟訂單「${orderNumber}」郵件詳情…`,
         orderNumber,
       });
-      if (onSearchThread && mailOpen) {
-        log("已在訂單郵件詳情，繼續撳郵件內掣");
+      if (onSearchThread && mailOpen && urlHasOrder) {
+        log("已在訂單搜尋郵件詳情，繼續撳郵件內掣");
       } else {
         await gmailSearchAndOpenOrderEmail(page, orderNumber);
       }
-    } else if (onSearchThread && !mailOpen) {
-      // URL 似已開 thread 但正文未載入：再試開一次
-      await gmailSearchAndOpenOrderEmail(page, orderNumber);
     }
 
     await writeStatus({

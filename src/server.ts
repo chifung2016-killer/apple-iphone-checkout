@@ -96,6 +96,42 @@ type AddOrderTask = {
 const addOrderTasks = new Map<string, AddOrderTask>();
 let addOrderNextIndex = 1;
 
+const ADD_ORDER_FINISHED_FILE = path.join(RUNTIME_DIR, "add-order-finished.json");
+
+type AddOrderFinishedEntry = {
+  id: string;
+  emailMasked: string;
+  orderNumber: string;
+  message: string;
+  finishedAt: string;
+  url?: string;
+};
+
+async function loadAddOrderFinished(): Promise<AddOrderFinishedEntry[]> {
+  try {
+    const raw = JSON.parse(await fs.readFile(ADD_ORDER_FINISHED_FILE, "utf8"));
+    return Array.isArray(raw) ? (raw as AddOrderFinishedEntry[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function saveAddOrderFinished(list: AddOrderFinishedEntry[]): Promise<void> {
+  await ensureRuntimeDir();
+  await fs.writeFile(ADD_ORDER_FINISHED_FILE, JSON.stringify(list, null, 2), "utf8");
+}
+
+async function markAddOrderFinished(entry: AddOrderFinishedEntry): Promise<void> {
+  const list = await loadAddOrderFinished();
+  const next = list.filter((x) => x.id !== entry.id);
+  next.unshift(entry);
+  await saveAddOrderFinished(next.slice(0, 200));
+}
+
+function isAddOrderStepsCompletePhase(phase: string): boolean {
+  return /steps_complete|shipping_saved/i.test(String(phase || ""));
+}
+
 async function readAddOrderStatus(id: string): Promise<Record<string, unknown> | null> {
   try {
     return JSON.parse(
@@ -112,6 +148,20 @@ async function snapshotAddOrderTasks() {
     const st = await readAddOrderStatus(t.id);
     const phase = String(st?.phase || (t.running ? "running" : "idle"));
     if (/^closed$/i.test(phase) && !t.running) continue;
+
+    // 完成步驟 → 記入 Finished（Active 不再顯示）
+    if (isAddOrderStepsCompletePhase(phase)) {
+      await markAddOrderFinished({
+        id: t.id,
+        emailMasked: String(t.emailMasked || st?.emailMasked || "—"),
+        orderNumber: String(t.orderNumber || st?.orderNumber || ""),
+        message: String(st?.message || phase),
+        finishedAt: String(st?.updatedAt || new Date().toISOString()),
+        url: typeof st?.url === "string" ? st.url : undefined,
+      });
+      continue;
+    }
+
     tasks.push({
       id: t.id,
       emailMasked: t.emailMasked || st?.emailMasked || "—",
@@ -127,6 +177,29 @@ async function snapshotAddOrderTasks() {
     });
   }
   return tasks;
+}
+
+async function snapshotAddOrderFinished() {
+  const disk = await loadAddOrderFinished();
+  // 補上仍在跑但已 steps_complete 嘅（browser 可能仲 hold）
+  const byId = new Map(disk.map((x) => [x.id, x]));
+  for (const t of addOrderTasks.values()) {
+    const st = await readAddOrderStatus(t.id);
+    const phase = String(st?.phase || "");
+    if (!isAddOrderStepsCompletePhase(phase)) continue;
+    byId.set(t.id, {
+      id: t.id,
+      emailMasked: String(t.emailMasked || st?.emailMasked || "—"),
+      orderNumber: String(t.orderNumber || st?.orderNumber || ""),
+      message: String(st?.message || phase),
+      finishedAt: String(st?.updatedAt || new Date().toISOString()),
+      url: typeof st?.url === "string" ? st.url : undefined,
+      running: t.running,
+    } as AddOrderFinishedEntry & { running?: boolean });
+  }
+  return [...byId.values()].sort((a, b) =>
+    String(b.finishedAt).localeCompare(String(a.finishedAt))
+  );
 }
 
 function stopAddOrderAutomation(id: string) {
@@ -227,7 +300,8 @@ async function broadcastAddOrderStatus(): Promise<void> {
   addOrderBroadcastTimer = setTimeout(async () => {
     try {
       const tasks = await snapshotAddOrderTasks();
-      const anyRunning = tasks.some((t) => t.running);
+      const finished = await snapshotAddOrderFinished();
+      const anyRunning = tasks.some((t) => t.running) || [...addOrderTasks.values()].some((t) => t.running);
       const allLogs = [...addOrderTasks.values()].flatMap((t) =>
         t.logs.slice(-40).map((line) => redactSecrets(line))
       );
@@ -236,6 +310,7 @@ async function broadcastAddOrderStatus(): Promise<void> {
         buildId: DASHBOARD_BUILD_ID,
         running: anyRunning,
         tasks,
+        finished,
         logs: allLogs.slice(-400),
         at: new Date().toISOString(),
       });
@@ -1761,7 +1836,9 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
 
   if (pathname === "/api/add-order-apple-ac/status" && req.method === "GET") {
     const tasks = await snapshotAddOrderTasks();
-    const anyRunning = tasks.some((t) => t.running);
+    const finished = await snapshotAddOrderFinished();
+    const anyRunning =
+      tasks.some((t) => t.running) || [...addOrderTasks.values()].some((t) => t.running);
     const allLogs = [...addOrderTasks.values()].flatMap((t) =>
       t.logs.slice(-40).map((line) => redactSecrets(line))
     );
@@ -1769,6 +1846,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
       ok: true,
       running: anyRunning,
       tasks,
+      finished,
       logs: allLogs.slice(-400),
       lastExitCode: anyRunning
         ? null
@@ -1828,12 +1906,14 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     await secureWipeFile(ADD_ORDER_JOB_ENC);
     await secureWipeFile(ADD_ORDER_JOB_LEGACY);
     await secureWipeFile(ADD_ORDER_STOP_FLAG);
+    await fs.unlink(ADD_ORDER_FINISHED_FILE).catch(() => {});
     await rotateKey(ADD_ORDER_KEY);
     return sendJson(res, 200, {
       ok: true,
       cleared: [
         "ui",
         "tasks",
+        "finished",
         "gmail-accounts.enc",
         "logs",
         "key-rotated",
@@ -1851,6 +1931,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     return sendJson(res, 200, {
       ok: true,
       tasks: await snapshotAddOrderTasks(),
+      finished: await snapshotAddOrderFinished(),
     });
   }
 
@@ -1917,6 +1998,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     return sendJson(res, 200, {
       ok: true,
       tasks: await snapshotAddOrderTasks(),
+      finished: await snapshotAddOrderFinished(),
     });
   }
 

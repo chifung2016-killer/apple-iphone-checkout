@@ -132,6 +132,19 @@
     .phase-pill.done { background: color-mix(in srgb, var(--ok) 40%, var(--field)); color: #062816; border-color: transparent; }
     .task-meta { font-size: 0.85rem; color: var(--muted); margin-bottom: 10px; }
     .task-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .tabs { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+    .tabs button {
+      border-radius: 999px; padding: 7px 14px; font-size: 0.84rem;
+    }
+    .tabs button.is-active {
+      background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 700;
+    }
+    .tabs .count {
+      margin-left: 6px; opacity: 0.75; font-variant-numeric: tabular-nums;
+    }
+    .task-card.is-finished {
+      border-color: color-mix(in srgb, var(--ok) 45%, var(--line));
+    }
   </style>
 </head>
 <body>
@@ -176,6 +189,14 @@
 
     <section>
       <h2>Tasks</h2>
+      <div class="tabs" role="tablist">
+        <button type="button" class="is-active" id="tabActive" data-tab="active" role="tab" aria-selected="true">
+          Active<span class="count" id="activeCount">0</span>
+        </button>
+        <button type="button" id="tabFinished" data-tab="finished" role="tab" aria-selected="false">
+          Finished<span class="count" id="finishedCount">0</span>
+        </button>
+      </div>
       <div class="task-list" id="taskList"><p class="hint">未有 task。填 Gmail 後撳 Start。</p></div>
     </section>
 
@@ -191,6 +212,9 @@
     const logsEl = $("logs");
     const statusPill = $("statusPill");
     let pollTimer = null;
+    let tasksTab = "active"; // active | finished
+    let lastActiveTasks = [];
+    let lastFinishedTasks = [];
 
     function parseAccounts(text) {
       const out = [];
@@ -224,13 +248,15 @@
         const res = await fetch("/api/add-order-apple-ac/status");
         const data = await res.json();
         renderLogs(data.logs || []);
-        renderTasks(data.tasks || []);
+        lastActiveTasks = data.tasks || [];
+        lastFinishedTasks = data.finished || [];
+        renderTasks();
         const running = !!data.running;
         if (running) {
           setStatus("Running…", "run");
           $("btnStart").disabled = true;
           $("btnStop").disabled = false;
-        } else if ((data.tasks || []).length) {
+        } else if (lastActiveTasks.length || lastFinishedTasks.length) {
           setStatus("Idle / waiting", "");
           $("btnStart").disabled = false;
           $("btnStop").disabled = true;
@@ -240,8 +266,7 @@
           $("btnStop").disabled = true;
         }
         if (!running && pollTimer) {
-          // 仍有 task（manual_control）繼續 poll
-          const alive = (data.tasks || []).some((t) => t.running || /manual|captcha|waiting/i.test(String(t.phase || "")));
+          const alive = lastActiveTasks.some((t) => t.running || /manual|captcha|waiting/i.test(String(t.phase || "")));
           if (!alive) {
             clearInterval(pollTimer);
             pollTimer = null;
@@ -256,7 +281,7 @@
       const p = String(phase || "");
       if (/waiting_captcha/i.test(p)) return { cls: "captcha", label: "captcha — enter letters" };
       if (/manual_control/i.test(p)) return { cls: "manual", label: "manual / stopped" };
-      if (/steps_complete/i.test(p)) return { cls: "done", label: "steps complete" };
+      if (/steps_complete|shipping_saved/i.test(p)) return { cls: "done", label: "finished" };
       if (/error|closed/i.test(p)) return { cls: "", label: p };
       return { cls: "run", label: p || "running" };
     }
@@ -269,13 +294,54 @@
         .replace(/"/g, "&quot;");
     }
 
-    function renderTasks(tasks) {
+    function setTasksTab(tab) {
+      tasksTab = tab === "finished" ? "finished" : "active";
+      $("tabActive").classList.toggle("is-active", tasksTab === "active");
+      $("tabFinished").classList.toggle("is-active", tasksTab === "finished");
+      $("tabActive").setAttribute("aria-selected", tasksTab === "active" ? "true" : "false");
+      $("tabFinished").setAttribute("aria-selected", tasksTab === "finished" ? "true" : "false");
+      renderTasks();
+    }
+
+    function renderTasks() {
       const box = $("taskList");
-      const list = (tasks || []).filter((t) => !/^closed$/i.test(String(t.phase || "")));
+      const active = lastActiveTasks.filter((t) => !/^closed$/i.test(String(t.phase || "")));
+      const finished = lastFinishedTasks || [];
+      $("activeCount").textContent = String(active.length);
+      $("finishedCount").textContent = String(finished.length);
+
+      const list = tasksTab === "finished" ? finished : active;
       if (!list.length) {
-        box.innerHTML = '<p class="hint">未有 task。填 Gmail 後撳 Start。</p>';
+        box.innerHTML =
+          tasksTab === "finished"
+            ? '<p class="hint">未有已完成 task。全部步驟做完會出現喺呢度。</p>'
+            : '<p class="hint">未有 task。填 Gmail 後撳 Start。</p>';
         return;
       }
+
+      if (tasksTab === "finished") {
+        box.innerHTML = list
+          .map((t) => `<article class="task-card is-finished" data-id="${esc(t.id)}">
+              <div class="task-head">
+                <strong>${esc(t.id)}</strong>
+                <span class="phase-pill done">finished</span>
+              </div>
+              <div class="task-meta">
+                <div><b>Gmail</b> ${esc(t.emailMasked || "—")}</div>
+                <div><b>Order</b> ${esc(t.orderNumber || "—")}</div>
+                <div><b>Status</b> ${esc(t.message || "steps complete")}</div>
+                <div><b>Finished</b> ${esc(t.finishedAt || "—")}</div>
+              </div>
+              <div class="task-actions">
+                <button type="button" class="btn-primary btn-sm" data-act="show" data-id="${esc(t.id)}">Open browser</button>
+                <button type="button" class="btn-ghost btn-sm" data-act="hide" data-id="${esc(t.id)}">Hide</button>
+                <button type="button" class="btn-ghost btn-sm" data-act="close" data-id="${esc(t.id)}">Close</button>
+              </div>
+            </article>`)
+          .join("");
+        return;
+      }
+
       box.innerHTML = list
         .map((t) => {
           const pill = phasePill(t.phase);
@@ -307,6 +373,9 @@
       pollTimer = setInterval(refreshStatus, 800);
       refreshStatus();
     }
+
+    $("tabActive").addEventListener("click", () => setTasksTab("active"));
+    $("tabFinished").addEventListener("click", () => setTasksTab("finished"));
 
     $("btnStart").addEventListener("click", async () => {
       const accounts = parseAccounts($("accounts").value);
@@ -381,12 +450,13 @@
         const data = await res.json().catch(() => ({}));
         if (act === "close") {
           if (card) card.remove();
-          if (Array.isArray(data.tasks)) renderTasks(data.tasks);
-          else if (!$("taskList").querySelector("article.task-card")) {
-            $("taskList").innerHTML = '<p class="hint">未有 task。填 Gmail 後撳 Start。</p>';
-          }
-        } else if (Array.isArray(data.tasks)) {
-          renderTasks(data.tasks);
+          if (Array.isArray(data.tasks)) lastActiveTasks = data.tasks;
+          if (Array.isArray(data.finished)) lastFinishedTasks = data.finished;
+          renderTasks();
+        } else if (Array.isArray(data.tasks) || Array.isArray(data.finished)) {
+          if (Array.isArray(data.tasks)) lastActiveTasks = data.tasks;
+          if (Array.isArray(data.finished)) lastFinishedTasks = data.finished;
+          renderTasks();
         }
         setTimeout(refreshStatus, 300);
       } finally {
@@ -418,7 +488,10 @@
       if (!confirm("Clear all？會清：輸入框、已存 Gmail、tasks、logs，並換加密 key。")) return;
       $("accounts").value = "";
       logsEl.textContent = "";
-      $("taskList").innerHTML = '<p class="hint">未有 task。</p>';
+      lastActiveTasks = [];
+      lastFinishedTasks = [];
+      tasksTab = "active";
+      setTasksTab("active");
       setStatus("Cleared", "ok");
       try {
         const res = await fetch("/api/add-order-apple-ac/accounts/clear", { method: "POST" });
@@ -471,14 +544,16 @@
         }
         if (msg.type === "add_order_status") {
           if (Array.isArray(msg.logs)) renderLogs(msg.logs);
-          if (Array.isArray(msg.tasks)) renderTasks(msg.tasks);
+          if (Array.isArray(msg.tasks)) lastActiveTasks = msg.tasks;
+          if (Array.isArray(msg.finished)) lastFinishedTasks = msg.finished;
+          renderTasks();
           const running = !!msg.running;
           if (running) {
             setStatus("Running…", "run");
             $("btnStart").disabled = true;
             $("btnStop").disabled = false;
             if (!pollTimer) startPolling();
-          } else if ((msg.tasks || []).length) {
+          } else if (lastActiveTasks.length || lastFinishedTasks.length) {
             setStatus("Idle / waiting", "");
             $("btnStart").disabled = false;
             $("btnStop").disabled = true;
