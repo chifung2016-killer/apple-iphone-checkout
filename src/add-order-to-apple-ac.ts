@@ -2245,49 +2245,126 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
     orderNumber: keyword,
   });
 
-  // 等真正郵件列（tr.zA），唔好用 sidebar div[role=row] 誤判
-  const listDeadline = Date.now() + 30_000;
-  let hasRows = false;
-  while (Date.now() < listDeadline) {
+  /** 新舊 Gmail 列表：tr.zA / role=row / listitem / thread id / 頁面有訂單字 */
+  const probeList = async () =>
+    page
+      .evaluate((order) => {
+        const main = document.querySelector("div[role='main']") || document.body;
+        const za = document.querySelectorAll("tr.zA").length;
+        const rows = main.querySelectorAll("div[role='row']").length;
+        const listitems = main.querySelectorAll("div[role='listitem']").length;
+        const tid = document.querySelectorAll(
+          "[data-legacy-thread-id], [data-thread-id]"
+        ).length;
+        const text = (main.innerText || "").replace(/\s+/g, " ");
+        const hasOrder =
+          !!order &&
+          (text.includes(order) ||
+            text.replace(/[\s-]/g, "").includes(String(order).replace(/[\s-]/g, "")));
+        return {
+          za,
+          rows,
+          listitems,
+          tid,
+          hasOrder,
+          ok: za > 0 || (hasOrder && (rows > 0 || listitems > 0 || tid > 0)) || (hasOrder && text.length > 40),
+        };
+      }, keyword)
+      .catch(() => ({ za: 0, rows: 0, listitems: 0, tid: 0, hasOrder: false, ok: false }));
+
+  // 用搜尋欄再打一次（hash 有時到咗 URL 但列表未 render）
+  const tryTypeSearch = async () => {
+    const box = page
+      .locator(
+        [
+          'input[aria-label*="Search mail" i]',
+          'input[aria-label*="Search" i]',
+          'input[aria-label*="搜尋郵件" i]',
+          'input[aria-label*="搜尋" i]',
+          'form[role="search"] input',
+          'input[name="q"]',
+        ].join(", ")
+      )
+      .first();
+    if ((await box.count().catch(() => 0)) === 0) return false;
+    if (!(await box.isVisible().catch(() => false))) return false;
+    await box.click({ timeout: 2000 }).catch(() => {});
+    await box.fill("").catch(() => {});
+    await box.pressSequentially(keyword, { delay: 25 }).catch(async () => {
+      await box.fill(keyword).catch(() => {});
+    });
+    await page.keyboard.press("Enter").catch(() => {});
+    await sleep(1000);
+    return true;
+  };
+
+  // 等列表／訂單字出現
+  const listStarted = Date.now();
+  const listDeadline = listStarted + 45_000;
+  let probe = await probeList();
+  let triedSearchBox = false;
+  let triedReload = false;
+  while (Date.now() < listDeadline && !probe.ok) {
     await throwIfStopped();
     await syncWindowFlags().catch(() => {});
     await dismissGmailOverlays(page);
-    hasRows = await page
-      .evaluate(() => document.querySelectorAll("tr.zA").length > 0)
-      .catch(() => false);
-    if (hasRows) break;
+    probe = await probeList();
+    if (probe.ok) break;
     const empty = await page
       .getByText(/沒有與你的搜尋相符|No messages matched|找不到任何郵件/i)
       .first()
       .isVisible()
       .catch(() => false);
     if (empty) throw new Error(`Gmail 搜尋訂單「${keyword}」冇結果`);
-    await sleep(600);
+    const elapsed = Date.now() - listStarted;
+    if (!triedSearchBox && elapsed > 10_000) {
+      triedSearchBox = true;
+      log("搜尋列表未就緒 — 改用搜尋欄再查…");
+      await tryTypeSearch();
+    }
+    if (!triedReload && elapsed > 20_000) {
+      triedReload = true;
+      log("reload 搜尋頁再等列表…");
+      await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
+      await sleep(800);
+    }
+    await sleep(500);
   }
-  if (!hasRows) {
+  if (!probe.ok) {
+    await tryTypeSearch();
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
-    await sleep(1200);
-    hasRows = await page
-      .evaluate(() => document.querySelectorAll("tr.zA").length > 0)
-      .catch(() => false);
+    await sleep(1500);
+    probe = await probeList();
   }
-  if (!hasRows) throw new Error(`Gmail 搜尋訂單「${keyword}」搵唔到郵件列（tr.zA）`);
+  log(
+    `Gmail 列表 probe：za=${probe.za} rows=${probe.rows} listitems=${probe.listitems} tid=${probe.tid} hasOrder=${probe.hasOrder}`
+  );
+  if (!probe.ok) {
+    // 最後：頁面任何位置見到訂單編號都當有結果，交俾 open 去撳
+    const anywhere = await page.getByText(keyword).first().isVisible().catch(() => false);
+    if (!anywhere) {
+      throw new Error(`Gmail 搜尋訂單「${keyword}」搵唔到郵件列（DOM 未就緒）`);
+    }
+    log("列表 selector 未齊，但頁面有訂單編號 — 繼續開信");
+  }
 
   // 只有「正確 search thread」先跳過再開；#search/訂單 列表唔算
   if (isCorrectOrderThreadUrl(page.url()) && (await isGmailMessageOpen(page))) {
     log("搜尋結果已打開訂單郵件詳情");
   } else {
-    log("點開選中／第一封搜尋結果…");
+    log("點開選中／含訂單編號嘅搜尋結果…");
     let opened = await openSelectedOrFirstGmailResult(page, keyword);
     // 仍停喺列表：再試一次（reload search 後再開）
     if (!opened || !isCorrectOrderThreadUrl(page.url())) {
       log("第一次開信未穩，reload 搜尋結果再試…");
       await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
-      await sleep(800);
+      await sleep(1000);
       await dismissGmailOverlays(page);
+      // 等列表再出現
+      for (let i = 0; i < 20 && !(await probeList()).ok; i++) await sleep(400);
       opened = await openSelectedOrFirstGmailResult(page, keyword);
     }
-    if (!opened && !isCorrectOrderThreadUrl(page.url())) {
+    if (!opened && !isCorrectOrderThreadUrl(page.url()) && !(await isGmailMessageOpen(page))) {
       throw new Error(`搜尋結果入面打唔開訂單「${keyword}」郵件（仍喺 ${page.url()}）`);
     }
   }
@@ -2519,14 +2596,48 @@ async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): 
     }
   }
 
-  // 1b) Playwright 撳第一／含訂單編號列
+  // 1b) 直接撳含訂單編號嘅可見文字（唔依賴 tr.zA）
+  {
+    const orderHit = page
+      .locator("div[role='main']")
+      .getByText(keyword, { exact: false })
+      .first();
+    if ((await orderHit.count().catch(() => 0)) > 0 && (await orderHit.isVisible().catch(() => false))) {
+      await orderHit.scrollIntoViewIfNeeded().catch(() => {});
+      const row = orderHit.locator(
+        "xpath=ancestor::tr[contains(@class,'zA')][1] | ancestor::div[@role='row'][1] | ancestor::div[@role='listitem'][1]"
+      );
+      const target = (await row.count().catch(() => 0)) > 0 ? row.first() : orderHit;
+      await target.click({ timeout: 3000, force: true }).catch(() => {});
+      await sleep(500);
+      if (urlIsOpenThread() || (await isGmailThreadDetailOpen(page, keyword))) {
+        log("已撳訂單編號文字開信");
+        return true;
+      }
+      await target.dblclick({ timeout: 2500, force: true }).catch(() => {});
+      await sleep(600);
+      if (urlIsOpenThread() || (await isGmailThreadDetailOpen(page, keyword))) {
+        log("dblclick 訂單編號已開信");
+        return true;
+      }
+      await page.keyboard.press("Enter").catch(() => {});
+      await sleep(500);
+      if (urlIsOpenThread() || (await isGmailThreadDetailOpen(page, keyword))) return true;
+    }
+  }
+
+  // 1c) Playwright 撳第一／含訂單編號列（多種 DOM）
   await dismissGmailOverlays(page);
   const esc = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const rowCandidates = [
     page.locator("tr.zA").filter({ hasText: new RegExp(esc, "i") }).first(),
-    page.locator(`tr.zA[data-legacy-thread-id]`).filter({ hasText: new RegExp(esc, "i") }).first(),
+    page.locator("div[role='main'] div[role='row']").filter({ hasText: new RegExp(esc, "i") }).first(),
+    page.locator("div[role='main'] div[role='listitem']").filter({ hasText: new RegExp(esc, "i") }).first(),
+    page.locator("[data-legacy-thread-id]").filter({ hasText: new RegExp(esc, "i") }).first(),
     page.locator("tr.zA[aria-selected='true']").first(),
+    page.locator("div[role='main'] div[role='row'][aria-selected='true']").first(),
     page.locator("tr.zA").first(),
+    page.locator("div[role='main'] div[role='row']").first(),
     page.locator("div[role='main'] div[role='listitem']").first(),
   ];
   for (const row of rowCandidates) {
@@ -2553,7 +2664,17 @@ async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): 
   // 2) DOM fire + 鍵盤 Enter / o
   await page
     .evaluate((order) => {
-      const rows = Array.from(document.querySelectorAll("tr.zA")) as HTMLElement[];
+      const sels = [
+        "tr.zA",
+        "div[role='main'] div[role='row']",
+        "div[role='main'] div[role='listitem']",
+        "[data-legacy-thread-id]",
+      ];
+      let rows: HTMLElement[] = [];
+      for (const s of sels) {
+        rows = Array.from(document.querySelectorAll(s)) as HTMLElement[];
+        if (rows.length) break;
+      }
       if (!rows.length) return;
       const textOf = (el: HTMLElement) => (el.innerText || "").replace(/\s+/g, " ");
       const target =
