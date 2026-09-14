@@ -2470,7 +2470,7 @@ async function waitForAppleOrderFlowPage(page: Page): Promise<void> {
   throw new Error(`未到達 Apple 訂單頁：${page.url()}`);
 }
 
-/** 同 checkout：可靠填入受控 input */
+/** 同 checkout：可靠填入受控 input（電話用數字比對；地址用文字比對） */
 async function fillVerifiedInput(field: Locator, value: string): Promise<boolean> {
   if (!(await field.count().catch(() => 0))) return false;
   if (!(await field.isVisible().catch(() => false))) return false;
@@ -2478,17 +2478,25 @@ async function fillVerifiedInput(field: Locator, value: string): Promise<boolean
   await field.click({ force: true, timeout: 2500 }).catch(() => {});
   await field.fill("").catch(() => {});
   await field.fill(value).catch(() => {});
-  const want = value.replace(/\D/g, "");
-  let current = ((await field.inputValue().catch(() => "")) || "").replace(/\D/g, "");
-  if (current === want || current.includes(want) || (current && want.includes(current))) return true;
+
+  const digitsOnly = !/[A-Za-z\u4e00-\u9fff]/.test(value);
+  const norm = (s: string) =>
+    digitsOnly ? String(s || "").replace(/\D/g, "") : String(s || "").trim().replace(/\s+/g, " ");
+  const want = norm(value);
+  let current = norm((await field.inputValue().catch(() => "")) || "");
+  if (current === want || (want && current.includes(want)) || (current && want.includes(current))) {
+    return true;
+  }
 
   await field.press("ControlOrMeta+A").catch(() => {});
   await field.press("Backspace").catch(() => {});
   await field.pressSequentially(value, { delay: 30 }).catch(async () => {
     await field.type(value, { delay: 30 }).catch(() => {});
   });
-  current = ((await field.inputValue().catch(() => "")) || "").replace(/\D/g, "");
-  if (current === want || current.includes(want) || (current && want.includes(current))) return true;
+  current = norm((await field.inputValue().catch(() => "")) || "");
+  if (current === want || (want && current.includes(want)) || (current && want.includes(current))) {
+    return true;
+  }
 
   return field
     .evaluate((el, v) => {
@@ -2507,9 +2515,261 @@ async function fillVerifiedInput(field: Locator, value: string): Promise<boolean
       } catch {
         /* ignore */
       }
-      return (input.value || "").replace(/\D/g, "").includes(String(v).replace(/\D/g, ""));
+      const digitsOnlyInner = !/[A-Za-z\u4e00-\u9fff]/.test(String(v));
+      const n = (s: string) =>
+        digitsOnlyInner ? s.replace(/\D/g, "") : s.trim().replace(/\s+/g, " ");
+      const cur = n(input.value || "");
+      const w = n(String(v));
+      return cur === w || cur.includes(w) || w.includes(cur);
     }, value)
     .catch(() => false);
+}
+
+/** 訂單詳情送貨地址（固定） */
+const ORDER_SHIPPING_EDIT = {
+  firstName: "Chi Fung", // 名字
+  lastName: "Leung", // 姓名
+  areaStreet: "37 ko shing steet, sai ying pun", // 區域
+  building: "11b, tai fat building", // 屋苑或大廈
+} as const;
+
+async function fillLabeledField(
+  page: Page,
+  labels: Array<string | RegExp>,
+  value: string,
+  step: string
+): Promise<boolean> {
+  for (const label of labels) {
+    const candidates = [
+      page.getByLabel(label).first(),
+      page.getByRole("textbox", { name: label }).first(),
+      page.getByRole("combobox", { name: label }).first(),
+      page.getByPlaceholder(label).first(),
+    ];
+    for (const field of candidates) {
+      if (await fillVerifiedInput(field, value)) {
+        log(`已填 ${step}：${value}`);
+        return true;
+      }
+    }
+  }
+  const key = step.toLowerCase();
+  const sels: string[] = [];
+  if (/姓|last/i.test(key) || step === "姓氏" || step === "姓名") {
+    sels.push(
+      'input[id*="lastName" i]',
+      'input[name*="lastName" i]',
+      'input[data-autom*="lastName" i]',
+      'input[autocomplete="family-name"]'
+    );
+  }
+  if (/名|first/i.test(key) || step === "名字") {
+    sels.push(
+      'input[id*="firstName" i]',
+      'input[name*="firstName" i]',
+      'input[data-autom*="firstName" i]',
+      'input[autocomplete="given-name"]'
+    );
+  }
+  if (/區域|街道|street|area/i.test(key)) {
+    sels.push(
+      'input[id*="street" i]',
+      'input[name*="street" i]',
+      'input[data-autom*="street" i]',
+      'input[id*="addressLine1" i]',
+      'textarea[id*="street" i]'
+    );
+  }
+  if (/屋苑|大廈|building/i.test(key)) {
+    sels.push(
+      'input[id*="street2" i]',
+      'input[id*="addressLine2" i]',
+      'input[name*="street2" i]',
+      'input[data-autom*="building" i]',
+      'input[id*="companyName" i]'
+    );
+  }
+  for (const sel of sels) {
+    if (await fillVerifiedInput(page.locator(sel).first(), value)) {
+      log(`已填 ${step}（${sel}）：${value}`);
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * 訂單詳情：撳第一個「編輯」→ 填名字／姓名／區域／屋苑 →「儲存」
+ */
+async function editOrderShippingAddress(page: Page): Promise<void> {
+  log("訂單詳情：編輯送貨地址…");
+  await writeStatus({
+    phase: "edit_shipping",
+    message: "編輯送貨地址…",
+    url: page.url(),
+  });
+
+  const detailDeadline = Date.now() + 60_000;
+  while (Date.now() < detailDeadline) {
+    await throwIfStopped();
+    await syncWindowFlags().catch(() => {});
+    const url = page.url();
+    if (/\/shop\/order\/detail\//i.test(url)) break;
+    if (isAppleGuestOrderUrl(url)) {
+      await clickAddToAppleIdOnce(page).catch(() => {});
+    }
+    const hasEdit = await page
+      .getByRole("link", { name: /^編輯$|^Edit$/i })
+      .or(page.getByRole("button", { name: /^編輯$|^Edit$/i }))
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (hasEdit) break;
+    await sleep(400);
+  }
+
+  await sleep(400);
+
+  // 優先第一個「編輯」（訂單詳情送貨通常係第一個）
+  let clickedEdit = false;
+  const firstEdit = page
+    .getByRole("link", { name: /^編輯$|^Edit$/i })
+    .or(page.getByRole("button", { name: /^編輯$|^Edit$/i }))
+    .first();
+  if ((await firstEdit.count().catch(() => 0)) > 0) {
+    await firstEdit.scrollIntoViewIfNeeded().catch(() => {});
+    clickedEdit = await firstEdit
+      .click({ force: true, timeout: 4000 })
+      .then(() => true)
+      .catch(() => false);
+  }
+
+  if (!clickedEdit) {
+    clickedEdit = await page
+      .evaluate(() => {
+        const norm = (s: string) => (s || "").replace(/[\s\u00a0\u200b]+/g, "");
+        for (const el of Array.from(
+          document.querySelectorAll("a, button, [role='button']")
+        ) as HTMLElement[]) {
+          if (el.closest("#globalnav")) continue;
+          const label = norm(`${el.innerText || ""} ${el.getAttribute("aria-label") || ""}`);
+          if (label === "編輯" || label === "Edit") {
+            el.scrollIntoView({ block: "center", inline: "nearest" });
+            el.click();
+            return true;
+          }
+        }
+        return false;
+      })
+      .catch(() => false);
+  }
+
+  if (!clickedEdit) throw new Error("揾唔到第一個「編輯」掣");
+  log("已撳第一個「編輯」");
+  await sleep(800);
+
+  const formDeadline = Date.now() + 20_000;
+  while (Date.now() < formDeadline) {
+    await throwIfStopped();
+    const ready =
+      (await page
+        .getByLabel(/名字|姓氏|姓名|First name|Last name/i)
+        .first()
+        .isVisible()
+        .catch(() => false)) ||
+      (await page
+        .locator('input[id*="firstName" i], input[id*="lastName" i]')
+        .first()
+        .isVisible()
+        .catch(() => false));
+    if (ready) break;
+    await sleep(300);
+  }
+
+  const { firstName, lastName, areaStreet, building } = ORDER_SHIPPING_EDIT;
+
+  const lastOk =
+    (await fillLabeledField(page, [/^姓氏$/, /姓氏/, /^姓名$/, /Last name/i, /Family name/i], lastName, "姓名")) ||
+    (await fillLabeledField(page, [/^姓名$/], lastName, "姓名"));
+  const firstOk = await fillLabeledField(
+    page,
+    [/^名字$/, /名字/, /^名$/, /First name/i, /Given name/i],
+    firstName,
+    "名字"
+  );
+  const areaOk = await fillLabeledField(
+    page,
+    [/^區域$/, /區域\/地區\/街道/, /區域.*街道/, /街道名稱/, /Street/i, /Address Line 1/i, /^地區$/],
+    areaStreet,
+    "區域"
+  );
+  const buildingOk = await fillLabeledField(
+    page,
+    [/屋苑或大廈/, /屋苑/, /大廈/, /座數/, /Address Line 2/i, /Building/i],
+    building,
+    "屋苑或大廈"
+  );
+
+  if (!lastOk) throw new Error("填唔入「姓名」");
+  if (!firstOk) throw new Error("填唔入「名字」");
+  if (!areaOk) throw new Error("填唔入「區域」");
+  if (!buildingOk) throw new Error("填唔入「屋苑或大廈」");
+
+  await sleep(400);
+
+  const saveClicked =
+    (await page
+      .getByRole("button", { name: /^儲存$|^Save$/i })
+      .first()
+      .click({ force: true, timeout: 4000 })
+      .then(() => true)
+      .catch(() => false)) ||
+    (await page
+      .getByRole("link", { name: /^儲存$|^Save$/i })
+      .first()
+      .click({ force: true, timeout: 3000 })
+      .then(() => true)
+      .catch(() => false)) ||
+    (await page
+      .evaluate(() => {
+        const norm = (s: string) => (s || "").replace(/[\s\u00a0]+/g, "");
+        for (const el of Array.from(
+          document.querySelectorAll("button, a, [role='button'], input[type='submit']")
+        ) as HTMLElement[]) {
+          if (el.closest("#globalnav")) continue;
+          const t = norm(
+            `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${(el as HTMLInputElement).value || ""}`
+          );
+          if (t === "儲存" || t === "Save" || t.startsWith("儲存")) {
+            el.click();
+            return true;
+          }
+        }
+        return false;
+      })
+      .catch(() => false));
+
+  if (!saveClicked) throw new Error("撳唔到「儲存」");
+  log("已撳「儲存」");
+  await sleep(1000);
+
+  const doneDeadline = Date.now() + 20_000;
+  while (Date.now() < doneDeadline) {
+    await throwIfStopped();
+    const stillEditing = await page
+      .getByRole("button", { name: /^儲存$|^Save$/i })
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (!stillEditing) break;
+    await sleep(400);
+  }
+  log("送貨地址已儲存");
+  await writeStatus({
+    phase: "shipping_saved",
+    message: "送貨地址已儲存",
+    url: page.url(),
+  });
 }
 
 /**
@@ -2973,19 +3233,33 @@ async function processOneAccount(
         log(`已在 Apple 訂單流程（${applePage.url()}），跳過 Gmail`);
         activePage = applePage;
         await maybeMinimizeBrowserWindow(applePage, browser);
+        // 已喺 order/detail → 直接編輯送貨
+        if (/\/shop\/order\/detail\//i.test(applePage.url())) {
+          await editOrderShippingAddress(applePage);
+          await writeStatus({
+            phase: "steps_complete",
+            message: `步驟完成（${orderNumber}）· 送貨已儲存`,
+            orderNumber,
+            windowHidden: !userKeepBrowserOpen,
+            keepOpen: userKeepBrowserOpen,
+          });
+          log(`完成：${maskEmail(account.email)} · ${orderNumber} → 送貨已儲存`);
+          return;
+        }
         await fillOrderVerifyPhoneAndContinue(applePage, orderNumber);
         await waitForAppleGuestOrderPage(applePage);
         await writeStatus({ phase: "add_to_apple_id", message: "加入至 Apple ID…", orderNumber });
         await clickAddToAppleIdOnce(applePage);
         await signInAppleIdOnOrderPage(applePage, appleEmail, applePassword);
+        await editOrderShippingAddress(applePage);
         await writeStatus({
           phase: "steps_complete",
-          message: `步驟完成（${orderNumber}）`,
+          message: `步驟完成（${orderNumber}）· 送貨已儲存`,
           orderNumber,
           windowHidden: !userKeepBrowserOpen,
           keepOpen: userKeepBrowserOpen,
         });
-        log(`完成：${maskEmail(account.email)} · ${orderNumber} → 已嘗試加入 Apple ID`);
+        log(`完成：${maskEmail(account.email)} · ${orderNumber} → Apple ID + 送貨已儲存`);
         return;
       }
     }
@@ -3066,14 +3340,15 @@ async function processOneAccount(
     await writeStatus({ phase: "add_to_apple_id", message: "登入／加入至 Apple ID…", orderNumber });
     await clickAddToAppleIdOnce(orderPage);
     await signInAppleIdOnOrderPage(orderPage, appleEmail, applePassword);
+    await editOrderShippingAddress(orderPage);
     await writeStatus({
       phase: "steps_complete",
-      message: `步驟完成（${orderNumber}）`,
+      message: `步驟完成（${orderNumber}）· 送貨已儲存`,
       orderNumber,
       windowHidden: !userKeepBrowserOpen,
       keepOpen: userKeepBrowserOpen,
     });
-    log(`完成：${maskEmail(account.email)} · ${orderNumber} → 已嘗試加入 Apple ID`);
+    log(`完成：${maskEmail(account.email)} · ${orderNumber} → Apple ID + 送貨已儲存`);
   };
 
   for (;;) {
