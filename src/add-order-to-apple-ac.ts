@@ -1940,17 +1940,11 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
       return url.includes(enc) || url.includes(keyword);
     }
   };
-  /** 淨係 #search/訂單/threadId 先算正確 —— #inbox/xxx 係錯信，唔接受 */
-  const isCorrectOrderThreadUrl = (url: string) => {
+  /** #search/訂單 淨係列表（未開 thread） */
+  const isSearchListOnly = (url: string) => {
     const hash = url.split("#")[1] || "";
     const parts = hash.split("/").filter(Boolean);
-    if (parts[0] !== "search" || parts.length < 3) return false;
-    try {
-      const q = decodeURIComponent(parts[1] || "");
-      return q.includes(keyword) || parts[1] === enc || urlHasKeyword(url);
-    } catch {
-      return urlHasKeyword(url);
-    }
+    return parts[0] === "search" && parts.length < 3 && urlHasKeyword(url);
   };
 
   log(`搜尋郵件（訂單編號）：${keyword}…`);
@@ -1961,28 +1955,26 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
     orderNumber: keyword,
   });
 
-  // 若誤入 #inbox/亂 thread：強制返 search
+  const goToSearchList = async () => {
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
+    await sleep(500);
+    if (!/#search\//i.test(page.url()) || !urlHasKeyword(page.url())) {
+      await page
+        .evaluate((q) => {
+          location.hash = `#search/${encodeURIComponent(q)}`;
+        }, keyword)
+        .catch(() => {});
+      await sleep(400);
+    }
+    await dismissGmailOverlays(page);
+  };
+
+  // 若誤入 #inbox／非本單：返 search
   if (/#inbox\//i.test(page.url()) || !urlHasKeyword(page.url()) || !/#search\//i.test(page.url())) {
     log(`離開錯誤頁 ${page.url()} → 搜尋 ${keyword}`);
-    await page
-      .evaluate((q) => {
-        location.hash = `#search/${encodeURIComponent(q)}`;
-      }, keyword)
-      .catch(() => {});
-    await sleep(400);
-    if (!/#search\//i.test(page.url()) || !urlHasKeyword(page.url())) {
-      await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
-    }
+    await goToSearchList();
   }
   await dismissGmailOverlays(page);
-
-  log(`搜尋結果頁：${page.url()}`);
-  await writeStatus({
-    phase: "search_email",
-    message: `已搜尋「${keyword}」，點開含訂單編號嘅郵件…`,
-    url: page.url(),
-    orderNumber: keyword,
-  });
 
   const probeList = async () =>
     page
@@ -1998,54 +1990,100 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
       }, keyword)
       .catch(() => ({ za: 0, hasOrder: false, ok: false }));
 
-  const listDeadline = Date.now() + 20_000;
-  let probe = await probeList();
-  while (Date.now() < listDeadline && !probe.ok) {
+  // 停喺 #search/訂單 列表時：自動重試開信（唔即刻 error hold）
+  const maxAttempts = 12;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     await throwIfStopped();
-    await dismissGmailOverlays(page);
-    probe = await probeList();
-    if (probe.ok) break;
-    const empty = await page
-      .getByText(/沒有與你的搜尋相符|No messages matched|找不到任何郵件/i)
-      .first()
-      .isVisible()
-      .catch(() => false);
-    if (empty) throw new Error(`Gmail 搜尋訂單「${keyword}」冇結果`);
-    await sleep(400);
-  }
-  if (!probe.ok) {
-    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
-    await sleep(800);
-    probe = await probeList();
-  }
-  if (!probe.ok) throw new Error(`Gmail 搜尋訂單「${keyword}」搵唔到郵件列`);
 
-  // 已正確開咗 search thread 且正文有訂單 → 跳過
-  if (await isGmailDetailReallyOpen(page, keyword)) {
-    log("搜尋結果已打開正確訂單郵件");
-  } else {
-    // 若而家喺 #inbox/…：先拉返 search 再開
-    if (/#inbox\//i.test(page.url())) {
-      log(`偵測到錯誤 inbox thread，返回搜尋：${page.url()}`);
+    if (await isGmailDetailReallyOpen(page, keyword)) {
+      log(`訂單郵件詳情已打開（第 ${attempt} 輪）`);
+      break;
+    }
+
+    // 確保喺 search 列表
+    if (!/#search\//i.test(page.url()) || !urlHasKeyword(page.url()) || /#inbox\//i.test(page.url())) {
+      await goToSearchList();
+    }
+    // 若仍係 thread URL 但正文唔對 → 返列表
+    if (!isSearchListOnly(page.url()) && !(await isGmailDetailReallyOpen(page, keyword))) {
+      log(`未開對詳情，返回搜尋列表再試（${attempt}/${maxAttempts}）`);
       await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
       await sleep(600);
     }
+
+    log(`搜尋結果頁：${page.url()} · 開信嘗試 ${attempt}/${maxAttempts}`);
+    await writeStatus({
+      phase: "search_email",
+      message: `搜尋「${keyword}」· 開信重試 ${attempt}/${maxAttempts}`,
+      url: page.url(),
+      orderNumber: keyword,
+    });
+
+    // 等列表
+    const listDeadline = Date.now() + 12_000;
+    let probe = await probeList();
+    while (Date.now() < listDeadline && !probe.ok) {
+      await throwIfStopped();
+      await dismissGmailOverlays(page);
+      probe = await probeList();
+      if (probe.ok) break;
+      const empty = await page
+        .getByText(/沒有與你的搜尋相符|No messages matched|找不到任何郵件/i)
+        .first()
+        .isVisible()
+        .catch(() => false);
+      if (empty) throw new Error(`Gmail 搜尋訂單「${keyword}」冇結果`);
+      await sleep(350);
+    }
+    if (!probe.ok) {
+      await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
+      await sleep(700);
+      probe = await probeList();
+    }
+    if (!probe.ok) {
+      log(`第 ${attempt} 次：列表未就緒，reload 再試…`);
+      continue;
+    }
+
     log("點開含訂單編號／已選中嘅搜尋結果…");
-    let opened = await openSelectedOrFirstGmailResult(page, keyword);
-    if (!opened || !(await isGmailDetailReallyOpen(page, keyword))) {
-      if (/#inbox\//i.test(page.url()) || !/#search\//i.test(page.url())) {
-        log("開信未穩 — 返回 search 再試");
-        await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
-        await sleep(700);
-      }
-      opened = await openSelectedOrFirstGmailResult(page, keyword);
+    await openSelectedOrFirstGmailResult(page, keyword);
+
+    if (await isGmailDetailReallyOpen(page, keyword)) {
+      log(`開信成功（第 ${attempt} 次）`);
+      break;
     }
-    if (/#inbox\//i.test(page.url()) && !(await messageBodyHasOrder(page, keyword))) {
-      throw new Error(`開錯郵件（inbox thread）：${page.url()} — 應為 #search/${keyword}/…`);
+
+    // 仍停喺 #search/訂單（列表）→ 自動 retry
+    if (isSearchListOnly(page.url())) {
+      log(`仍停喺搜尋列表 ${page.url()} — ${attempt < maxAttempts ? "自動重試" : "已達上限"}`);
+      await writeStatus({
+        phase: "search_email",
+        message: `仍在搜尋列表，自動重試開信 ${attempt}/${maxAttempts}`,
+        url: page.url(),
+        orderNumber: keyword,
+      });
+      await sleep(800);
+      await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
+      await sleep(500);
+      continue;
     }
-    if (!(await isGmailDetailReallyOpen(page, keyword))) {
-      throw new Error(`搜尋結果打唔開訂單「${keyword}」郵件詳情（仍喺 ${page.url()}）`);
+
+    // 去咗 inbox 錯信 → 返 search 再試
+    if (/#inbox\//i.test(page.url())) {
+      log("誤入 inbox，返回 search 重試…");
+      await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
+      await sleep(600);
+      continue;
     }
+
+    await sleep(600);
+  }
+
+  if (!(await isGmailDetailReallyOpen(page, keyword))) {
+    // 最後仍係列表：丟可辨識錯誤，外層會再自動 retry
+    throw new Error(
+      `SEARCH_LIST_STUCK：仍停喺搜尋列表未能打開訂單「${keyword}」郵件（${page.url()}）`
+    );
   }
 
   await writeStatus({
@@ -3814,9 +3852,13 @@ async function processOneAccount(
     log(`完成：${maskEmail(account.email)} · ${orderNumber} → Apple ID + 送貨已儲存`);
   };
 
+  let searchListAutoRetries = 0;
+  const orderNumber = String(account.orderNumber || "").trim();
+
   for (;;) {
     try {
       await runSteps();
+      searchListAutoRetries = 0;
       break;
     } catch (err) {
       if (err instanceof CloseRequestedError) throw err;
@@ -3825,16 +3867,59 @@ async function processOneAccount(
         if (next === "close") throw new CloseRequestedError();
         continue;
       }
-      // 其他錯誤：唔關瀏覽器，等 Continue 再試／Close 先關
-      log(`步驟錯誤：${err instanceof Error ? err.message : String(err)}`);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      log(`步驟錯誤：${errMsg}`);
       await writeStatus({
         phase: "error",
-        message: err instanceof Error ? err.message : String(err),
+        message: errMsg,
         windowHidden,
       });
-      // 唔自動開窗；要睇就撳 Open browser
+
+      // 停喺 #search/訂單 列表（未開 thread）：自動重試，唔使等 Continue
+      const curUrl = page.url();
+      const stuckOnSearchList = (() => {
+        const hash = curUrl.split("#")[1] || "";
+        const parts = hash.split("/").filter(Boolean);
+        const hasOrder =
+          curUrl.includes(orderNumber) ||
+          curUrl.includes(encodeURIComponent(orderNumber));
+        return (
+          /SEARCH_LIST_STUCK/i.test(errMsg) ||
+          (parts[0] === "search" && parts.length < 3 && hasOrder) ||
+          (/打唔開訂單|仍停喺搜尋|郵件詳情|揾唔到「訂單狀態」/i.test(errMsg) &&
+            /#search\//i.test(curUrl) &&
+            hasOrder &&
+            parts.length < 3)
+        );
+      })();
+      if (stuckOnSearchList) {
+        searchListAutoRetries += 1;
+        if (searchListAutoRetries <= 8) {
+          log(
+            `偵測到停喺搜尋列表（${curUrl}）— 自動重試開信 ${searchListAutoRetries}/8（唔使 Continue）`
+          );
+          await writeStatus({
+            phase: "search_email",
+            message: `搜尋列表卡住，自動重試 ${searchListAutoRetries}/8`,
+            url: curUrl,
+            orderNumber,
+          });
+          await page
+            .goto(
+              `https://mail.google.com/mail/u/0/#search/${encodeURIComponent(orderNumber)}`,
+              { waitUntil: "domcontentloaded", timeout: 45_000 }
+            )
+            .catch(() => {});
+          await sleep(1000);
+          continue;
+        }
+        log("搜尋列表自動重試已用盡，改等 Continue");
+        searchListAutoRetries = 0;
+      }
+
       const next = await holdBrowserUntilClose("出錯後保持瀏覽器開啟 — Continue 重試／Close 關閉");
       if (next === "close") throw new CloseRequestedError();
+      searchListAutoRetries = 0;
       continue;
     }
   }
