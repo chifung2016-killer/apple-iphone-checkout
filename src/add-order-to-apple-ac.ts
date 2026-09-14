@@ -18,7 +18,14 @@ import {
   type Locator,
   type Page,
 } from "playwright";
-import { decryptFromFile, maskEmail, redactSecrets } from "./add-order-secrets.js";
+import {
+  decryptFromFile,
+  encryptToBlob,
+  loadShippingAddress,
+  maskEmail,
+  redactSecrets,
+  type ShippingAddress,
+} from "./add-order-secrets.js";
 
 type Account = { email: string; password: string; orderNumber: string };
 
@@ -33,6 +40,8 @@ const JOB_ENC =
   process.env.ADD_ORDER_JOB_ENC || path.join(ROOT, "runtime", "add-order-job.enc");
 const KEY_PATH =
   process.env.ADD_ORDER_KEY_PATH || path.join(ROOT, "runtime", ".add-order-key");
+const SHIPPING_ENC =
+  process.env.ADD_ORDER_SHIPPING_ENC || path.join(ROOT, "runtime", "shipping-address.enc");
 const LEGACY_CONFIG =
   process.env.ADD_ORDER_CONFIG_PATH ||
   process.env.CHECKOUT_CONFIG_PATH ||
@@ -2537,29 +2546,20 @@ async function fillVerifiedInput(field: Locator, value: string): Promise<boolean
     .catch(() => false);
 }
 
-/** 訂單詳情送貨地址（固定） */
-const ORDER_SHIPPING_EDIT = {
-  firstName: "Chi Fung", // 名字
-  lastName: "Leung", // 姓名
-  areaStreet: "37 ko shing steet, sai ying pun", // 區域
-  building: "11b, tai fat building", // 屋苑或大廈
-} as const;
+/** 訂單詳情送貨地址：AES 加密存 runtime/shipping-address.enc，唔寫明文入 source／status */
+let cachedShipping: ShippingAddress | null = null;
 
-function shippingStatusFields() {
-  return {
-    shipping: {
-      firstName: ORDER_SHIPPING_EDIT.firstName,
-      lastName: ORDER_SHIPPING_EDIT.lastName,
-      areaStreet: ORDER_SHIPPING_EDIT.areaStreet,
-      building: ORDER_SHIPPING_EDIT.building,
-      labels: {
-        firstName: "名字",
-        lastName: "姓名",
-        areaStreet: "區域",
-        building: "屋苑或大廈",
-      },
-    },
-  };
+async function getOrderShipping(): Promise<ShippingAddress> {
+  if (cachedShipping) return cachedShipping;
+  cachedShipping = await loadShippingAddress(SHIPPING_ENC, KEY_PATH);
+  return cachedShipping;
+}
+
+/** status 只存密文 blob；dashboard 用 key 先解 */
+async function shippingStatusFields(): Promise<{ shippingEnc: string; shippingMasked: true }> {
+  const s = await getOrderShipping();
+  const blob = await encryptToBlob(KEY_PATH, JSON.stringify(s));
+  return { shippingEnc: blob, shippingMasked: true };
 }
 
 async function fillLabeledField(
@@ -2889,7 +2889,9 @@ async function editOrderShippingAddress(page: Page): Promise<void> {
     await sleep(300);
   }
 
-  const { firstName, lastName, areaStreet, building } = ORDER_SHIPPING_EDIT;
+  const { firstName, lastName, areaStreet, building } = await getOrderShipping();
+
+  log("已載入加密送貨資料，開始填表…");
 
   const lastOk =
     (await fillLabeledField(page, [/^姓氏$/, /姓氏/, /^姓名$/, /Last name/i, /Family name/i], lastName, "姓名")) ||
@@ -3066,7 +3068,7 @@ async function editOrderShippingAddress(page: Page): Promise<void> {
     phase: "shipping_saved",
     message: "送貨地址已儲存",
     url: page.url(),
-    ...shippingStatusFields(),
+    ...(await shippingStatusFields()),
   });
 }
 
@@ -3540,7 +3542,7 @@ async function processOneAccount(
             orderNumber,
             email: account.email,
             emailMasked: maskEmail(account.email),
-            ...shippingStatusFields(),
+            ...(await shippingStatusFields()),
             windowHidden: !userKeepBrowserOpen,
             keepOpen: userKeepBrowserOpen,
           });
@@ -3559,7 +3561,7 @@ async function processOneAccount(
           orderNumber,
           email: account.email,
           emailMasked: maskEmail(account.email),
-          ...shippingStatusFields(),
+          ...(await shippingStatusFields()),
           windowHidden: !userKeepBrowserOpen,
           keepOpen: userKeepBrowserOpen,
         });
@@ -3651,7 +3653,7 @@ async function processOneAccount(
       orderNumber,
       email: account.email,
       emailMasked: maskEmail(account.email),
-      ...shippingStatusFields(),
+      ...(await shippingStatusFields()),
       windowHidden: !userKeepBrowserOpen,
       keepOpen: userKeepBrowserOpen,
     });
@@ -3715,7 +3717,7 @@ async function processOneAccount(
         orderNumber,
         email: account.email,
         emailMasked: maskEmail(account.email),
-        ...shippingStatusFields(),
+        ...(await shippingStatusFields()),
       });
     } catch (err) {
       if (err instanceof CloseRequestedError) throw err;

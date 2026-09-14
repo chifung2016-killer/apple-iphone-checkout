@@ -20,12 +20,16 @@ import {
   resolveDeliveryMethodLabel,
 } from "./fulfillment-label.js";
 import {
+  decryptFromBlob,
   decryptFromFile,
+  encryptToBlob,
   encryptToFile,
+  loadShippingAddress,
   maskEmail,
   redactSecrets,
   rotateKey,
   secureWipeFile,
+  type ShippingAddress,
 } from "./add-order-secrets.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -38,6 +42,7 @@ const PROXY_BLACKLIST_FILE = path.join(RUNTIME_DIR, "proxy-blacklist.json");
 const GMAIL_ACCOUNTS_ENC = path.join(RUNTIME_DIR, "gmail-accounts.enc");
 const GMAIL_ACCOUNTS_LEGACY = path.join(RUNTIME_DIR, "gmail-accounts-saved.txt");
 const ADD_ORDER_KEY = path.join(RUNTIME_DIR, ".add-order-key");
+const SHIPPING_ENC = path.join(RUNTIME_DIR, "shipping-address.enc");
 const ADD_ORDER_JOB_ENC = path.join(RUNTIME_DIR, "add-order-job.enc");
 const ADD_ORDER_JOB_LEGACY = path.join(RUNTIME_DIR, "add-order-apple-ac.json");
 const ADD_ORDER_STOP_FLAG = path.join(RUNTIME_DIR, "add-order-stop.flag");
@@ -115,7 +120,7 @@ function finishedArchivePath(id: string): string {
   return path.join(RUNTIME_DIR, "finished-archive", `${id}.json`);
 }
 
-/** 寫入永久 Finished 存檔（Clear all 唔會刪） */
+/** 寫入永久 Finished 存檔（Clear all 唔會刪）；送貨只存密文 */
 async function archiveFinishedAddOrderTask(
   id: string,
   st: Record<string, unknown>
@@ -123,14 +128,88 @@ async function archiveFinishedAddOrderTask(
   const nid = String(id || "").trim();
   if (!nid) return;
   await fs.mkdir(path.join(RUNTIME_DIR, "finished-archive"), { recursive: true }).catch(() => {});
+  const safe = { ...st };
+  // 唔 archive 明文 shipping
+  if (safe.shipping && !safe.shippingEnc) {
+    try {
+      const blob = await encryptToBlob(ADD_ORDER_KEY, JSON.stringify(safe.shipping));
+      safe.shippingEnc = blob;
+    } catch {
+      /* ignore */
+    }
+  }
+  delete safe.shipping;
   const payload = {
-    ...st,
+    ...safe,
     phase: "finished",
     id: nid,
     type: "add_order",
     archivedAt: new Date().toISOString(),
   };
   await fs.writeFile(finishedArchivePath(nid), JSON.stringify(payload, null, 2), "utf8");
+}
+
+async function resolveShippingForStatus(
+  st: Record<string, unknown> | null
+): Promise<ShippingAddress | null> {
+  if (!st) return null;
+  const enc = String(st.shippingEnc || "").trim();
+  if (enc) {
+    try {
+      const plain = await decryptFromBlob(ADD_ORDER_KEY, enc);
+      const parsed = JSON.parse(plain) as ShippingAddress;
+      if (parsed?.firstName && parsed?.areaStreet) return parsed;
+    } catch {
+      /* fall through */
+    }
+  }
+  // 舊明文 → 即刻加密遷移
+  const legacy = st.shipping as Partial<ShippingAddress> | undefined;
+  if (legacy?.firstName && legacy?.lastName && legacy?.areaStreet && legacy?.building) {
+    const shipping: ShippingAddress = {
+      firstName: String(legacy.firstName),
+      lastName: String(legacy.lastName),
+      areaStreet: String(legacy.areaStreet),
+      building: String(legacy.building),
+    };
+    return shipping;
+  }
+  try {
+    return await loadShippingAddress(SHIPPING_ENC, ADD_ORDER_KEY);
+  } catch {
+    return null;
+  }
+}
+
+async function scrubPlaintextShippingFromStatusFiles(): Promise<void> {
+  let files: string[] = [];
+  try {
+    files = (await fs.readdir(RUNTIME_DIR)).filter((f) => /^status-ao\d+\.json$/i.test(f));
+  } catch {
+    return;
+  }
+  for (const file of files) {
+    const id = /^status-(ao\d+)\.json$/i.exec(file)?.[1];
+    if (!id) continue;
+    const st = await readAddOrderStatus(id);
+    if (!st?.shipping) continue;
+    try {
+      const shipping = st.shipping;
+      const blob = await encryptToBlob(ADD_ORDER_KEY, JSON.stringify(shipping));
+      const next: Record<string, unknown> = { ...st, shippingEnc: blob, shippingMasked: true };
+      delete next.shipping;
+      await fs.writeFile(
+        path.join(RUNTIME_DIR, file),
+        JSON.stringify(next, null, 2),
+        "utf8"
+      );
+      if (isAddOrderFinishedPhase(st.phase)) {
+        await archiveFinishedAddOrderTask(id, next);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 /** 誤被 Clear／Close 標成 closed 但已到 order/detail → 還原 Finished */
@@ -258,6 +337,7 @@ async function recoverAddOrderTasksFromDisk(): Promise<void> {
 
 async function snapshotAddOrderTasks() {
   await recoverAddOrderTasksFromDisk();
+  await scrubPlaintextShippingFromStatusFiles().catch(() => {});
   const tasks = [];
   for (const t of addOrderTasks.values()) {
     const st = await readAddOrderStatus(t.id);
@@ -266,7 +346,6 @@ async function snapshotAddOrderTasks() {
       addOrderTasks.delete(t.id);
       continue;
     }
-    // 對齊 running 狀態（process 可能已死）
     if (t.running && t.pid) {
       try {
         process.kill(t.pid, 0);
@@ -277,12 +356,16 @@ async function snapshotAddOrderTasks() {
       }
     }
     if (isAddOrderFinishedPhase(phase) && st) {
-      await archiveFinishedAddOrderTask(t.id, { ...st, phase: "finished" }).catch(() => {});
+      await archiveFinishedAddOrderTask(t.id, st).catch(() => {});
+    }
+    // Finished：本機 dashboard 解密顯示；磁碟只留 shippingEnc
+    let shipping: ShippingAddress | null = null;
+    if (isAddOrderFinishedPhase(phase)) {
+      shipping = await resolveShippingForStatus(st);
     }
     tasks.push({
       id: t.id,
       emailMasked: t.emailMasked || st?.emailMasked || "—",
-      // Finished 顯示完整 Gmail；active 亦可帶但 UI 可選擇用 masked
       email: String(st?.email || "").trim() || "",
       orderNumber: t.orderNumber || st?.orderNumber || "",
       running: t.running,
@@ -294,7 +377,7 @@ async function snapshotAddOrderTasks() {
       url: st?.url || "",
       windowHidden: st?.windowHidden !== false,
       keepOpen: st?.keepOpen === true,
-      shipping: (st?.shipping as Record<string, unknown> | undefined) || null,
+      shipping,
       logs: t.logs.slice(-80).map(redactSecrets),
     });
   }
@@ -2012,7 +2095,40 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     await secureWipeFile(ADD_ORDER_JOB_ENC);
     await secureWipeFile(ADD_ORDER_JOB_LEGACY);
     await secureWipeFile(ADD_ORDER_STOP_FLAG);
+    // 換 key 前保留送貨地址明文於記憶體，換完再加密寫返
+    let shippingPlain = "";
+    try {
+      shippingPlain = await decryptFromFile(SHIPPING_ENC, ADD_ORDER_KEY);
+    } catch {
+      shippingPlain = "";
+    }
     await rotateKey(ADD_ORDER_KEY);
+    if (shippingPlain) {
+      await encryptToFile(SHIPPING_ENC, ADD_ORDER_KEY, shippingPlain).catch(() => {});
+    } else {
+      await loadShippingAddress(SHIPPING_ENC, ADD_ORDER_KEY).catch(() => {});
+    }
+    // Finished status 內 shippingEnc 要用新 key 重加密
+    for (const id of [...addOrderTasks.keys()]) {
+      const st = await readAddOrderStatus(id);
+      if (!st || !isAddOrderFinishedPhase(st.phase)) continue;
+      try {
+        const ship = shippingPlain
+          ? (JSON.parse(shippingPlain) as ShippingAddress)
+          : await loadShippingAddress(SHIPPING_ENC, ADD_ORDER_KEY);
+        const blob = await encryptToBlob(ADD_ORDER_KEY, JSON.stringify(ship));
+        const next: Record<string, unknown> = { ...st, shippingEnc: blob, shippingMasked: true };
+        delete next.shipping;
+        await fs.writeFile(
+          path.join(RUNTIME_DIR, `status-${id}.json`),
+          JSON.stringify(next, null, 2),
+          "utf8"
+        );
+        await archiveFinishedAddOrderTask(id, next);
+      } catch {
+        /* ignore */
+      }
+    }
     return sendJson(res, 200, {
       ok: true,
       cleared: [
@@ -2022,7 +2138,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
         "logs",
         "key-rotated",
       ],
-      kept: "finished-tasks",
+      kept: "finished-tasks+shipping-enc",
       tasks: await snapshotAddOrderTasks(),
     });
   }

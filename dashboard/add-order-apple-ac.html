@@ -488,17 +488,16 @@
               ${
                 finishedCard
                   ? (() => {
-                      const s = t.shipping || {};
-                      const firstName = s.firstName || "Chi Fung";
-                      const lastName = s.lastName || "Leung";
-                      const area = s.areaStreet || "37 ko shing steet, sai ying pun";
-                      const building = s.building || "11b, tai fat building";
+                      const s = t.shipping;
+                      if (!s || !s.firstName) {
+                        return `<div class="shipping-block"><div><b>送貨資料</b> [encrypted — 本機解密中／未載入]</div></div>`;
+                      }
                       return `<div class="shipping-block">
-                  <div><b>送貨資料</b></div>
-                  <div>名字：${esc(firstName)}</div>
-                  <div>姓名：${esc(lastName)}</div>
-                  <div>區域：${esc(area)}</div>
-                  <div>屋苑或大廈：${esc(building)}</div>
+                  <div><b>送貨資料</b>（本機解密）</div>
+                  <div>名字：${esc(s.firstName)}</div>
+                  <div>姓名：${esc(s.lastName)}</div>
+                  <div>區域：${esc(s.areaStreet)}</div>
+                  <div>屋苑或大廈：${esc(s.building)}</div>
                 </div>`;
                     })()
                   : ""
