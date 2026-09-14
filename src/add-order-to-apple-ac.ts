@@ -2889,54 +2889,148 @@ async function editOrderShippingAddress(page: Page): Promise<void> {
   if (!areaOk) throw new Error("填唔入「區域」");
   if (!buildingOk) throw new Error("填唔入「屋苑或大廈」");
 
-  await sleep(400);
+  await sleep(500);
+  log("地址已填完，撳「儲存」…");
+  await writeStatus({
+    phase: "edit_shipping",
+    message: "撳「儲存」…",
+    url: page.url(),
+  });
 
-  const saveClicked =
-    (await page
-      .getByRole("button", { name: /^儲存$|^Save$/i })
-      .first()
-      .click({ force: true, timeout: 4000 })
-      .then(() => true)
-      .catch(() => false)) ||
-    (await page
-      .getByRole("link", { name: /^儲存$|^Save$/i })
-      .first()
-      .click({ force: true, timeout: 3000 })
-      .then(() => true)
-      .catch(() => false)) ||
-    (await page
+  const saveStillVisible = async (): Promise<boolean> => {
+    return (
+      (await page.getByRole("button", { name: /儲存|Save/i }).first().isVisible().catch(() => false)) ||
+      (await page.getByRole("link", { name: /^儲存$|^Save$/i }).first().isVisible().catch(() => false)) ||
+      (await page.locator("button, a, [role='button']").filter({ hasText: /^[\s]*儲存[\s]*$/ }).first().isVisible().catch(() => false))
+    );
+  };
+
+  const tryClickSaveOnce = async (attempt: number): Promise<boolean> => {
+    // 1) 常見 button／submit
+    const candidates = [
+      page.getByRole("button", { name: /^儲存$|^Save$/i }).first(),
+      page.getByRole("button", { name: /儲存|Save/i }).first(),
+      page.locator('button[type="submit"], input[type="submit"]').filter({ hasText: /儲存|Save/i }).first(),
+      page.locator("button.as-button-large, button.button, button[class*='button']").filter({ hasText: /^[\s]*儲存[\s]*$/ }).first(),
+      page.getByRole("link", { name: /^儲存$|^Save$/i }).first(),
+      page.locator("a, button, [role='button']").filter({ hasText: /^[\s]*儲存[\s]*$/ }).first(),
+      page.getByText(/^儲存$/, { exact: true }).first(),
+    ];
+    for (const loc of candidates) {
+      if ((await loc.count().catch(() => 0)) === 0) continue;
+      if (!(await loc.isVisible().catch(() => false))) continue;
+      await loc.scrollIntoViewIfNeeded().catch(() => {});
+      const box = await loc.boundingBox().catch(() => null);
+      if (box) {
+        await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2).catch(() => {});
+      }
+      const clicked = await loc
+        .click({ force: true, timeout: 2500 })
+        .then(() => true)
+        .catch(() => false);
+      if (clicked) {
+        log(`已嘗試「儲存」（PW ${attempt}）`);
+        return true;
+      }
+    }
+
+    // 2) DOM 掃描
+    const dom = await page
       .evaluate(() => {
-        const norm = (s: string) => (s || "").replace(/[\s\u00a0]+/g, "");
-        for (const el of Array.from(
-          document.querySelectorAll("button, a, [role='button'], input[type='submit']")
-        ) as HTMLElement[]) {
-          if (el.closest("#globalnav")) continue;
+        const norm = (s: string) => (s || "").replace(/[\s\u00a0\u200b]+/g, "").trim();
+        const nodes = Array.from(
+          document.querySelectorAll("button, a, [role='button'], input[type='submit'], span, div")
+        ) as HTMLElement[];
+        const cands: HTMLElement[] = [];
+        for (const el of nodes) {
+          if (el.closest("#globalnav, header, nav, footer")) continue;
           const t = norm(
             `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${(el as HTMLInputElement).value || ""}`
           );
-          if (t === "儲存" || t === "Save" || t.startsWith("儲存")) {
-            el.click();
-            return true;
-          }
+          if (t !== "儲存" && t !== "Save" && !/^儲存/.test(t)) continue;
+          // 只要短文字（按鈕）
+          if (t.length > 8) continue;
+          cands.push(el);
         }
-        return false;
+        // 優先 button／submit
+        cands.sort((a, b) => {
+          const rank = (el: HTMLElement) =>
+            el.tagName === "BUTTON" || (el as HTMLInputElement).type === "submit"
+              ? 0
+              : el.tagName === "A"
+                ? 1
+                : 2;
+          return rank(a) - rank(b);
+        });
+        const top = cands[0];
+        if (!top) return { ok: false, n: 0, tag: "" };
+        const clickable =
+          (top.closest("button, a, [role='button']") as HTMLElement) || top;
+        clickable.scrollIntoView({ block: "center", inline: "nearest" });
+        clickable.click();
+        return { ok: true, n: cands.length, tag: clickable.tagName };
       })
-      .catch(() => false));
+      .catch(() => ({ ok: false, n: 0, tag: "" }));
 
-  if (!saveClicked) throw new Error("撳唔到「儲存」");
+    if (dom.ok) {
+      log(`已嘗試「儲存」（DOM ${attempt}·${dom.tag}·n=${dom.n}）`);
+      return true;
+    }
+    return false;
+  };
+
+  const saveDeadline = Date.now() + 45_000;
+  let saveDone = false;
+  let saveAttempt = 0;
+  while (!saveDone && Date.now() < saveDeadline) {
+    await throwIfStopped();
+    await syncWindowFlags().catch(() => {});
+    saveAttempt += 1;
+    await writeStatus({
+      phase: "edit_shipping",
+      message: `重試撳「儲存」 ${saveAttempt}…`,
+      url: page.url(),
+    });
+
+    // 確保表單欄位仍在視野
+    await page
+      .getByLabel(/名字|姓名|區域|First name|Last name/i)
+      .first()
+      .scrollIntoViewIfNeeded()
+      .catch(() => {});
+    await page.keyboard.press("Tab").catch(() => {});
+    await sleep(200);
+
+    const hit = await tryClickSaveOnce(saveAttempt);
+    await sleep(800);
+
+    // 成功條件：儲存掣消失，或返回只有「編輯」嘅詳情
+    const stillSave = await saveStillVisible();
+    const backToDetail =
+      /\/shop\/order\/detail\//i.test(page.url()) &&
+      (await page.getByText(/標準運送/).first().isVisible().catch(() => false)) &&
+      !(await page.getByLabel(/名字|First name/i).first().isVisible().catch(() => false));
+
+    if (!stillSave || backToDetail) {
+      saveDone = true;
+      log(`「儲存」成功（第 ${saveAttempt} 次${hit ? "" : "·延遲確認"}）`);
+      break;
+    }
+    await sleep(400 + Math.min(600, saveAttempt * 50));
+  }
+
+  if (!saveDone) throw new Error("撳唔到「儲存」");
   log("已撳「儲存」");
-  await sleep(1000);
+  await sleep(800);
 
   const doneDeadline = Date.now() + 20_000;
   while (Date.now() < doneDeadline) {
     await throwIfStopped();
-    const stillEditing = await page
-      .getByRole("button", { name: /^儲存$|^Save$/i })
-      .first()
-      .isVisible()
-      .catch(() => false);
+    const stillEditing = await saveStillVisible();
     if (!stillEditing) break;
-    await sleep(400);
+    // 若仲喺度，再補撳一次
+    await tryClickSaveOnce(99).catch(() => false);
+    await sleep(500);
   }
   log("送貨地址已儲存");
   await writeStatus({
