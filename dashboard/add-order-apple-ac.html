@@ -246,6 +246,7 @@
       <div class="actions" style="margin-top:0; margin-bottom:10px">
         <button type="button" class="btn-primary" id="btnSelectAll">Select all</button>
         <button type="button" class="btn-ghost" id="btnSelectNone">Clear selection</button>
+        <button type="button" class="btn-primary" id="btnPasteAccounts" title="貼上 Live card limits 複製嘅 email:password:order number">Paste</button>
         <button type="button" class="btn-primary" id="btnSaveAccounts">Save</button>
         <button type="button" class="btn-danger" id="btnClearAccounts">Clear all</button>
       </div>
@@ -582,6 +583,54 @@
     $("btnSelectNone").addEventListener("click", () => {
       selectedKeys.clear();
       renderAccountRows();
+    });
+
+    $("btnPasteAccounts").addEventListener("click", async () => {
+      const btn = $("btnPasteAccounts");
+      const prev = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Pasting…";
+      try {
+        const clip = String((await navigator.clipboard.readText()) || "").trim();
+        if (!clip) {
+          alert("剪貼簿係空嘅。請先喺 Live card limits 撳 Copy info。");
+          return;
+        }
+        const parsed = parseAccounts(clip);
+        if (!parsed.length) {
+          alert("剪貼簿格式唔啱。需要每行：email:password:order number");
+          return;
+        }
+        const ta = $("accounts");
+        const existing = String(ta.value || "").trim();
+        // 合併去重（同一 email+order 只留一次）
+        const merged = new Map();
+        for (const a of [...parseAccounts(existing), ...parsed]) {
+          merged.set(accountKey(a), a);
+        }
+        ta.value = [...merged.values()]
+          .map((a) => `${a.email}:${a.password}:${a.orderNumber}`)
+          .join("\n");
+        const raw = $("rawEdit");
+        if (raw && !raw.open) raw.open = true;
+        // 自動選取今次貼上嗰啲
+        for (const a of parsed) selectedKeys.add(accountKey(a));
+        renderAccountRows();
+        btn.textContent = `Pasted ${parsed.length}`;
+        setTimeout(() => {
+          btn.textContent = prev;
+        }, 1200);
+      } catch (err) {
+        alert(
+          "讀唔到剪貼簿（瀏覽器可能要權限）。可改為喺「編輯列表」手動 Ctrl+V。\n" +
+            (err instanceof Error ? err.message : String(err))
+        );
+      } finally {
+        btn.disabled = false;
+        setTimeout(() => {
+          if (btn.textContent.startsWith("Pasted")) btn.textContent = prev;
+        }, 1300);
+      }
     });
 
     $("accounts").addEventListener("input", () => {
