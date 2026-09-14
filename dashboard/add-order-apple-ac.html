@@ -383,6 +383,23 @@
       return /finished|steps_complete|shipping_saved/i.test(String(t?.phase || ""));
     }
 
+    /** Finished：同一訂單編號只留一張（保留最新 ao 編號） */
+    function uniqueFinishedByOrder(tasks) {
+      const byOrder = new Map();
+      for (const t of tasks || []) {
+        const order = String(t.orderNumber || "").trim() || `__${t.id}`;
+        const prev = byOrder.get(order);
+        if (!prev) {
+          byOrder.set(order, t);
+          continue;
+        }
+        const prevN = Number(/^ao(\d+)$/i.exec(String(prev.id || ""))?.[1] || 0);
+        const curN = Number(/^ao(\d+)$/i.exec(String(t.id || ""))?.[1] || 0);
+        if (curN >= prevN) byOrder.set(order, t);
+      }
+      return [...byOrder.values()];
+    }
+
     function phasePill(phase) {
       const p = String(phase || "");
       if (/waiting_captcha/i.test(p)) return { cls: "captcha", label: "captcha — enter letters" };
@@ -417,7 +434,7 @@
       lastTasks = Array.isArray(tasks) ? tasks : [];
       const box = $("taskList");
       const all = lastTasks.filter((t) => !/^closed$/i.test(String(t.phase || "")));
-      const finished = all.filter(isFinishedTask);
+      const finished = uniqueFinishedByOrder(all.filter(isFinishedTask));
       const active = all.filter((t) => !isFinishedTask(t));
       $("activeCount").textContent = String(active.length);
       $("finishedCount").textContent = String(finished.length);
