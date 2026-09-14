@@ -46,7 +46,15 @@
       border: 1px solid var(--line); border-radius: 18px; padding: 18px;
       margin-bottom: 16px;
     }
-    section h2 {
+    .section-head {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px; margin-bottom: 14px;
+    }
+    .section-head h2 {
+      margin: 0; font-size: 0.78rem; text-transform: uppercase;
+      letter-spacing: 0.08em; color: var(--muted); font-weight: 600;
+    }
+    section > h2 {
       margin: 0 0 14px; font-size: 0.78rem; text-transform: uppercase;
       letter-spacing: 0.08em; color: var(--muted); font-weight: 600;
     }
@@ -57,7 +65,7 @@
       color: var(--text); border-radius: 10px; padding: 10px 12px; font: inherit; outline: none;
     }
     textarea {
-      min-height: 180px;
+      min-height: 120px;
       resize: vertical;
       font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
       font-size: 0.86rem;
@@ -93,7 +101,6 @@
       white-space: pre-wrap;
       word-break: break-word;
     }
-    #logs .dim { color: var(--muted); }
     #statusPill {
       display: inline-flex; align-items: center; gap: 8px;
       padding: 6px 10px; border-radius: 999px; border: 1px solid var(--line);
@@ -107,6 +114,18 @@
       border-color: color-mix(in srgb, var(--warn) 45%, var(--line));
     }
     .btn-sm { padding: 7px 10px; font-size: 0.82rem; }
+    .task-tabs { display: flex; gap: 8px; }
+    .task-tabs button {
+      padding: 6px 12px; font-size: 0.78rem; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.04em;
+    }
+    .task-tabs button.is-active {
+      background: var(--accent); color: var(--accent-ink); border-color: transparent;
+    }
+    .task-tabs button .count {
+      display: inline-block; min-width: 1.2em; margin-left: 4px;
+      opacity: 0.85;
+    }
     .task-list { display: grid; gap: 12px; }
     .task-card {
       border: 1px solid var(--line);
@@ -135,27 +154,102 @@
     .phase-pill.manual { background: color-mix(in srgb, var(--warn) 35%, var(--field)); color: #3a2a10; border-color: transparent; }
     .phase-pill.done { background: color-mix(in srgb, var(--ok) 40%, var(--field)); color: #062816; border-color: transparent; }
     .task-meta { font-size: 0.85rem; color: var(--muted); margin-bottom: 10px; }
+    .task-meta:last-child { margin-bottom: 0; }
     .task-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+    .account-list {
+      display: grid; gap: 8px;
+      max-height: 320px; overflow: auto;
+      padding: 2px;
+      margin-bottom: 10px;
+    }
+    .account-row {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 10px;
+      align-items: start;
+      text-align: left;
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: var(--field);
+      color: var(--text);
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s, box-shadow 0.15s;
+    }
+    .account-row:hover {
+      border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+    }
+    .account-row.is-selected {
+      border-color: color-mix(in srgb, var(--accent) 70%, var(--line));
+      background: color-mix(in srgb, var(--accent) 14%, var(--field));
+      box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent);
+    }
+    .account-row .check {
+      width: 18px; height: 18px; margin-top: 2px;
+      border-radius: 5px; border: 1.5px solid var(--line);
+      background: transparent; flex-shrink: 0;
+    }
+    .account-row.is-selected .check {
+      background: var(--accent);
+      border-color: transparent;
+      box-shadow: inset 0 0 0 3px var(--field);
+    }
+    .account-row .meta { min-width: 0; }
+    .account-row .email {
+      font-weight: 600; font-size: 0.92rem;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .account-row .order {
+      color: var(--muted); font-size: 0.8rem; margin-top: 2px;
+      font-family: ui-monospace, Consolas, monospace;
+    }
+    .account-empty {
+      color: var(--muted); font-size: 0.85rem; padding: 16px;
+      border: 1px dashed var(--line); border-radius: 12px; text-align: center;
+    }
+    details.raw-edit {
+      margin-top: 8px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 8px 12px;
+      background: color-mix(in srgb, var(--field) 80%, transparent);
+    }
+    details.raw-edit summary {
+      cursor: pointer; color: var(--muted); font-size: 0.82rem;
+      user-select: none;
+    }
+    details.raw-edit[open] summary { margin-bottom: 8px; }
+    #selectedCount { color: var(--accent); font-weight: 600; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <header>
       <h1>add order to apple ac</h1>
-      <p class="sub"><a href="/">← Checkout Dashboard</a> · email:password:order number → Gmail 搜訂單編號 → 訂單狀態 → 加入至 Apple ID</p>
+      <p class="sub"><a href="/">← Checkout Dashboard</a> · 選 Gmail 列 → Apple ID → Start</p>
     </header>
 
     <section>
       <h2>Gmail accounts</h2>
-      <div class="field">
-        <label for="accounts">每行一個：email:password:order number</label>
-        <textarea id="accounts" autocomplete="off" spellcheck="false" placeholder="you@gmail.com:yourPassword:W123456789&#10;other@gmail.com:otherPassword:W987654321"></textarea>
-        <div class="actions" style="margin-top:10px">
-          <button type="button" class="btn-primary" id="btnSaveAccounts">Save</button>
-          <button type="button" class="btn-danger" id="btnClearAccounts">Clear all</button>
-        </div>
-        <p class="hint">用 <code>:</code> 分隔。第三段訂單編號會用作 Gmail inbox 搜尋關鍵字。Save 會 AES 加密存本機；每個帳號開獨立 task。</p>
+      <div class="actions" style="margin-top:0; margin-bottom:10px">
+        <button type="button" class="btn-primary" id="btnSelectAll">Select all</button>
+        <button type="button" class="btn-ghost" id="btnSelectNone">Clear selection</button>
+        <button type="button" class="btn-primary" id="btnSaveAccounts">Save</button>
+        <button type="button" class="btn-danger" id="btnClearAccounts">Clear all</button>
       </div>
+      <p class="hint" style="margin-top:0; margin-bottom:10px">
+        撳列選取帳號（可多選）。已選 <span id="selectedCount">0</span> 行 → 去下面填 Apple ID 再撳 Start。
+      </p>
+      <div class="account-list" id="accountList" role="listbox" aria-multiselectable="true" aria-label="Gmail accounts">
+        <div class="account-empty">未有帳號。喺下面「編輯列表」貼上 email:password:order number。</div>
+      </div>
+      <details class="raw-edit" id="rawEdit">
+        <summary>編輯列表（每行 email:password:order number）</summary>
+        <textarea id="accounts" autocomplete="off" spellcheck="false" placeholder="you@gmail.com:yourPassword:W123456789&#10;other@gmail.com:otherPassword:W987654321"></textarea>
+        <p class="hint">改完會即時更新上面可選列。Save 會 AES 加密存本機。</p>
+      </details>
     </section>
 
     <section>
@@ -170,7 +264,7 @@
           <input id="applePassword" type="password" value="yY6594083" autocomplete="new-password" />
         </div>
       </div>
-      <p class="hint">Google 若要輸入數字+英文字母驗證碼，會自動開瀏覽器等人手；完成後可撳該 task 嘅 Continue。</p>
+      <p class="hint">只會對<strong>已選取</strong>嘅 Gmail 列開 task，加入呢個 Apple ID。</p>
       <div class="actions">
         <button type="button" class="btn-primary" id="btnStart">Start</button>
         <button type="button" class="btn-danger" id="btnStop" disabled>Stop all</button>
@@ -179,8 +273,18 @@
     </section>
 
     <section>
-      <h2>Tasks</h2>
-      <div class="task-list" id="taskList"><p class="hint">未有 task。填 Gmail 後撳 Start。</p></div>
+      <div class="section-head">
+        <h2>Tasks</h2>
+        <div class="task-tabs" role="tablist">
+          <button type="button" class="is-active" id="tabActive" role="tab" aria-selected="true">
+            Active<span class="count" id="activeCount">0</span>
+          </button>
+          <button type="button" id="tabFinished" role="tab" aria-selected="false">
+            Finished<span class="count" id="finishedCount">0</span>
+          </button>
+        </div>
+      </div>
+      <div class="task-list" id="taskList"><p class="hint">未有 task。選 Gmail 列後撳 Start。</p></div>
     </section>
 
     <section>
@@ -195,22 +299,74 @@
     const logsEl = $("logs");
     const statusPill = $("statusPill");
     let pollTimer = null;
+    let tasksTab = "active"; // active | finished
+    let lastTasks = [];
+    /** @type {Set<string>} */
+    const selectedKeys = new Set();
+
+    function accountKey(a) {
+      return `${a.email}|||${a.orderNumber}`;
+    }
 
     function parseAccounts(text) {
       const out = [];
       for (const raw of String(text || "").split(/\r?\n/)) {
         const line = raw.trim();
         if (!line || line.startsWith("#")) continue;
-        // email:password:order number（password 中間可含 :）
         const first = line.indexOf(":");
         const last = line.lastIndexOf(":");
         if (first < 0 || last <= first) continue;
         const email = line.slice(0, first).trim();
         const password = line.slice(first + 1, last).trim();
         const orderNumber = line.slice(last + 1).trim();
-        if (email && password && orderNumber) out.push({ email, password, orderNumber });
+        if (email && password && orderNumber) out.push({ email, password, orderNumber, line });
       }
       return out;
+    }
+
+    function maskEmail(email) {
+      const s = String(email || "");
+      const at = s.indexOf("@");
+      if (at <= 0) return s || "—";
+      return `${s[0]}***${s.slice(at)}`;
+    }
+
+    function updateSelectedCount() {
+      $("selectedCount").textContent = String(selectedKeys.size);
+    }
+
+    function renderAccountRows() {
+      const accounts = parseAccounts($("accounts").value);
+      const box = $("accountList");
+      const validKeys = new Set(accounts.map(accountKey));
+      for (const k of [...selectedKeys]) {
+        if (!validKeys.has(k)) selectedKeys.delete(k);
+      }
+      if (!accounts.length) {
+        box.innerHTML =
+          '<div class="account-empty">未有帳號。喺下面「編輯列表」貼上 email:password:order number。</div>';
+        updateSelectedCount();
+        return;
+      }
+      box.innerHTML = accounts
+        .map((a, i) => {
+          const key = accountKey(a);
+          const selected = selectedKeys.has(key);
+          return `<button type="button" class="account-row ${selected ? "is-selected" : ""}" role="option" aria-selected="${selected}" data-key="${escAttr(key)}" data-idx="${i}">
+            <span class="check" aria-hidden="true"></span>
+            <span class="meta">
+              <div class="email">${esc(a.email)}</div>
+              <div class="order">${esc(a.orderNumber)}</div>
+            </span>
+          </button>`;
+        })
+        .join("");
+      updateSelectedCount();
+    }
+
+    function getSelectedAccounts() {
+      const accounts = parseAccounts($("accounts").value);
+      return accounts.filter((a) => selectedKeys.has(accountKey(a)));
     }
 
     function setStatus(text, kind) {
@@ -223,41 +379,8 @@
       logsEl.scrollTop = logsEl.scrollHeight;
     }
 
-    async function refreshStatus() {
-      try {
-        const res = await fetch("/api/add-order-apple-ac/status");
-        const data = await res.json();
-        renderLogs(data.logs || []);
-        renderTasks(data.tasks || []);
-        const running = !!data.running;
-        if (running) {
-          setStatus("Running…", "run");
-          $("btnStart").disabled = true;
-          $("btnStop").disabled = false;
-        } else if ((data.tasks || []).length) {
-          setStatus("Idle / waiting", "");
-          $("btnStart").disabled = false;
-          $("btnStop").disabled = true;
-        } else {
-          setStatus("Idle", "");
-          $("btnStart").disabled = false;
-          $("btnStop").disabled = true;
-        }
-        if (!running && pollTimer) {
-          // 仍有 task（manual_control／Finished）繼續 poll
-          const alive = (data.tasks || []).some(
-            (t) =>
-              t.running ||
-              /manual|captcha|waiting|finished|steps_complete|shipping_saved/i.test(String(t.phase || ""))
-          );
-          if (!alive) {
-            clearInterval(pollTimer);
-            pollTimer = null;
-          }
-        }
-      } catch (err) {
-        setStatus(err instanceof Error ? err.message : String(err), "err");
-      }
+    function isFinishedTask(t) {
+      return /finished|steps_complete|shipping_saved/i.test(String(t?.phase || ""));
     }
 
     function phasePill(phase) {
@@ -277,29 +400,56 @@
         .replace(/"/g, "&quot;");
     }
 
+    function escAttr(s) {
+      return esc(s).replace(/'/g, "&#39;");
+    }
+
+    function setTasksTab(tab) {
+      tasksTab = tab === "finished" ? "finished" : "active";
+      $("tabActive").classList.toggle("is-active", tasksTab === "active");
+      $("tabFinished").classList.toggle("is-active", tasksTab === "finished");
+      $("tabActive").setAttribute("aria-selected", tasksTab === "active" ? "true" : "false");
+      $("tabFinished").setAttribute("aria-selected", tasksTab === "finished" ? "true" : "false");
+      renderTasks(lastTasks);
+    }
+
     function renderTasks(tasks) {
+      lastTasks = Array.isArray(tasks) ? tasks : [];
       const box = $("taskList");
-      // 保留 Finished／running／manual；淨係 closed 先唔顯示
-      const list = (tasks || []).filter((t) => !/^closed$/i.test(String(t.phase || "")));
+      const all = lastTasks.filter((t) => !/^closed$/i.test(String(t.phase || "")));
+      const finished = all.filter(isFinishedTask);
+      const active = all.filter((t) => !isFinishedTask(t));
+      $("activeCount").textContent = String(active.length);
+      $("finishedCount").textContent = String(finished.length);
+
+      const list = tasksTab === "finished" ? finished : active;
       if (!list.length) {
-        box.innerHTML = '<p class="hint">未有 task。填 Gmail 後撳 Start。</p>';
+        box.innerHTML =
+          tasksTab === "finished"
+            ? '<p class="hint">未有 Finished task。</p>'
+            : '<p class="hint">未有 Active task。選 Gmail 列後撳 Start。</p>';
         return;
       }
-      // Finished 排前，方便喺 Tasks 見到
-      list.sort((a, b) => {
-        const af = /finished|steps_complete|shipping_saved/i.test(String(a.phase || "")) ? 0 : 1;
-        const bf = /finished|steps_complete|shipping_saved/i.test(String(b.phase || "")) ? 0 : 1;
-        if (af !== bf) return af - bf;
-        return String(a.id).localeCompare(String(b.id), undefined, { numeric: true });
-      });
+
+      list.sort((a, b) => String(a.id).localeCompare(String(b.id), undefined, { numeric: true }));
+
       box.innerHTML = list
         .map((t) => {
           const pill = phasePill(t.phase);
           const captcha = /waiting_captcha/i.test(String(t.phase || ""));
-          const finished = /finished|steps_complete|shipping_saved/i.test(String(t.phase || ""));
-          return `<article class="task-card ${captcha ? "is-captcha" : ""} ${finished ? "is-finished" : ""}" data-id="${esc(t.id)}">
+          const finishedCard = isFinishedTask(t);
+          const actions = finishedCard
+            ? ""
+            : `<div class="task-actions">
+              <button type="button" class="btn-primary btn-sm" data-act="show" data-id="${esc(t.id)}">Open browser</button>
+              <button type="button" class="btn-ghost btn-sm" data-act="hide" data-id="${esc(t.id)}">Hide</button>
+              <button type="button" class="btn-danger btn-sm" data-act="stop" data-id="${esc(t.id)}">Stop</button>
+              <button type="button" class="btn-ghost btn-sm" data-act="close" data-id="${esc(t.id)}">Close</button>
+              <button type="button" class="btn-warn btn-sm" data-act="continue" data-id="${esc(t.id)}">Continue</button>
+            </div>`;
+          return `<article class="task-card ${captcha ? "is-captcha" : ""} ${finishedCard ? "is-finished" : ""}" data-id="${esc(t.id)}">
             <div class="task-head">
-              <strong>${esc(t.id)}${finished ? " · Finished" : ""}</strong>
+              <strong>${esc(t.id)}${finishedCard ? " · Finished" : ""}</strong>
               <span class="phase-pill ${pill.cls}">${esc(pill.label)}</span>
             </div>
             <div class="task-meta">
@@ -307,16 +457,50 @@
               <div><b>Order</b> ${esc(t.orderNumber || "—")}</div>
               <div><b>Status</b> ${esc(t.message || t.phase || "—")}</div>
             </div>
-            <div class="task-actions">
-              <button type="button" class="btn-primary btn-sm" data-act="show" data-id="${esc(t.id)}">Open browser</button>
-              <button type="button" class="btn-ghost btn-sm" data-act="hide" data-id="${esc(t.id)}">Hide</button>
-              <button type="button" class="btn-danger btn-sm" data-act="stop" data-id="${esc(t.id)}">Stop</button>
-              <button type="button" class="btn-ghost btn-sm" data-act="close" data-id="${esc(t.id)}">Close</button>
-              ${finished ? "" : `<button type="button" class="btn-warn btn-sm" data-act="continue" data-id="${esc(t.id)}">Continue</button>`}
-            </div>
+            ${actions}
           </article>`;
         })
         .join("");
+    }
+
+    function applyRunState(data) {
+      const running = !!data.running;
+      if (running) {
+        setStatus("Running…", "run");
+        $("btnStart").disabled = true;
+        $("btnStop").disabled = false;
+      } else if ((data.tasks || []).length) {
+        setStatus("Idle / waiting", "");
+        $("btnStart").disabled = false;
+        $("btnStop").disabled = true;
+      } else {
+        setStatus("Idle", "");
+        $("btnStart").disabled = false;
+        $("btnStop").disabled = true;
+      }
+    }
+
+    async function refreshStatus() {
+      try {
+        const res = await fetch("/api/add-order-apple-ac/status");
+        const data = await res.json();
+        renderLogs(data.logs || []);
+        renderTasks(data.tasks || []);
+        applyRunState(data);
+        if (!data.running && pollTimer) {
+          const alive = (data.tasks || []).some(
+            (t) =>
+              t.running ||
+              /manual|captcha|waiting|finished|steps_complete|shipping_saved/i.test(String(t.phase || ""))
+          );
+          if (!alive) {
+            clearInterval(pollTimer);
+            pollTimer = null;
+          }
+        }
+      } catch (err) {
+        setStatus(err instanceof Error ? err.message : String(err), "err");
+      }
     }
 
     function startPolling() {
@@ -325,10 +509,46 @@
       refreshStatus();
     }
 
-    $("btnStart").addEventListener("click", async () => {
+    $("tabActive").addEventListener("click", () => setTasksTab("active"));
+    $("tabFinished").addEventListener("click", () => setTasksTab("finished"));
+
+    $("accountList").addEventListener("click", (e) => {
+      const row = e.target.closest(".account-row");
+      if (!row) return;
+      const idx = Number(row.getAttribute("data-idx"));
       const accounts = parseAccounts($("accounts").value);
+      const a = accounts[idx];
+      if (!a) return;
+      const key = accountKey(a);
+      if (selectedKeys.has(key)) selectedKeys.delete(key);
+      else selectedKeys.add(key);
+      renderAccountRows();
+    });
+
+    $("btnSelectAll").addEventListener("click", () => {
+      const accounts = parseAccounts($("accounts").value);
+      selectedKeys.clear();
+      for (const a of accounts) selectedKeys.add(accountKey(a));
+      renderAccountRows();
+    });
+
+    $("btnSelectNone").addEventListener("click", () => {
+      selectedKeys.clear();
+      renderAccountRows();
+    });
+
+    $("accounts").addEventListener("input", () => {
+      renderAccountRows();
+    });
+
+    $("btnStart").addEventListener("click", async () => {
+      const accounts = getSelectedAccounts().map(({ email, password, orderNumber }) => ({
+        email,
+        password,
+        orderNumber,
+      }));
       if (!accounts.length) {
-        alert("請至少輸入一行：email:password:order number");
+        alert("請先喺 Gmail accounts 選取至少一行，再撳 Start。");
         return;
       }
       const appleEmail = $("appleEmail").value.trim();
@@ -338,7 +558,7 @@
         return;
       }
       $("btnStart").disabled = true;
-      setStatus("Starting…", "run");
+      setStatus(`Starting ${accounts.length} selected…`, "run");
       try {
         const res = await fetch("/api/add-order-apple-ac/start", {
           method: "POST",
@@ -352,6 +572,7 @@
           setStatus("Idle", "");
           return;
         }
+        setTasksTab("active");
         startPolling();
       } catch (err) {
         alert(err instanceof Error ? err.message : String(err));
@@ -389,22 +610,13 @@
       const act = btn.getAttribute("data-act");
       if (!id || !act) return;
       btn.disabled = true;
-      const card = btn.closest("article.task-card");
       try {
         const res = await fetch(
           `/api/add-order-apple-ac/tasks/${encodeURIComponent(id)}/${act}`,
           { method: "POST" }
         );
         const data = await res.json().catch(() => ({}));
-        if (act === "close") {
-          if (card) card.remove();
-          if (Array.isArray(data.tasks)) renderTasks(data.tasks);
-          else if (!$("taskList").querySelector("article.task-card")) {
-            $("taskList").innerHTML = '<p class="hint">未有 task。填 Gmail 後撳 Start。</p>';
-          }
-        } else if (Array.isArray(data.tasks)) {
-          renderTasks(data.tasks);
-        }
+        if (Array.isArray(data.tasks)) renderTasks(data.tasks);
         setTimeout(refreshStatus, 300);
       } finally {
         setTimeout(() => {
@@ -425,17 +637,23 @@
         alert(data.error || "Save failed");
         return;
       }
+      renderAccountRows();
       const btn = $("btnSaveAccounts");
       const prev = btn.textContent;
       btn.textContent = "Saved";
-      setTimeout(() => { btn.textContent = prev || "Save"; }, 1200);
+      setTimeout(() => {
+        btn.textContent = prev || "Save";
+      }, 1200);
     });
 
     $("btnClearAccounts").addEventListener("click", async () => {
       if (!confirm("Clear all？會清：輸入框、已存 Gmail、tasks、logs，並換加密 key。")) return;
       $("accounts").value = "";
+      selectedKeys.clear();
+      renderAccountRows();
       logsEl.textContent = "";
-      $("taskList").innerHTML = '<p class="hint">未有 task。</p>';
+      lastTasks = [];
+      renderTasks([]);
       setStatus("Cleared", "ok");
       try {
         const res = await fetch("/api/add-order-apple-ac/accounts/clear", { method: "POST" });
@@ -457,6 +675,7 @@
         const data = await res.json();
         if (data.ok && typeof data.text === "string") {
           $("accounts").value = data.text;
+          renderAccountRows();
         }
       } catch {
         /* ignore */
@@ -467,14 +686,12 @@
     refreshStatus();
     startPolling();
 
-    // 同 Checkout Dashboard：改 HTML／server／worker 即時 reload；task 狀態 SSE 即時更新
     let addOrderBuildId = null;
     const es = new EventSource("/api/events");
     es.onmessage = (ev) => {
       try {
         const msg = JSON.parse(ev.data);
         if (msg.type === "reload") {
-          console.log("[live-reload]", msg.reason || "reload");
           location.reload();
           return;
         }
@@ -489,21 +706,8 @@
         if (msg.type === "add_order_status") {
           if (Array.isArray(msg.logs)) renderLogs(msg.logs);
           if (Array.isArray(msg.tasks)) renderTasks(msg.tasks);
-          const running = !!msg.running;
-          if (running) {
-            setStatus("Running…", "run");
-            $("btnStart").disabled = true;
-            $("btnStop").disabled = false;
-            if (!pollTimer) startPolling();
-          } else if ((msg.tasks || []).length) {
-            setStatus("Idle / waiting", "");
-            $("btnStart").disabled = false;
-            $("btnStop").disabled = true;
-          } else {
-            setStatus("Idle", "");
-            $("btnStart").disabled = false;
-            $("btnStop").disabled = true;
-          }
+          applyRunState(msg);
+          if (msg.running && !pollTimer) startPolling();
         }
       } catch {
         /* ignore */
