@@ -3520,6 +3520,8 @@ async function processOneAccount(
             phase: "finished",
             message: `Finished · ${orderNumber} · 送貨已儲存`,
             orderNumber,
+            email: account.email,
+            emailMasked: maskEmail(account.email),
             windowHidden: !userKeepBrowserOpen,
             keepOpen: userKeepBrowserOpen,
           });
@@ -3536,6 +3538,8 @@ async function processOneAccount(
           phase: "finished",
           message: `Finished · ${orderNumber} · 送貨已儲存`,
           orderNumber,
+          email: account.email,
+          emailMasked: maskEmail(account.email),
           windowHidden: !userKeepBrowserOpen,
           keepOpen: userKeepBrowserOpen,
         });
@@ -3625,6 +3629,8 @@ async function processOneAccount(
       phase: "finished",
       message: `Finished · ${orderNumber} · 送貨已儲存`,
       orderNumber,
+      email: account.email,
+      emailMasked: maskEmail(account.email),
       windowHidden: !userKeepBrowserOpen,
       keepOpen: userKeepBrowserOpen,
     });
@@ -3686,6 +3692,8 @@ async function processOneAccount(
         phase: "finished",
         message: `Finished · ${orderNumber} · 送貨已儲存`,
         orderNumber,
+        email: account.email,
+        emailMasked: maskEmail(account.email),
       });
     } catch (err) {
       if (err instanceof CloseRequestedError) throw err;

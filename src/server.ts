@@ -282,6 +282,8 @@ async function snapshotAddOrderTasks() {
     tasks.push({
       id: t.id,
       emailMasked: t.emailMasked || st?.emailMasked || "—",
+      // Finished 顯示完整 Gmail；active 亦可帶但 UI 可選擇用 masked
+      email: String(st?.email || "").trim() || "",
       orderNumber: t.orderNumber || st?.orderNumber || "",
       running: t.running,
       pid: t.pid,

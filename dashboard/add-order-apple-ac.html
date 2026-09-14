@@ -455,6 +455,9 @@
           const pill = phasePill(t.phase);
           const captcha = /waiting_captcha/i.test(String(t.phase || ""));
           const finishedCard = isFinishedTask(t);
+          const gmailLabel = finishedCard
+            ? esc(t.email || t.emailMasked || "—")
+            : esc(t.emailMasked || "—");
           const actions = finishedCard
             ? ""
             : `<div class="task-actions">
@@ -470,7 +473,7 @@
               <span class="phase-pill ${pill.cls}">${esc(pill.label)}</span>
             </div>
             <div class="task-meta">
-              <div><b>Gmail</b> ${esc(t.emailMasked || "—")}</div>
+              <div><b>Gmail</b> ${gmailLabel}</div>
               <div><b>Order</b> ${esc(t.orderNumber || "—")}</div>
               <div><b>Status</b> ${esc(t.message || t.phase || "—")}</div>
             </div>
