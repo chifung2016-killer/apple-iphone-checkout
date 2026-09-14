@@ -2073,6 +2073,18 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
         await fs.unlink(path.join(RUNTIME_DIR, f)).catch(() => {});
       }
 
+      // Start 即開窗置頂（live 睇）：寫 keepopen + show，worker 唔會 auto-minimize
+      await fs.writeFile(
+        path.join(RUNTIME_DIR, `keepopen-${id}.flag`),
+        new Date().toISOString(),
+        "utf8"
+      );
+      await fs.writeFile(
+        path.join(RUNTIME_DIR, `show-${id}.flag`),
+        new Date().toISOString(),
+        "utf8"
+      );
+
       const proc = spawn(process.execPath, [tsxCli, script], {
         cwd: ROOT,
         env: envForCheckoutChild({

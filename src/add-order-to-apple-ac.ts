@@ -445,7 +445,7 @@ async function sleep(ms: number) {
   }
 }
 
-/** Windows：用 process tree 搵有 MainWindow 嘅 Chrome／Chromium 再還原／最大化 */
+/** Windows：用 process tree 搵有 MainWindow 嘅 Chrome／Chromium，還原／最大化並強制置頂 */
 function winRestoreBrowserWindow(browser: Browser): void {
   if (process.platform !== "win32") return;
   const proc = (browser as unknown as { process?: () => { pid?: number } | null }).process?.();
@@ -458,7 +458,29 @@ using System.Runtime.InteropServices;
 public class W {
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h, int n);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool f);
+  [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtra);
+  public static void ForceForeground(IntPtr h) {
+    if (h == IntPtr.Zero) return;
+    if (IsIconic(h)) ShowWindowAsync(h, 9); // SW_RESTORE
+    ShowWindow(h, 3); // SW_MAXIMIZE
+    BringWindowToTop(h);
+    IntPtr fg = GetForegroundWindow();
+    uint fgPid; uint fgTid = GetWindowThreadProcessId(fg, out fgPid);
+    uint cur = GetCurrentThreadId();
+    if (fgTid != 0 && fgTid != cur) AttachThreadInput(cur, fgTid, true);
+    // Alt 輕撳：繞過 Windows foreground lock
+    keybd_event(0x12, 0, 0, UIntPtr.Zero);
+    keybd_event(0x12, 0, 2, UIntPtr.Zero);
+    SetForegroundWindow(h);
+    if (fgTid != 0 && fgTid != cur) AttachThreadInput(cur, fgTid, false);
+  }
 }
 '@ -ErrorAction SilentlyContinue
 $root = ${pid}
@@ -472,10 +494,7 @@ while ($queue.Count -gt 0) {
   $seen[$id] = $true
   $p = Get-Process -Id $id -ErrorAction SilentlyContinue
   if ($p -and $p.MainWindowHandle -ne [IntPtr]::Zero) {
-    $h = $p.MainWindowHandle
-    if ([W]::IsIconic($h)) { [void][W]::ShowWindowAsync($h, 9) } # SW_RESTORE
-    [void][W]::ShowWindowAsync($h, 3) # SW_MAXIMIZE
-    [void][W]::SetForegroundWindow($h)
+    [W]::ForceForeground($p.MainWindowHandle)
   }
   foreach ($c in @($all | Where-Object { $_.ParentProcessId -eq $id })) {
     $queue.Enqueue([int]$c.ProcessId)
@@ -2149,6 +2168,12 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
   };
 
   log(`搜尋郵件（訂單編號）：${keyword}…`);
+  // 開信前確保視窗喺最前（minimized 時 Gmail 好易開唔到）
+  if (activeBrowser) {
+    await setKeepBrowserOpen(true);
+    await maximizeBrowserWindow(page, activeBrowser).catch(() => {});
+    winRestoreBrowserWindow(activeBrowser);
+  }
   await writeStatus({
     phase: "search_email",
     message: `搜尋訂單「${keyword}」…`,
@@ -2186,20 +2211,15 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
     orderNumber: keyword,
   });
 
-  // 等列表出現
-  const listDeadline = Date.now() + 25_000;
+  // 等真正郵件列（tr.zA），唔好用 sidebar div[role=row] 誤判
+  const listDeadline = Date.now() + 30_000;
   let hasRows = false;
   while (Date.now() < listDeadline) {
     await throwIfStopped();
     await syncWindowFlags().catch(() => {});
     await dismissGmailOverlays(page);
     hasRows = await page
-      .evaluate(() => {
-        const rows = document.querySelectorAll(
-          "tr.zA, div[role='main'] div[role='row'], table.F tbody tr"
-        );
-        return rows.length > 0;
-      })
+      .evaluate(() => document.querySelectorAll("tr.zA").length > 0)
       .catch(() => false);
     if (hasRows) break;
     const empty = await page
@@ -2212,12 +2232,12 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
   }
   if (!hasRows) {
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
-    await sleep(1000);
+    await sleep(1200);
     hasRows = await page
       .evaluate(() => document.querySelectorAll("tr.zA").length > 0)
       .catch(() => false);
   }
-  if (!hasRows) throw new Error(`Gmail 搜尋訂單「${keyword}」搵唔到郵件列`);
+  if (!hasRows) throw new Error(`Gmail 搜尋訂單「${keyword}」搵唔到郵件列（tr.zA）`);
 
   // 只有「正確 search thread」先跳過再開；#search/訂單 列表唔算
   if (isCorrectOrderThreadUrl(page.url()) && (await isGmailMessageOpen(page))) {
@@ -2261,77 +2281,147 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
 /**
  * 點開 Gmail 搜尋結果：優先已選中／含訂單編號嗰封，否則第一封。
  * 單擊可能淨係 highlight → Enter／o／dblclick；最後用 thread id 直接改 hash。
+ * 最小化視窗時 Gmail SPA 好易開唔到信 → 開信前強制還原置頂。
  */
 async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): Promise<boolean> {
   const keyword = String(orderNumber || "").trim();
   const enc = encodeURIComponent(keyword);
 
+  // 最小化／背景時 click／hash 往往唔生效
+  if (activeBrowser) {
+    await maximizeBrowserWindow(page, activeBrowser).catch(() => {});
+    winRestoreBrowserWindow(activeBrowser);
+    await sleep(400);
+  } else {
+    await page.bringToFront().catch(() => {});
+  }
+
   const urlIsOpenThread = () => {
     const hash = page.url().split("#")[1] || "";
     const parts = hash.split("/").filter(Boolean);
-    return parts[0] === "search" && parts.length >= 3 && (parts[1] === enc || decodeURIComponent(parts[1] || "").includes(keyword));
+    if (parts[0] !== "search" || parts.length < 3) return false;
+    try {
+      const q = decodeURIComponent(parts[1] || "");
+      return q.includes(keyword) || parts[1] === enc;
+    } catch {
+      return parts[1] === enc || (parts[1] || "").includes(keyword);
+    }
   };
 
-  // 從列抽出 thread id（Gmail 常見 data-legacy-thread-id / data-thread-id）
+  /** 從列表／DOM 盡力抽出 thread id（兼容新舊 Gmail） */
   const extractThreadIdFromRows = async (): Promise<string> => {
     return page
       .evaluate((order) => {
-        const rows = Array.from(
-          document.querySelectorAll(
-            "tr.zA, div[role='main'] div[role='row'], table.F tbody tr"
-          )
-        ) as HTMLElement[];
-        if (!rows.length) return "";
-
-        const textOf = (el: HTMLElement) => (el.innerText || "").replace(/\s+/g, " ").trim();
-        const hasOrder = (el: HTMLElement) => {
-          const t = textOf(el);
-          const n = String(order || "");
-          return n && (t.includes(n) || t.replace(/[\s-]/g, "").includes(n.replace(/[\s-]/g, "")));
+        const norm = (s: string) => (s || "").replace(/\s+/g, " ").trim();
+        const orderN = String(order || "");
+        const hasOrder = (el: Element) => {
+          const t = norm((el as HTMLElement).innerText || "");
+          if (!orderN) return false;
+          return t.includes(orderN) || t.replace(/[\s-]/g, "").includes(orderN.replace(/[\s-]/g, ""));
         };
+        const tidFrom = (el: Element | null): string => {
+          if (!el) return "";
+          const attrs = [
+            "data-legacy-thread-id",
+            "data-thread-id",
+            "data-legacy-last-message-id",
+            "data-message-id",
+          ];
+          for (const a of attrs) {
+            const v = el.getAttribute(a);
+            if (v && v.length > 4) return v;
+          }
+          const nested = el.querySelector(
+            "[data-legacy-thread-id], [data-thread-id], [data-legacy-last-message-id]"
+          );
+          if (nested) {
+            for (const a of attrs) {
+              const v = nested.getAttribute(a);
+              if (v && v.length > 4) return v;
+            }
+          }
+          // href：#inbox/xxx、#search/q/xxx、#all/xxx
+          for (const a of Array.from(el.querySelectorAll("a[href]")) as HTMLAnchorElement[]) {
+            const href = a.getAttribute("href") || a.href || "";
+            const m =
+              href.match(/#[\w.-]+\/(?:[^/]+\/)?([A-Za-z0-9:_-]{8,})/) ||
+              href.match(/[?&]th=([A-Za-z0-9:_-]+)/);
+            if (m?.[1] && !/^(inbox|search|all|sent|starred|label)$/i.test(m[1])) return m[1];
+          }
+          return "";
+        };
+
+        const rowSel =
+          "tr.zA, div[role='main'] tr.zA, table.F tbody tr.zA, div[role='main'] div[role='row'].zA, div.ae4 tr.zA";
+        let rows = Array.from(document.querySelectorAll(rowSel)) as HTMLElement[];
+        if (!rows.length) {
+          rows = Array.from(
+            document.querySelectorAll("tr.zA, div[role='main'] div[role='listitem']")
+          ) as HTMLElement[];
+        }
+
         const isSelected = (el: HTMLElement) => {
           const aria = (el.getAttribute("aria-selected") || "").toLowerCase();
-          return (
-            aria === "true" ||
-            el.classList.contains("btb") ||
-            el.classList.contains("x7")
-          );
+          return aria === "true" || el.classList.contains("btb") || el.classList.contains("x7");
         };
-        const tidOf = (el: HTMLElement) =>
-          el.getAttribute("data-legacy-thread-id") ||
-          el.getAttribute("data-thread-id") ||
-          el.querySelector("[data-legacy-thread-id], [data-thread-id], [data-legacy-last-message-id]")?.getAttribute("data-legacy-thread-id") ||
-          el.querySelector("[data-thread-id]")?.getAttribute("data-thread-id") ||
-          "";
 
-        const target =
+        const pick =
           rows.find((r) => isSelected(r) && hasOrder(r)) ||
-          rows.find(hasOrder) ||
-          rows.find(isSelected) ||
-          rows[0]!;
-        return tidOf(target) || "";
+          rows.find((r) => hasOrder(r)) ||
+          rows.find((r) => isSelected(r)) ||
+          rows[0] ||
+          null;
+        let tid = tidFrom(pick);
+        if (tid) return tid;
+
+        // 全頁掃 data-legacy-thread-id，優先文字含訂單
+        const allTid = Array.from(
+          document.querySelectorAll("[data-legacy-thread-id], [data-thread-id]")
+        ) as HTMLElement[];
+        const withOrder = allTid.find((el) => {
+          const row = el.closest("tr, div[role='row'], div[role='listitem']") || el;
+          return hasOrder(row);
+        });
+        tid = tidFrom(withOrder || null) || tidFrom(allTid[0] || null);
+        if (tid) return tid;
+
+        // 最後：任何看起來似 thread 嘅 hash link
+        for (const a of Array.from(document.querySelectorAll("a[href*='#']")) as HTMLAnchorElement[]) {
+          const href = a.getAttribute("href") || "";
+          if (!/#(?:search|inbox|all)\//i.test(href)) continue;
+          const parts = href.split("#")[1]?.split("/").filter(Boolean) || [];
+          if (parts.length >= 2) {
+            const last = parts[parts.length - 1] || "";
+            if (last.length >= 8 && !/^(inbox|search|all)$/i.test(last)) {
+              if (!orderN || hasOrder(a.closest("tr, div[role='row']") || a)) return last;
+            }
+          }
+        }
+        return "";
       }, keyword)
       .catch(() => "");
   };
 
   const gotoThreadById = async (tid: string): Promise<boolean> => {
     if (!tid) return false;
-    const hash = `#search/${enc}/${tid}`;
+    const clean = tid.replace(/^#/, "").trim();
+    if (!clean) return false;
+    const hash = `#search/${enc}/${clean}`;
     log(`直接打開搜尋 thread：${hash}`);
     await page
       .evaluate((h) => {
         location.hash = h;
       }, hash)
       .catch(() => {});
-    await sleep(700);
-    if (urlIsOpenThread()) return true;
+    await sleep(900);
+    if (urlIsOpenThread() || (await isGmailMessageOpen(page))) return true;
     await page
       .goto(`https://mail.google.com/mail/u/0/${hash}`, {
         waitUntil: "domcontentloaded",
         timeout: 45_000,
       })
       .catch(() => {});
-    await sleep(600);
+    await sleep(800);
     return urlIsOpenThread() || (await isGmailMessageOpen(page));
   };
 
@@ -2341,29 +2431,62 @@ async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): 
     return true;
   }
 
-  // 1) Playwright 撳第一／含訂單編號列（比 synthetic event 穩）
+  // 診斷：列數／有冇 thread id attribute
+  const diag = await page
+    .evaluate(() => {
+      const za = document.querySelectorAll("tr.zA").length;
+      const tid = document.querySelectorAll("[data-legacy-thread-id], [data-thread-id]").length;
+      const sample = Array.from(document.querySelectorAll("tr.zA"))
+        .slice(0, 3)
+        .map((r) => ({
+          tid: r.getAttribute("data-legacy-thread-id") || r.getAttribute("data-thread-id") || "",
+          text: ((r as HTMLElement).innerText || "").replace(/\s+/g, " ").slice(0, 80),
+        }));
+      return { za, tid, sample };
+    })
+    .catch(() => ({ za: 0, tid: 0, sample: [] as { tid: string; text: string }[] }));
+  log(`Gmail 列表診斷：tr.zA=${diag.za} tidAttrs=${diag.tid} sample=${JSON.stringify(diag.sample)}`);
+
+  // 1a) 若已有 thread id，優先直接 hash（比 click 穩，尤其 minimized／focus 問題）
+  {
+    const tidEarly = await extractThreadIdFromRows();
+    if (tidEarly) {
+      log(`提早用 thread id 打開：${tidEarly}`);
+      if (await gotoThreadById(tidEarly)) {
+        await waitForGmailMessageOpen(page, {
+          orderNumber: keyword,
+          timeoutMs: 8_000,
+          relaxOrderMatch: true,
+        });
+        return urlIsOpenThread() || (await isGmailMessageOpen(page));
+      }
+    }
+  }
+
+  // 1b) Playwright 撳第一／含訂單編號列
   await dismissGmailOverlays(page);
+  const esc = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const rowCandidates = [
-    page.locator("tr.zA").filter({ hasText: new RegExp(keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i") }).first(),
+    page.locator("tr.zA").filter({ hasText: new RegExp(esc, "i") }).first(),
+    page.locator(`tr.zA[data-legacy-thread-id]`).filter({ hasText: new RegExp(esc, "i") }).first(),
     page.locator("tr.zA[aria-selected='true']").first(),
     page.locator("tr.zA").first(),
-    page.locator("div[role='main'] div[role='row']").first(),
+    page.locator("div[role='main'] div[role='listitem']").first(),
   ];
   for (const row of rowCandidates) {
     if ((await row.count().catch(() => 0)) === 0) continue;
     if (!(await row.isVisible().catch(() => false))) continue;
-    const subject = row.locator("span.bog, .y6 span, td.a4W, span.bqe").first();
+    const subject = row.locator("span.bog, .y6 span, td.a4W, span.bqe, span.y2").first();
     const clickTarget = (await subject.count().catch(() => 0)) > 0 ? subject : row;
     await clickTarget.scrollIntoViewIfNeeded().catch(() => {});
     await clickTarget.click({ timeout: 3000, force: true }).catch(() => {});
-    await sleep(400);
+    await sleep(500);
     if (urlIsOpenThread() || (await isGmailThreadDetailOpen(page, keyword))) {
       log("Playwright 已撳開搜尋結果");
       return true;
     }
-    // dblclick
     await clickTarget.dblclick({ timeout: 2500, force: true }).catch(() => {});
-    await sleep(500);
+    await sleep(600);
     if (urlIsOpenThread() || (await isGmailThreadDetailOpen(page, keyword))) {
       log("Playwright dblclick 已開郵件");
       return true;
@@ -2381,13 +2504,18 @@ async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): 
         rows.find((r) => textOf(r).includes(String(order || ""))) || rows[0]!;
       const sub =
         (target.querySelector("span.bog, .y6 span, td.a4W") as HTMLElement | null) || target;
+      target.setAttribute("aria-selected", "true");
+      target.classList.add("x7", "btb");
       sub.scrollIntoView({ block: "center" });
-      sub.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, view: window }));
-      sub.click();
+      for (const type of ["mousedown", "mouseup", "click", "dblclick"] as const) {
+        sub.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+      }
     }, keyword)
     .catch(() => {});
 
-  for (let attempt = 0; attempt < 6; attempt++) {
+  // 聚焦郵件列表後 Enter
+  await page.locator("div[role='main']").first().click({ timeout: 1500 }).catch(() => {});
+  for (let attempt = 0; attempt < 8; attempt++) {
     await throwIfStopped();
     await dismissGmailOverlays(page);
     if (urlIsOpenThread() || (await isGmailThreadDetailOpen(page, keyword))) {
@@ -2396,15 +2524,16 @@ async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): 
     }
     if (attempt === 0) await page.keyboard.press("ArrowDown").catch(() => {});
     if (attempt === 1) await page.keyboard.press("ArrowUp").catch(() => {});
+    if (attempt === 2) await page.keyboard.press("Home").catch(() => {});
     await page.keyboard.press("Enter").catch(() => {});
-    await sleep(350);
+    await sleep(400);
     if (urlIsOpenThread() || (await isGmailThreadDetailOpen(page, keyword))) return true;
     await page.keyboard.press("o").catch(() => {});
-    await sleep(350);
+    await sleep(400);
     if (urlIsOpenThread() || (await isGmailThreadDetailOpen(page, keyword))) return true;
   }
 
-  // 3) 用 thread id 直接改 hash（最穩）
+  // 3) 再用 thread id 直接改 hash
   const tid = await extractThreadIdFromRows();
   if (tid && (await gotoThreadById(tid))) {
     log(`已用 thread id 打開：${tid}`);
@@ -2412,12 +2541,15 @@ async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): 
     return urlIsOpenThread() || (await isGmailMessageOpen(page));
   }
 
-  // 4) 放寬等正文
+  // 4) 放寬等正文（有時 URL 未變但右側 pane 已開）
   const ok = await waitForGmailMessageOpen(page, {
     orderNumber: keyword,
     timeoutMs: 10_000,
     relaxOrderMatch: true,
   });
+  if (!ok && !tid) {
+    log(`警告：抽唔到 thread id（tr.zA=${diag.za}），Gmail DOM 可能未就緒或列表空白`);
+  }
   return ok || urlIsOpenThread();
 }
 
@@ -3499,7 +3631,8 @@ async function processOneAccount(
     phase: "running",
     emailMasked: maskEmail(account.email),
     message: "running",
-    windowHidden: true,
+    windowHidden: false,
+    keepOpen: true,
   });
   const context = await browser.newContext({
     locale: "zh-HK",
@@ -3542,9 +3675,13 @@ async function processOneAccount(
   log(
     `視窗鋪位（同 Checkout）：${windowBounds.width}x${windowBounds.height} @ (${windowBounds.left},${windowBounds.top}) · ${ACCOUNT_INDEX + 1}/${WINDOW_TOTAL}`
   );
-  await applyCheckoutWindowBounds(page, true).catch(() => {});
-  await maybeMinimizeBrowserWindow(page, browser);
-  log(userKeepBrowserOpen ? "瀏覽器保持開啟（用戶 Open browser）" : "瀏覽器已隱藏（minimized）");
+  // Start：即刻顯示並置頂（live），唔再預設收埋
+  await loadKeepBrowserOpenFlag();
+  await setKeepBrowserOpen(true);
+  await applyCheckoutWindowBounds(page, false).catch(() => {});
+  await maximizeBrowserWindow(page, browser).catch(() => {});
+  winRestoreBrowserWindow(browser);
+  log("瀏覽器已置頂顯示（Start live）");
 
   const runSteps = async () => {
     // —— Gmail 之後步驟盡量短、可 resume ——
@@ -3749,13 +3886,14 @@ async function processOneAccount(
 }
 
 async function launchBrowser(): Promise<Browser> {
+  // Start 即顯示：唔用 --start-minimized，方便 live 睇
   const common = {
     headless: false as const,
     args: [
       "--disable-blink-features=AutomationControlled",
       "--disable-features=IsolateOrigins,site-per-process",
       `--window-size=${WINDOW_WIDTH},${WINDOW_HEIGHT}`,
-      "--start-minimized",
+      "--start-maximized",
     ],
     ignoreDefaultArgs: ["--enable-automation"] as string[],
   };
@@ -3772,12 +3910,13 @@ async function main() {
   await fs.unlink(RELEASE_FLAG).catch(() => {});
   await fs.unlink(CLOSE_FLAG).catch(() => {});
   await fs.unlink(CONTINUE_FLAG).catch(() => {});
-  await fs.unlink(SHOW_FLAG).catch(() => {});
   await fs.unlink(HIDE_FLAG).catch(() => {});
-  // 新 task 預設隱藏；舊 keepopen 清走（呢次 run 用戶再開先 lock）
-  await fs.unlink(KEEP_OPEN_FLAG).catch(() => {});
-  userKeepBrowserOpen = false;
+  // Start = live 睇：保留 dashboard 寫入嘅 keepopen／show（唔清走）
   finishedFullScreen = false;
+  await loadKeepBrowserOpenFlag();
+  if (!userKeepBrowserOpen) {
+    await setKeepBrowserOpen(true);
+  }
 
   const cfg = await loadConfig();
   const account = cfg.accounts[ACCOUNT_INDEX];
@@ -3788,18 +3927,20 @@ async function main() {
     emailMasked: maskEmail(account.email),
     orderNumber: account.orderNumber,
     message: `starting · ${account.orderNumber}`,
-    windowHidden: true,
-    keepOpen: false,
+    windowHidden: false,
+    keepOpen: true,
     pid: process.pid,
   });
 
   const browser = await launchBrowser();
   activeBrowser = browser;
   startFlagPoller();
-  // 若 dashboard 喺 spawn 後好快撳咗 Open，補讀 keepopen
-  await loadKeepBrowserOpenFlag();
-  if (userKeepBrowserOpen && activePage) {
+  // show flag：最大化置頂（server Start 會寫 show-*.flag）
+  await syncWindowFlags().catch(() => {});
+  if (activePage) {
     await maximizeBrowserWindow(activePage, browser).catch(() => {});
+  } else {
+    winRestoreBrowserWindow(browser);
   }
 
   let closeBrowser = false;
