@@ -2021,7 +2021,7 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
   if (!probe.ok) throw new Error(`Gmail 搜尋訂單「${keyword}」搵唔到郵件列`);
 
   // 已正確開咗 search thread 且正文有訂單 → 跳過
-  if (isCorrectOrderThreadUrl(page.url()) && (await messageBodyHasOrder(page, keyword))) {
+  if (await isGmailDetailReallyOpen(page, keyword)) {
     log("搜尋結果已打開正確訂單郵件");
   } else {
     // 若而家喺 #inbox/…：先拉返 search 再開
@@ -2030,28 +2030,22 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
       await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
       await sleep(600);
     }
-    log("點開含訂單編號嘅搜尋結果（唔開 inbox 亂信）…");
+    log("點開含訂單編號／已選中嘅搜尋結果…");
     let opened = await openSelectedOrFirstGmailResult(page, keyword);
-    if (!opened || /#inbox\//i.test(page.url()) || !(await messageBodyHasOrder(page, keyword))) {
-      if (/#inbox\//i.test(page.url())) {
-        log("開信後誤入 inbox — 返回 search 再試");
+    if (!opened || !(await isGmailDetailReallyOpen(page, keyword))) {
+      if (/#inbox\//i.test(page.url()) || !/#search\//i.test(page.url())) {
+        log("開信未穩 — 返回 search 再試");
         await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
         await sleep(700);
       }
       opened = await openSelectedOrFirstGmailResult(page, keyword);
     }
-    // 最終校驗：唔接受 #inbox/xxx
-    if (/#inbox\//i.test(page.url())) {
+    if (/#inbox\//i.test(page.url()) && !(await messageBodyHasOrder(page, keyword))) {
       throw new Error(`開錯郵件（inbox thread）：${page.url()} — 應為 #search/${keyword}/…`);
     }
-    if (!opened && !isCorrectOrderThreadUrl(page.url()) && !(await messageBodyHasOrder(page, keyword))) {
-      throw new Error(`搜尋結果打唔開訂單「${keyword}」郵件（仍喺 ${page.url()}）`);
+    if (!(await isGmailDetailReallyOpen(page, keyword))) {
+      throw new Error(`搜尋結果打唔開訂單「${keyword}」郵件詳情（仍喺 ${page.url()}）`);
     }
-  }
-
-  // 再確認唔喺錯 inbox
-  if (/#inbox\//i.test(page.url()) && !(await messageBodyHasOrder(page, keyword))) {
-    throw new Error(`仍停喺錯誤 inbox thread：${page.url()}`);
   }
 
   await writeStatus({
@@ -2065,21 +2059,56 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
 async function messageBodyHasOrder(page: Page, orderNumber: string): Promise<boolean> {
   const n = String(orderNumber || "").trim();
   if (!n) return false;
+  // 淨係睇真正郵件正文／主旨 —— 唔好用 div[role=main]（會誤中搜尋列表文字）
   const hay = await page
-    .locator("div.a3s, h2.hP, div.adn, div[role='main']")
-    .first()
-    .innerText()
+    .evaluate((order) => {
+      const nodes = Array.from(
+        document.querySelectorAll("h2.hP, div.a3s, div.adn div.a3s, div.ii.gt, div[data-message-id]")
+      ) as HTMLElement[];
+      const texts = nodes
+        .filter((el) => {
+          const r = el.getBoundingClientRect();
+          return r.width > 20 && r.height > 10;
+        })
+        .map((el) => (el.innerText || "").replace(/\s+/g, " ").trim())
+        .filter((t) => t.length > 2);
+      return texts.join("\n");
+    }, n)
     .catch(() => "");
   const t = String(hay || "");
+  if (!t) return false;
   return (
     t.includes(n) ||
-    t.replace(/[\s-]/g, "").includes(n.replace(/[\s-]/g, "")) ||
-    (/訂單狀態|Order Status|View [Yy]our [Oo]rder|Apple Store/i.test(t) && /W\d{7,}/.test(t) && t.includes(n))
+    t.replace(/[\s-]/g, "").includes(n.replace(/[\s-]/g, ""))
   );
 }
 
+/** 郵件詳情真正打開：URL 有 thread id，或見到主旨／正文 pane */
+async function isGmailDetailReallyOpen(page: Page, orderNumber: string): Promise<boolean> {
+  const keyword = String(orderNumber || "").trim();
+  const hash = page.url().split("#")[1] || "";
+  const parts = hash.split("/").filter(Boolean);
+  const searchThreadOpen =
+    parts[0] === "search" &&
+    parts.length >= 3 &&
+    (() => {
+      try {
+        return decodeURIComponent(parts[1] || "").includes(keyword) || parts[1] === encodeURIComponent(keyword);
+      } catch {
+        return (parts[1] || "").includes(keyword);
+      }
+    })();
+
+  if (searchThreadOpen && (await isGmailMessageOpen(page))) return true;
+  if (searchThreadOpen && (await messageBodyHasOrder(page, keyword))) return true;
+  // split pane：URL 未變但右邊有正文＋訂單
+  if ((await isGmailMessageOpen(page)) && (await messageBodyHasOrder(page, keyword))) return true;
+  return false;
+}
+
 /**
- * 點開搜尋結果：只開「含訂單編號」嗰封；禁止落到 #inbox/亂 thread。
+ * 點開搜尋結果：優先「已選中且含訂單」→ 含訂單列；用 thread id 改 hash 最穩。
+ * 成功條件：#search/訂單/threadId 或真正正文 pane（唔係列表有訂單字）。
  */
 async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): Promise<boolean> {
   const keyword = String(orderNumber || "").trim();
@@ -2096,7 +2125,8 @@ async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): 
     }
   };
 
-  const extractOrderThreadId = async (): Promise<string> => {
+  type RowInfo = { tid: string; why: string; preview: string; selected: boolean };
+  const pickOrderRow = async (): Promise<RowInfo | null> => {
     return page
       .evaluate((order) => {
         const norm = (s: string) => (s || "").replace(/\s+/g, " ").trim();
@@ -2109,22 +2139,39 @@ async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): 
               t.replace(/[\s-]/g, "").includes(orderN.replace(/[\s-]/g, "")))
           );
         };
+        const isSelected = (el: HTMLElement) => {
+          const aria = (el.getAttribute("aria-selected") || "").toLowerCase();
+          return (
+            aria === "true" ||
+            el.classList.contains("btb") ||
+            el.classList.contains("x7") ||
+            el.classList.contains("J-N-K")
+          );
+        };
         const tidOf = (el: Element | null): string => {
           if (!el) return "";
-          const attrs = ["data-legacy-thread-id", "data-thread-id"];
-          let cur: Element | null = el;
-          for (let i = 0; i < 6 && cur; i++) {
+          const attrs = [
+            "data-legacy-thread-id",
+            "data-thread-id",
+            "data-legacy-last-message-id",
+          ];
+          const read = (node: Element | null) => {
+            if (!node) return "";
             for (const a of attrs) {
-              const v = (cur.getAttribute(a) || "").trim();
-              if (v.length > 4) return v;
+              const v = (node.getAttribute(a) || "").trim();
+              if (v.length > 5) return v;
             }
-            const nested = cur.querySelector("[data-legacy-thread-id], [data-thread-id]");
-            if (nested) {
-              for (const a of attrs) {
-                const v = (nested.getAttribute(a) || "").trim();
-                if (v.length > 4) return v;
-              }
-            }
+            return "";
+          };
+          let cur: Element | null = el;
+          for (let depth = 0; depth < 8 && cur; depth++) {
+            const v = read(cur);
+            if (v) return v;
+            const nested = cur.querySelector(
+              "[data-legacy-thread-id], [data-thread-id], [data-legacy-last-message-id]"
+            );
+            const nv = read(nested);
+            if (nv) return nv;
             cur = cur.parentElement;
           }
           return "";
@@ -2132,157 +2179,218 @@ async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): 
 
         const rows = Array.from(
           document.querySelectorAll(
-            "tr.zA, div[role='main'] div[role='row'], div[role='main'] div[role='listitem']"
+            "tr.zA, div[role='main'] tr.zA, table.F tbody tr.zA, div[role='main'] div[role='row']"
           )
         ) as HTMLElement[];
-        // 必須優先訂單列（唔好用 selected／第一封 —— 會開錯 inbox 信）
+
         const pick =
+          rows.find((r) => isSelected(r) && hasOrder(r)) ||
           rows.find((r) => hasOrder(r) && /Apple/i.test(norm(r.innerText || ""))) ||
           rows.find((r) => hasOrder(r)) ||
           null;
         if (!pick) {
-          // 全頁 thread id 元素附近有訂單字
+          // 全頁掃 tid 元素
           for (const el of Array.from(
             document.querySelectorAll("[data-legacy-thread-id], [data-thread-id]")
           ) as HTMLElement[]) {
-            const row = el.closest("tr, div[role='row'], div[role='listitem']") || el;
-            if (hasOrder(row)) return tidOf(el) || tidOf(row);
+            const row = (el.closest("tr.zA, tr, div[role='row']") as HTMLElement | null) || el;
+            if (!hasOrder(row)) continue;
+            const tid = tidOf(el) || tidOf(row);
+            if (tid) {
+              return {
+                tid,
+                why: "tid-scan",
+                preview: norm(row.innerText || "").slice(0, 80),
+                selected: isSelected(row),
+              };
+            }
           }
-          return "";
+          return null;
         }
-        return tidOf(pick);
+        return {
+          tid: tidOf(pick),
+          why: isSelected(pick) && hasOrder(pick) ? "selected+order" : hasOrder(pick) ? "order" : "row",
+          preview: norm(pick.innerText || "").slice(0, 80),
+          selected: isSelected(pick),
+        };
       }, keyword)
-      .catch(() => "");
+      .catch(() => null);
   };
 
   const gotoSearchThread = async (tid: string): Promise<boolean> => {
-    if (!tid) return false;
-    const hash = `#search/${enc}/${tid}`;
-    log(`用 thread id 開搜尋結果（避免 inbox）：${hash}`);
+    const clean = String(tid || "").replace(/^#/, "").trim();
+    if (!clean || clean.length < 6) return false;
+    const hash = `#search/${enc}/${clean}`;
+    log(`用 thread id 打開：${hash}`);
+    // 方法 1：改 hash（SPA）
     await page
       .evaluate((h) => {
         location.hash = h;
       }, hash)
       .catch(() => {});
-    await sleep(800);
-    // 若 Gmail 改寫成 #inbox/… → 強制拉返 search hash
-    if (/#inbox\//i.test(page.url())) {
-      log(`Gmail 改寫成 inbox，強制返 search hash`);
-      await page.goto(`https://mail.google.com/mail/u/0/${hash}`, {
+    await sleep(900);
+    if (await isGmailDetailReallyOpen(page, keyword)) return true;
+    // 方法 2：完整 goto
+    await page
+      .goto(`https://mail.google.com/mail/u/0/${hash}`, {
         waitUntil: "domcontentloaded",
         timeout: 45_000,
-      }).catch(() => {});
-      await sleep(700);
+      })
+      .catch(() => {});
+    await sleep(800);
+    // 若被改寫成 inbox → 再強制 search hash
+    if (/#inbox\//i.test(page.url())) {
+      await page
+        .evaluate((h) => {
+          location.hash = h;
+        }, hash)
+        .catch(() => {});
+      await sleep(800);
     }
-    if (/#inbox\//i.test(page.url())) return false;
-    return (
-      urlIsCorrectSearchThread() ||
-      (await messageBodyHasOrder(page, keyword)) ||
-      (await isGmailMessageOpen(page))
-    );
+    return isGmailDetailReallyOpen(page, keyword);
   };
 
-  // 0) 已正確
-  if (urlIsCorrectSearchThread() && (await messageBodyHasOrder(page, keyword))) {
-    log("已在正確訂單搜尋 thread");
+  if (await isGmailDetailReallyOpen(page, keyword)) {
+    log("郵件詳情已打開（正確訂單）");
     return true;
   }
 
-  // 1) 優先 thread id → #search/訂單/tid（最穩，唔經 inbox）
-  {
-    const tid = await extractOrderThreadId();
-    if (tid) {
-      if (await gotoSearchThread(tid)) {
-        await waitForGmailMessageOpen(page, {
-          orderNumber: keyword,
-          timeoutMs: 8_000,
-          relaxOrderMatch: true,
-        });
-        if (/#inbox\//i.test(page.url()) && !(await messageBodyHasOrder(page, keyword))) {
-          log("thread id 導航後仍係錯 inbox");
-        } else {
-          return true;
-        }
-      }
-    } else {
-      log("抽唔到含訂單嘅 thread id，改撳訂單列…");
+  // —— 1) 抽 selected／訂單列 thread id，直接跳 ——
+  let info = await pickOrderRow();
+  log(
+    `Gmail 目標列：${info ? `${info.why} selected=${info.selected} tid=${info.tid || "(無)"} | ${info.preview}` : "(搵唔到)"}`
+  );
+  if (info?.tid) {
+    if (await gotoSearchThread(info.tid)) {
+      log("thread id 導航成功");
+      return true;
     }
   }
 
-  // 2) 只撳「含訂單編號」列（唔撳 selected／第一封）
+  // —— 2) Playwright：撳／雙擊「已選中＋訂單」或「含訂單」列 ——
   await dismissGmailOverlays(page);
   const esc = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const orderRows = [
+  const orderRowLocators = [
+    page.locator("tr.zA[aria-selected='true']").filter({ hasText: new RegExp(esc, "i") }).first(),
+    page.locator("tr.zA.btb, tr.zA.x7").filter({ hasText: new RegExp(esc, "i") }).first(),
     page.locator("tr.zA").filter({ hasText: new RegExp(esc, "i") }).first(),
     page.locator("div[role='main'] div[role='row']").filter({ hasText: new RegExp(esc, "i") }).first(),
-    page.locator("div[role='main']").getByText(keyword, { exact: false }).first(),
   ];
-  for (const row of orderRows) {
+
+  for (const row of orderRowLocators) {
     if ((await row.count().catch(() => 0)) === 0) continue;
-    if (!(await row.isVisible().catch(() => false))) continue;
-    const subject = row.locator("span.bog, .y6 span, td.a4W, span.bqe").first();
-    const clickTarget = (await subject.count().catch(() => 0)) > 0 ? subject : row;
-    await clickTarget.scrollIntoViewIfNeeded().catch(() => {});
-    await clickTarget.click({ timeout: 3000, force: true }).catch(() => {});
+    // 唔要求 visible（minimized／viewport 問題）
+    const subject = row.locator("span.bog, .y6 span, td.a4W, span.bqe, span.y2, div.y6").first();
+    const target = (await subject.count().catch(() => 0)) > 0 ? subject : row;
+    await target.scrollIntoViewIfNeeded().catch(() => {});
+
+    // 先讀 tid（click 前）
+    const tidBefore = await row
+      .evaluate((el) => {
+        const attrs = ["data-legacy-thread-id", "data-thread-id"];
+        const read = (n: Element | null) => {
+          if (!n) return "";
+          for (const a of attrs) {
+            const v = (n.getAttribute(a) || "").trim();
+            if (v.length > 5) return v;
+          }
+          const nested = n.querySelector("[data-legacy-thread-id], [data-thread-id]");
+          if (nested) {
+            for (const a of attrs) {
+              const v = (nested.getAttribute(a) || "").trim();
+              if (v.length > 5) return v;
+            }
+          }
+          return "";
+        };
+        let cur: Element | null = el;
+        for (let i = 0; i < 6 && cur; i++) {
+          const v = read(cur);
+          if (v) return v;
+          cur = cur.parentElement;
+        }
+        return "";
+      })
+      .catch(() => "");
+
+    if (tidBefore && (await gotoSearchThread(tidBefore))) return true;
+
+    await target.click({ timeout: 3000, force: true }).catch(() => {});
+    await sleep(400);
+    await target.dblclick({ timeout: 2500, force: true }).catch(() => {});
     await sleep(500);
-    // 若跳去 inbox 但正文有訂單字，仍可接受；否則拉返 search
-    if (/#inbox\//i.test(page.url())) {
-      if (await messageBodyHasOrder(page, keyword)) {
-        log("Gmail 用咗 inbox URL，但正文係正確訂單信");
-        return true;
-      }
-      log("撳錯／被改寫去 inbox，返回 search");
-      await page.goto(`https://mail.google.com/mail/u/0/#search/${enc}`, {
-        waitUntil: "domcontentloaded",
-        timeout: 45_000,
-      }).catch(() => {});
-      await sleep(500);
-      continue;
-    }
-    if (urlIsCorrectSearchThread() || (await messageBodyHasOrder(page, keyword))) {
-      log("已撳開含訂單編號郵件");
+    // 只對呢一列 Enter（唔 ArrowDown）
+    await page.keyboard.press("Enter").catch(() => {});
+    await sleep(600);
+
+    if (await isGmailDetailReallyOpen(page, keyword)) {
+      log("已撳／雙擊打開訂單郵件");
       return true;
     }
-    await clickTarget.dblclick({ timeout: 2500, force: true }).catch(() => {});
-    await sleep(500);
-    if (/#inbox\//i.test(page.url()) && !(await messageBodyHasOrder(page, keyword))) {
-      await page.goto(`https://mail.google.com/mail/u/0/#search/${enc}`, {
-        waitUntil: "domcontentloaded",
-        timeout: 45_000,
-      }).catch(() => {});
-      continue;
-    }
-    if (urlIsCorrectSearchThread() || (await messageBodyHasOrder(page, keyword))) return true;
-    // 只對「已選中嘅訂單列」Enter（唔 ArrowDown，避免揀錯信）
-    await page.keyboard.press("Enter").catch(() => {});
-    await sleep(400);
-    if (/#inbox\//i.test(page.url()) && !(await messageBodyHasOrder(page, keyword))) {
-      await page.goto(`https://mail.google.com/mail/u/0/#search/${enc}`, {
-        waitUntil: "domcontentloaded",
-        timeout: 45_000,
-      }).catch(() => {});
-      continue;
-    }
-    if (urlIsCorrectSearchThread() || (await messageBodyHasOrder(page, keyword))) return true;
+    // click 後再抽 tid
+    info = await pickOrderRow();
+    if (info?.tid && (await gotoSearchThread(info.tid))) return true;
     break;
   }
 
-  // 3) 再抽一次 thread id
-  const tid2 = await extractOrderThreadId();
-  if (tid2 && (await gotoSearchThread(tid2))) {
-    return urlIsCorrectSearchThread() || (await messageBodyHasOrder(page, keyword));
-  }
+  // —— 3) DOM：只 fire 含訂單列 ——
+  const tidDom = await page
+    .evaluate((order) => {
+      const norm = (s: string) => (s || "").replace(/\s+/g, " ");
+      const orderN = String(order || "");
+      const rows = Array.from(document.querySelectorAll("tr.zA")) as HTMLElement[];
+      const isSelected = (el: HTMLElement) =>
+        (el.getAttribute("aria-selected") || "").toLowerCase() === "true" ||
+        el.classList.contains("btb") ||
+        el.classList.contains("x7");
+      const hasOrder = (el: HTMLElement) =>
+        norm(el.innerText || "").includes(orderN) ||
+        norm(el.innerText || "")
+          .replace(/[\s-]/g, "")
+          .includes(orderN.replace(/[\s-]/g, ""));
+      const target =
+        rows.find((r) => isSelected(r) && hasOrder(r)) || rows.find((r) => hasOrder(r));
+      if (!target) return "";
+      const sub =
+        (target.querySelector("span.bog, .y6 span, td.a4W") as HTMLElement | null) || target;
+      target.setAttribute("aria-selected", "true");
+      sub.scrollIntoView({ block: "center" });
+      for (const type of ["mousedown", "mouseup", "click", "dblclick"] as const) {
+        sub.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+      }
+      const tid =
+        target.getAttribute("data-legacy-thread-id") ||
+        target.getAttribute("data-thread-id") ||
+        target.querySelector("[data-legacy-thread-id]")?.getAttribute("data-legacy-thread-id") ||
+        target.querySelector("[data-thread-id]")?.getAttribute("data-thread-id") ||
+        "";
+      return tid || "";
+    }, keyword)
+    .catch(() => "");
 
-  // 失敗：如果而家 inbox 又冇訂單字 → false
-  if (/#inbox\//i.test(page.url()) && !(await messageBodyHasOrder(page, keyword))) {
-    log(`拒絕錯誤 inbox thread：${page.url()}`);
-    return false;
-  }
-  return waitForGmailMessageOpen(page, {
+  await sleep(500);
+  await page.keyboard.press("Enter").catch(() => {});
+  await sleep(500);
+  if (await isGmailDetailReallyOpen(page, keyword)) return true;
+  if (tidDom && (await gotoSearchThread(tidDom))) return true;
+
+  // —— 4) 最後再 probe 一次 ——
+  info = await pickOrderRow();
+  if (info?.tid && (await gotoSearchThread(info.tid))) return true;
+
+  const ok = await waitForGmailMessageOpen(page, {
     orderNumber: keyword,
-    timeoutMs: 6_000,
+    timeoutMs: 5_000,
     relaxOrderMatch: false,
   });
+  if (ok && (await isGmailDetailReallyOpen(page, keyword))) return true;
+
+  // 仍停喺列表
+  if (!urlIsCorrectSearchThread()) {
+    log(`開信失敗：仍喺列表 ${page.url()}`);
+    return false;
+  }
+  return isGmailDetailReallyOpen(page, keyword);
 }
 
 async function isGmailThreadDetailOpen(page: Page, orderNumber?: string): Promise<boolean> {
