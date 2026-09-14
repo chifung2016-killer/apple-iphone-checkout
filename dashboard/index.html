@@ -1932,7 +1932,17 @@
           alert(data.error || `Copy failed (${res.status})`);
           return;
         }
-        await navigator.clipboard.writeText(String(data.text));
+        const text = String(data.text);
+        try {
+          localStorage.setItem("apple-checkout:gmail-accounts-paste", text);
+        } catch {
+          /* ignore quota / private mode */
+        }
+        try {
+          await navigator.clipboard.writeText(text);
+        } catch {
+          /* Paste 會改讀 localStorage；剪貼簿失敗唔阻 Copy */
+        }
         if (btn) btn.textContent = `Copied ${data.count || rows.length}`;
         setTimeout(() => {
           if (btn) btn.textContent = prev;

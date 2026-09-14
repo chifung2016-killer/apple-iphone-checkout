@@ -585,25 +585,41 @@
       renderAccountRows();
     });
 
+    async function readPasteText() {
+      // Copy info 會寫入同 origin 嘅 localStorage（跨 tab 可靠；唔靠 clipboard 權限）
+      try {
+        const stored = String(localStorage.getItem("apple-checkout:gmail-accounts-paste") || "").trim();
+        if (stored) return stored;
+      } catch {
+        /* ignore */
+      }
+      try {
+        const clip = String((await navigator.clipboard.readText()) || "").trim();
+        if (clip) return clip;
+      } catch {
+        /* ignore — 常見：跨 tab 無 clipboard-read 權限 */
+      }
+      return "";
+    }
+
     $("btnPasteAccounts").addEventListener("click", async () => {
       const btn = $("btnPasteAccounts");
       const prev = btn.textContent;
       btn.disabled = true;
       btn.textContent = "Pasting…";
       try {
-        const clip = String((await navigator.clipboard.readText()) || "").trim();
+        const clip = await readPasteText();
         if (!clip) {
-          alert("剪貼簿係空嘅。請先喺 Live card limits 撳 Copy info。");
+          alert("未有可貼內容。請先去 Checkout Dashboard → Live card limits 選列再撳 Copy info。");
           return;
         }
         const parsed = parseAccounts(clip);
         if (!parsed.length) {
-          alert("剪貼簿格式唔啱。需要每行：email:password:order number");
+          alert("內容格式唔啱。需要每行：email:password:order number");
           return;
         }
         const ta = $("accounts");
         const existing = String(ta.value || "").trim();
-        // 合併去重（同一 email+order 只留一次）
         const merged = new Map();
         for (const a of [...parseAccounts(existing), ...parsed]) {
           merged.set(accountKey(a), a);
@@ -611,20 +627,23 @@
         ta.value = [...merged.values()]
           .map((a) => `${a.email}:${a.password}:${a.orderNumber}`)
           .join("\n");
+        ta.dispatchEvent(new Event("input", { bubbles: true }));
         const raw = $("rawEdit");
-        if (raw && !raw.open) raw.open = true;
-        // 自動選取今次貼上嗰啲
+        if (raw) raw.open = true;
         for (const a of parsed) selectedKeys.add(accountKey(a));
         renderAccountRows();
+        try {
+          ta.focus();
+          ta.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        } catch {
+          /* ignore */
+        }
         btn.textContent = `Pasted ${parsed.length}`;
         setTimeout(() => {
           btn.textContent = prev;
         }, 1200);
       } catch (err) {
-        alert(
-          "讀唔到剪貼簿（瀏覽器可能要權限）。可改為喺「編輯列表」手動 Ctrl+V。\n" +
-            (err instanceof Error ? err.message : String(err))
-        );
+        alert(err instanceof Error ? err.message : String(err));
       } finally {
         btn.disabled = false;
         setTimeout(() => {
