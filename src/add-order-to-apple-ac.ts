@@ -1979,16 +1979,57 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
   const probeList = async () =>
     page
       .evaluate((order) => {
-        const main = document.querySelector("div[role='main']") || document.body;
-        const za = document.querySelectorAll("tr.zA").length;
-        const text = (main.innerText || "").replace(/\s+/g, " ");
-        const hasOrder =
-          !!order &&
-          (text.includes(order) ||
-            text.replace(/[\s-]/g, "").includes(String(order).replace(/[\s-]/g, "")));
-        return { za, hasOrder, ok: za > 0 || hasOrder };
+        // 必須有真正郵件列 tr.zA —— 唔好用 main 文字（搜尋欄都有訂單編號會誤判）
+        const rows = Array.from(document.querySelectorAll("tr.zA")) as HTMLElement[];
+        const norm = (s: string) => (s || "").replace(/\s+/g, " ").trim();
+        const orderN = String(order || "");
+        const hasOrder = (el: HTMLElement) => {
+          const t = norm(el.innerText || "");
+          return (
+            !!orderN &&
+            (t.includes(orderN) ||
+              t.replace(/[\s-]/g, "").includes(orderN.replace(/[\s-]/g, "")))
+          );
+        };
+        const selected = rows.filter((r) => {
+          const aria = (r.getAttribute("aria-selected") || "").toLowerCase();
+          return aria === "true" || r.classList.contains("btb") || r.classList.contains("x7");
+        });
+        const withOrder = rows.filter(hasOrder);
+        const sample = rows.slice(0, 5).map((r) => ({
+          sel:
+            (r.getAttribute("aria-selected") || "").toLowerCase() === "true" ||
+            r.classList.contains("btb"),
+          tid:
+            r.getAttribute("data-legacy-thread-id") ||
+            r.querySelector("[data-legacy-thread-id]")?.getAttribute("data-legacy-thread-id") ||
+            "",
+          text: norm(r.innerText || "").slice(0, 70),
+        }));
+        return {
+          za: rows.length,
+          selected: selected.length,
+          withOrder: withOrder.length,
+          ok: rows.length > 0,
+          sample,
+        };
       }, keyword)
-      .catch(() => ({ za: 0, hasOrder: false, ok: false }));
+      .catch(() => ({
+        za: 0,
+        selected: 0,
+        withOrder: 0,
+        ok: false,
+        sample: [] as { sel: boolean; tid: string; text: string }[],
+      }));
+
+  // 開信前必須顯示視窗（minimized 時 Gmail virtual list 往往冇 tr.zA）
+  if (activeBrowser) {
+    await setKeepBrowserOpen(true);
+    await maximizeBrowserWindow(page, activeBrowser).catch(() => {});
+    winRestoreBrowserWindow(activeBrowser);
+    await page.bringToFront().catch(() => {});
+    await sleep(500);
+  }
 
   // 停喺 #search/訂單 列表時：自動重試開信（唔即刻 error hold）
   const maxAttempts = 12;
@@ -2019,12 +2060,16 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
       orderNumber: keyword,
     });
 
-    // 等列表
-    const listDeadline = Date.now() + 12_000;
+    // 等真正 tr.zA
+    const listDeadline = Date.now() + 15_000;
     let probe = await probeList();
     while (Date.now() < listDeadline && !probe.ok) {
       await throwIfStopped();
       await dismissGmailOverlays(page);
+      if (activeBrowser && (await isBrowserWindowMinimized(page).catch(() => false))) {
+        await maximizeBrowserWindow(page, activeBrowser).catch(() => {});
+        winRestoreBrowserWindow(activeBrowser);
+      }
       probe = await probeList();
       if (probe.ok) break;
       const empty = await page
@@ -2033,19 +2078,26 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
         .isVisible()
         .catch(() => false);
       if (empty) throw new Error(`Gmail 搜尋訂單「${keyword}」冇結果`);
-      await sleep(350);
+      await sleep(400);
     }
     if (!probe.ok) {
       await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
-      await sleep(700);
+      await sleep(1000);
       probe = await probeList();
     }
+    log(
+      `列表 probe：za=${probe.za} selected=${probe.selected} withOrder=${probe.withOrder} sample=${JSON.stringify(probe.sample)}`
+    );
     if (!probe.ok) {
-      log(`第 ${attempt} 次：列表未就緒，reload 再試…`);
+      log(`第 ${attempt} 次：未有 tr.zA（可能視窗最小化／未 render），reload…`);
+      if (activeBrowser) {
+        await maximizeBrowserWindow(page, activeBrowser).catch(() => {});
+        winRestoreBrowserWindow(activeBrowser);
+      }
       continue;
     }
 
-    log("點開含訂單編號／已選中嘅搜尋結果…");
+    log("點開已選中／含訂單／第一封搜尋結果…");
     await openSelectedOrFirstGmailResult(page, keyword);
 
     if (await isGmailDetailReallyOpen(page, keyword)) {
@@ -2131,14 +2183,22 @@ async function isGmailDetailReallyOpen(page: Page, orderNumber: string): Promise
     parts.length >= 3 &&
     (() => {
       try {
-        return decodeURIComponent(parts[1] || "").includes(keyword) || parts[1] === encodeURIComponent(keyword);
+        return (
+          decodeURIComponent(parts[1] || "").includes(keyword) ||
+          parts[1] === encodeURIComponent(keyword)
+        );
       } catch {
         return (parts[1] || "").includes(keyword);
       }
     })();
 
-  if (searchThreadOpen && (await isGmailMessageOpen(page))) return true;
-  if (searchThreadOpen && (await messageBodyHasOrder(page, keyword))) return true;
+  // 已去到 #search/訂單/threadId → 視為已開（正文可能稍慢）
+  if (searchThreadOpen) {
+    if (await isGmailMessageOpen(page)) return true;
+    if (await messageBodyHasOrder(page, keyword)) return true;
+    // URL 已正確就當成功（畀後續等正文／撳訂單狀態）
+    return true;
+  }
   // split pane：URL 未變但右邊有正文＋訂單
   if ((await isGmailMessageOpen(page)) && (await messageBodyHasOrder(page, keyword))) return true;
   return false;
@@ -2217,29 +2277,31 @@ async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): 
 
         const rows = Array.from(
           document.querySelectorAll(
-            "tr.zA, div[role='main'] tr.zA, table.F tbody tr.zA, div[role='main'] div[role='row']"
+            "tr.zA, div[role='main'] tr.zA, table.F tbody tr.zA"
           )
         ) as HTMLElement[];
 
+        // 優先：已選中＋訂單 → 訂單 → 已選中（搜尋已係訂單編號，selected 好係目標）→ 第一封
         const pick =
           rows.find((r) => isSelected(r) && hasOrder(r)) ||
           rows.find((r) => hasOrder(r) && /Apple/i.test(norm(r.innerText || ""))) ||
           rows.find((r) => hasOrder(r)) ||
+          rows.find((r) => isSelected(r)) ||
+          rows[0] ||
           null;
         if (!pick) {
-          // 全頁掃 tid 元素
           for (const el of Array.from(
             document.querySelectorAll("[data-legacy-thread-id], [data-thread-id]")
           ) as HTMLElement[]) {
             const row = (el.closest("tr.zA, tr, div[role='row']") as HTMLElement | null) || el;
-            if (!hasOrder(row)) continue;
             const tid = tidOf(el) || tidOf(row);
-            if (tid) {
+            if (!tid) continue;
+            if (hasOrder(row) || isSelected(row as HTMLElement) || rows.length <= 3) {
               return {
                 tid,
                 why: "tid-scan",
-                preview: norm(row.innerText || "").slice(0, 80),
-                selected: isSelected(row),
+                preview: norm((row as HTMLElement).innerText || "").slice(0, 80),
+                selected: isSelected(row as HTMLElement),
               };
             }
           }
@@ -2247,7 +2309,13 @@ async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): 
         }
         return {
           tid: tidOf(pick),
-          why: isSelected(pick) && hasOrder(pick) ? "selected+order" : hasOrder(pick) ? "order" : "row",
+          why: isSelected(pick) && hasOrder(pick)
+            ? "selected+order"
+            : hasOrder(pick)
+              ? "order"
+              : isSelected(pick)
+                ? "selected"
+                : "first",
           preview: norm(pick.innerText || "").slice(0, 80),
           selected: isSelected(pick),
         };
@@ -2305,24 +2373,23 @@ async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): 
     }
   }
 
-  // —— 2) Playwright：撳／雙擊「已選中＋訂單」或「含訂單」列 ——
+  // —— 2) Playwright：撳／雙擊已選中 → 含訂單 → 第一封 ——
   await dismissGmailOverlays(page);
   const esc = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const orderRowLocators = [
-    page.locator("tr.zA[aria-selected='true']").filter({ hasText: new RegExp(esc, "i") }).first(),
-    page.locator("tr.zA.btb, tr.zA.x7").filter({ hasText: new RegExp(esc, "i") }).first(),
+    page.locator("tr.zA[aria-selected='true']").first(),
+    page.locator("tr.zA.btb, tr.zA.x7").first(),
     page.locator("tr.zA").filter({ hasText: new RegExp(esc, "i") }).first(),
-    page.locator("div[role='main'] div[role='row']").filter({ hasText: new RegExp(esc, "i") }).first(),
+    page.locator("tr.zA").filter({ hasText: /Apple/i }).first(),
+    page.locator("tr.zA").first(),
   ];
 
   for (const row of orderRowLocators) {
     if ((await row.count().catch(() => 0)) === 0) continue;
-    // 唔要求 visible（minimized／viewport 問題）
     const subject = row.locator("span.bog, .y6 span, td.a4W, span.bqe, span.y2, div.y6").first();
     const target = (await subject.count().catch(() => 0)) > 0 ? subject : row;
     await target.scrollIntoViewIfNeeded().catch(() => {});
 
-    // 先讀 tid（click 前）
     const tidBefore = await row
       .evaluate((el) => {
         const attrs = ["data-legacy-thread-id", "data-thread-id"];
@@ -2357,26 +2424,34 @@ async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): 
     await sleep(400);
     await target.dblclick({ timeout: 2500, force: true }).catch(() => {});
     await sleep(500);
-    // 只對呢一列 Enter（唔 ArrowDown）
     await page.keyboard.press("Enter").catch(() => {});
     await sleep(600);
 
     if (await isGmailDetailReallyOpen(page, keyword)) {
-      log("已撳／雙擊打開訂單郵件");
+      log("已撳／雙擊打開郵件");
       return true;
     }
-    // click 後再抽 tid
+    // URL 已變有 thread id（search/.../tid）都算開咗，再等正文
+    if (urlIsCorrectSearchThread()) {
+      await waitForGmailMessageOpen(page, {
+        orderNumber: keyword,
+        timeoutMs: 8_000,
+        relaxOrderMatch: true,
+      });
+      if (await isGmailDetailReallyOpen(page, keyword) || urlIsCorrectSearchThread()) return true;
+    }
     info = await pickOrderRow();
     if (info?.tid && (await gotoSearchThread(info.tid))) return true;
     break;
   }
 
-  // —— 3) DOM：只 fire 含訂單列 ——
+  // —— 3) DOM：已選中／含訂單／第一封 ——
   const tidDom = await page
     .evaluate((order) => {
       const norm = (s: string) => (s || "").replace(/\s+/g, " ");
       const orderN = String(order || "");
       const rows = Array.from(document.querySelectorAll("tr.zA")) as HTMLElement[];
+      if (!rows.length) return "";
       const isSelected = (el: HTMLElement) =>
         (el.getAttribute("aria-selected") || "").toLowerCase() === "true" ||
         el.classList.contains("btb") ||
@@ -2387,8 +2462,10 @@ async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): 
           .replace(/[\s-]/g, "")
           .includes(orderN.replace(/[\s-]/g, ""));
       const target =
-        rows.find((r) => isSelected(r) && hasOrder(r)) || rows.find((r) => hasOrder(r));
-      if (!target) return "";
+        rows.find((r) => isSelected(r) && hasOrder(r)) ||
+        rows.find((r) => hasOrder(r)) ||
+        rows.find((r) => isSelected(r)) ||
+        rows[0]!;
       const sub =
         (target.querySelector("span.bog, .y6 span, td.a4W") as HTMLElement | null) || target;
       target.setAttribute("aria-selected", "true");
@@ -3679,8 +3756,11 @@ async function processOneAccount(
     `視窗鋪位（同 Checkout）：${windowBounds.width}x${windowBounds.height} @ (${windowBounds.left},${windowBounds.top}) · ${ACCOUNT_INDEX + 1}/${WINDOW_TOTAL}`
   );
   await applyCheckoutWindowBounds(page, true).catch(() => {});
-  await maybeMinimizeBrowserWindow(page, browser);
-  log(userKeepBrowserOpen ? "瀏覽器保持開啟（用戶 Open browser）" : "瀏覽器已隱藏（minimized）");
+  // 開 Gmail 前保持可見（最小化會令搜尋列表 tr.zA 唔 render）
+  await setKeepBrowserOpen(true);
+  await maximizeBrowserWindow(page, browser).catch(() => {});
+  winRestoreBrowserWindow(browser);
+  log("瀏覽器保持開啟（開 Gmail／搜尋需要可見視窗）");
 
   const runSteps = async () => {
     // —— Gmail 之後步驟盡量短、可 resume ——
