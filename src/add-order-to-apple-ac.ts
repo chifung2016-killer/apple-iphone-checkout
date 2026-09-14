@@ -2599,7 +2599,7 @@ async function fillLabeledField(
 }
 
 /**
- * 訂單詳情：撳第一個「編輯」→ 填名字／姓名／區域／屋苑 →「儲存」
+ * 訂單詳情：喺「送貨：／標準運送」區塊撳「編輯」→ 填地址 →「儲存」
  */
 async function editOrderShippingAddress(page: Page): Promise<void> {
   log("訂單詳情：編輯送貨地址…");
@@ -2608,6 +2608,12 @@ async function editOrderShippingAddress(page: Page): Promise<void> {
     message: "編輯送貨地址…",
     url: page.url(),
   });
+
+  if (activeBrowser) {
+    await setKeepBrowserOpen(true);
+    await maximizeBrowserWindow(page, activeBrowser).catch(() => {});
+    await page.bringToFront().catch(() => {});
+  }
 
   const detailDeadline = Date.now() + 60_000;
   while (Date.now() < detailDeadline) {
@@ -2618,54 +2624,143 @@ async function editOrderShippingAddress(page: Page): Promise<void> {
     if (isAppleGuestOrderUrl(url)) {
       await clickAddToAppleIdOnce(page).catch(() => {});
     }
-    const hasEdit = await page
-      .getByRole("link", { name: /^編輯$|^Edit$/i })
-      .or(page.getByRole("button", { name: /^編輯$|^Edit$/i }))
+    const hasShipping = await page
+      .getByText(/標準運送|送貨\s*[:：]/i)
       .first()
       .isVisible()
       .catch(() => false);
-    if (hasEdit) break;
+    if (hasShipping) break;
     await sleep(400);
   }
 
-  await sleep(400);
+  await sleep(500);
 
-  // 優先第一個「編輯」（訂單詳情送貨通常係第一個）
-  let clickedEdit = false;
-  const firstEdit = page
-    .getByRole("link", { name: /^編輯$|^Edit$/i })
-    .or(page.getByRole("button", { name: /^編輯$|^Edit$/i }))
-    .first();
-  if ((await firstEdit.count().catch(() => 0)) > 0) {
-    await firstEdit.scrollIntoViewIfNeeded().catch(() => {});
-    clickedEdit = await firstEdit
-      .click({ force: true, timeout: 4000 })
-      .then(() => true)
-      .catch(() => false);
-  }
+  // 喺「送貨：／標準運送」區塊撳「編輯」（唔好撳其他無關編輯）
+  const clickedEdit = await page
+    .evaluate(() => {
+      const norm = (s: string) => (s || "").replace(/[\s\u00a0\u200b\u200c\u200d\ufeff]+/g, " ").trim();
+      const compact = (s: string) => norm(s).replace(/\s+/g, "");
 
-  if (!clickedEdit) {
-    clickedEdit = await page
-      .evaluate(() => {
-        const norm = (s: string) => (s || "").replace(/[\s\u00a0\u200b]+/g, "");
-        for (const el of Array.from(
-          document.querySelectorAll("a, button, [role='button']")
-        ) as HTMLElement[]) {
-          if (el.closest("#globalnav")) continue;
-          const label = norm(`${el.innerText || ""} ${el.getAttribute("aria-label") || ""}`);
-          if (label === "編輯" || label === "Edit") {
-            el.scrollIntoView({ block: "center", inline: "nearest" });
-            el.click();
-            return true;
-          }
+      const isEditLabel = (raw: string) => {
+        const t = compact(raw);
+        return t === "編輯" || t === "Edit" || /^編輯/.test(t) || /^Edit$/i.test(t);
+      };
+
+      const scoreBlock = (text: string): number => {
+        const t = norm(text).slice(0, 800);
+        let score = 0;
+        if (/送貨\s*[:：]/.test(t) || t.includes("送貨：") || t.includes("送貨:")) score += 40;
+        if (t.includes("標準運送")) score += 50;
+        if (/Hennessy|軒尼詩/i.test(t)) score += 25;
+        if (/大廈|樓|室/.test(t)) score += 10;
+        if (/梁|Jason/i.test(t)) score += 15;
+        if (/•{2,}\d{2}|••••/.test(t)) score += 10;
+        if (/\bEdit\b|編輯/.test(t)) score += 20;
+        return score;
+      };
+
+      const blocks = Array.from(
+        document.querySelectorAll("section, article, li, div, tr, td")
+      ) as HTMLElement[];
+      let best: HTMLElement | null = null;
+      let bestScore = 0;
+      for (const el of blocks) {
+        // 跳過太大嘅容器（成頁）
+        const childCount = el.querySelectorAll("*").length;
+        if (childCount > 400) continue;
+        const score = scoreBlock(el.innerText || "");
+        if (score > bestScore && score >= 70) {
+          bestScore = score;
+          best = el;
+        }
+      }
+
+      const tryClickEditIn = (root: ParentNode | null): boolean => {
+        if (!root) return false;
+        const links = Array.from(root.querySelectorAll("a, button, [role='button']")) as HTMLElement[];
+        for (const el of links) {
+          if (el.closest("#globalnav, header, nav")) continue;
+          const label = `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""}`;
+          if (!isEditLabel(label)) continue;
+          el.scrollIntoView({ block: "center", inline: "nearest" });
+          el.click();
+          return true;
         }
         return false;
-      })
-      .catch(() => false);
-  }
+      };
 
-  if (!clickedEdit) throw new Error("揾唔到第一個「編輯」掣");
-  log("已撳第一個「編輯」");
+      // 1) 最佳送貨區塊內
+      if (best && tryClickEditIn(best)) return { ok: true, how: "shipping-block", score: bestScore };
+      // 2) 往上幾層父節點
+      let cur: HTMLElement | null = best;
+      for (let i = 0; i < 5 && cur; i++) {
+        if (tryClickEditIn(cur)) return { ok: true, how: `parent-${i}`, score: bestScore };
+        cur = cur.parentElement;
+      }
+      // 3) 「標準運送」文字附近
+      for (const el of Array.from(document.querySelectorAll("body *")) as HTMLElement[]) {
+        const t = compact(el.innerText || "");
+        if (t !== "標準運送" && !t.startsWith("標準運送")) continue;
+        if (t.length > 40) continue;
+        let p: HTMLElement | null = el;
+        for (let d = 0; d < 8 && p; d++) {
+          if (tryClickEditIn(p)) return { ok: true, how: "near-標準運送", score: 0 };
+          p = p.parentElement;
+        }
+      }
+      // 4) 「送貨：」附近
+      for (const el of Array.from(document.querySelectorAll("body *")) as HTMLElement[]) {
+        const t = norm(el.innerText || "");
+        if (!/^送貨\s*[:：]/.test(t) && t !== "送貨：" && t !== "送貨:") continue;
+        if (t.length > 60) continue;
+        let p: HTMLElement | null = el;
+        for (let d = 0; d < 8 && p; d++) {
+          if (tryClickEditIn(p)) return { ok: true, how: "near-送貨", score: 0 };
+          p = p.parentElement;
+        }
+      }
+      return { ok: false, how: "none", score: bestScore };
+    })
+    .catch(() => ({ ok: false, how: "eval-fail", score: 0 }));
+
+  if (!clickedEdit.ok) {
+    // Playwright fallback：標準運送／送貨區塊內嘅「編輯」
+    const shippingScope = page
+      .locator("section, article, li, div")
+      .filter({ hasText: /標準運送/ })
+      .filter({ hasText: /送貨/ })
+      .first();
+    const nearbyEdit = shippingScope
+      .getByRole("link", { name: /^編輯$|^Edit$/i })
+      .or(shippingScope.getByRole("button", { name: /^編輯$|^Edit$/i }))
+      .first();
+    if ((await nearbyEdit.count().catch(() => 0)) > 0) {
+      await nearbyEdit.scrollIntoViewIfNeeded().catch(() => {});
+      await nearbyEdit.click({ force: true, timeout: 4000 });
+      log("已撳送貨區塊「編輯」（Playwright）");
+    } else {
+      const byText = page
+        .getByText(/標準運送/)
+        .first()
+        .locator("xpath=ancestor::*[self::section or self::article or self::li or self::div][1]")
+        .getByRole("link", { name: /^編輯$|^Edit$/i })
+        .or(
+          page
+            .getByText(/標準運送/)
+            .first()
+            .locator("xpath=ancestor::*[self::section or self::article or self::li or self::div][1]")
+            .getByRole("button", { name: /^編輯$|^Edit$/i })
+        )
+        .first();
+      if ((await byText.count().catch(() => 0)) === 0) {
+        throw new Error("揾唔到「送貨／標準運送」底下嘅「編輯」掣");
+      }
+      await byText.click({ force: true, timeout: 4000 });
+      log("已撳標準運送附近「編輯」（xpath）");
+    }
+  } else {
+    log(`已撳送貨「編輯」（${clickedEdit.how}·score=${clickedEdit.score}）`);
+  }
   await sleep(800);
 
   const formDeadline = Date.now() + 20_000;
