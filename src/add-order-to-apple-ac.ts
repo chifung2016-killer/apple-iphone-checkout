@@ -2635,131 +2635,166 @@ async function editOrderShippingAddress(page: Page): Promise<void> {
 
   await sleep(500);
 
-  // 喺「送貨：／標準運送」區塊撳「編輯」（唔好撳其他無關編輯）
+  // 喺「送貨：／標準運送／梁 Jason／Hennessy…」區塊撳有底線嘅「編輯」連結
   const clickedEdit = await page
     .evaluate(() => {
       const norm = (s: string) => (s || "").replace(/[\s\u00a0\u200b\u200c\u200d\ufeff]+/g, " ").trim();
       const compact = (s: string) => norm(s).replace(/\s+/g, "");
 
-      const isEditLabel = (raw: string) => {
-        const t = compact(raw);
-        return t === "編輯" || t === "Edit" || /^編輯/.test(t) || /^Edit$/i.test(t);
+      const isEditLabel = (el: HTMLElement): boolean => {
+        const t = compact(
+          `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""}`
+        );
+        return t === "編輯" || t === "Edit";
+      };
+
+      const hasUnderline = (el: HTMLElement): boolean => {
+        const st = window.getComputedStyle(el);
+        const td = `${st.textDecorationLine || ""} ${st.textDecoration || ""}`.toLowerCase();
+        if (td.includes("underline")) return true;
+        // Apple 連結有時 underline 喺偽元素／子 span
+        for (const child of Array.from(el.querySelectorAll("*")).slice(0, 6) as HTMLElement[]) {
+          const cs = window.getComputedStyle(child);
+          const ctd = `${cs.textDecorationLine || ""} ${cs.textDecoration || ""}`.toLowerCase();
+          if (ctd.includes("underline")) return true;
+        }
+        return el.tagName === "A" || el.getAttribute("role") === "link";
       };
 
       const scoreBlock = (text: string): number => {
-        const t = norm(text).slice(0, 800);
+        const t = norm(text).slice(0, 900);
         let score = 0;
         if (/送貨\s*[:：]/.test(t) || t.includes("送貨：") || t.includes("送貨:")) score += 40;
         if (t.includes("標準運送")) score += 50;
-        if (/Hennessy|軒尼詩/i.test(t)) score += 25;
-        if (/大廈|樓|室/.test(t)) score += 10;
-        if (/梁|Jason/i.test(t)) score += 15;
-        if (/•{2,}\d{2}|••••/.test(t)) score += 10;
-        if (/\bEdit\b|編輯/.test(t)) score += 20;
+        if (/44\s*Hennessy|Hennessy\s*Road|軒尼詩/i.test(t)) score += 30;
+        if (/大廈\s*6\s*座|大廈6座|17\s*樓|11\s*室/.test(t)) score += 20;
+        if (/梁\s*Jason|梁Jason|Jason/i.test(t)) score += 20;
+        if (/•{2,}\s*07|••••••07|••07/.test(t)) score += 15;
+        if (compact(t).includes("編輯") || /\bEdit\b/.test(t)) score += 15;
         return score;
       };
 
+      type Cand = { el: HTMLElement; score: number; why: string };
+      const cands: Cand[] = [];
+
       const blocks = Array.from(
-        document.querySelectorAll("section, article, li, div, tr, td")
+        document.querySelectorAll("section, article, li, div, tr, td, as-order-detail, as-shipping")
       ) as HTMLElement[];
       let best: HTMLElement | null = null;
       let bestScore = 0;
       for (const el of blocks) {
-        // 跳過太大嘅容器（成頁）
-        const childCount = el.querySelectorAll("*").length;
-        if (childCount > 400) continue;
+        if (el.querySelectorAll("*").length > 500) continue;
         const score = scoreBlock(el.innerText || "");
-        if (score > bestScore && score >= 70) {
+        if (score > bestScore && score >= 80) {
           bestScore = score;
           best = el;
         }
       }
 
-      const tryClickEditIn = (root: ParentNode | null): boolean => {
-        if (!root) return false;
-        const links = Array.from(root.querySelectorAll("a, button, [role='button']")) as HTMLElement[];
-        for (const el of links) {
-          if (el.closest("#globalnav, header, nav")) continue;
-          const label = `${el.innerText || ""} ${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""}`;
-          if (!isEditLabel(label)) continue;
-          el.scrollIntoView({ block: "center", inline: "nearest" });
-          el.click();
-          return true;
+      const collectEdits = (root: ParentNode | null, base: number, why: string) => {
+        if (!root) return;
+        for (const el of Array.from(root.querySelectorAll("a, button, [role='button'], [role='link'], span, u")) as HTMLElement[]) {
+          if (el.closest("#globalnav, header, nav, footer")) continue;
+          if (!isEditLabel(el)) continue;
+          // 只要淨係「編輯」兩個字（唔好整段文字）
+          const visible = compact(el.innerText || "");
+          if (visible !== "編輯" && visible !== "Edit") continue;
+          let s = base;
+          if (el.tagName === "A") s += 40;
+          if (hasUnderline(el)) s += 35;
+          if (el.closest("a")) s += 20;
+          cands.push({ el: (el.closest("a") as HTMLElement) || el, score: s, why });
         }
-        return false;
       };
 
-      // 1) 最佳送貨區塊內
-      if (best && tryClickEditIn(best)) return { ok: true, how: "shipping-block", score: bestScore };
-      // 2) 往上幾層父節點
-      let cur: HTMLElement | null = best;
-      for (let i = 0; i < 5 && cur; i++) {
-        if (tryClickEditIn(cur)) return { ok: true, how: `parent-${i}`, score: bestScore };
-        cur = cur.parentElement;
-      }
-      // 3) 「標準運送」文字附近
-      for (const el of Array.from(document.querySelectorAll("body *")) as HTMLElement[]) {
-        const t = compact(el.innerText || "");
-        if (t !== "標準運送" && !t.startsWith("標準運送")) continue;
-        if (t.length > 40) continue;
-        let p: HTMLElement | null = el;
-        for (let d = 0; d < 8 && p; d++) {
-          if (tryClickEditIn(p)) return { ok: true, how: "near-標準運送", score: 0 };
+      if (best) {
+        collectEdits(best, bestScore + 100, "shipping-block");
+        let p: HTMLElement | null = best.parentElement;
+        for (let i = 0; i < 4 && p; i++) {
+          collectEdits(p, bestScore + 60 - i * 10, `parent-${i}`);
           p = p.parentElement;
         }
       }
-      // 4) 「送貨：」附近
+
+      // 「標準運送」錨點附近
       for (const el of Array.from(document.querySelectorAll("body *")) as HTMLElement[]) {
-        const t = norm(el.innerText || "");
-        if (!/^送貨\s*[:：]/.test(t) && t !== "送貨：" && t !== "送貨:") continue;
-        if (t.length > 60) continue;
+        const t = compact(el.childNodes.length ? Array.from(el.childNodes).map((n) => (n.nodeType === 3 ? n.textContent : "")).join("") : el.innerText || "");
+        const own = compact(
+          Array.from(el.childNodes)
+            .filter((n) => n.nodeType === 3)
+            .map((n) => n.textContent || "")
+            .join("")
+        );
+        if (own !== "標準運送" && compact(el.innerText || "") !== "標準運送") continue;
+        if (compact(el.innerText || "").length > 30 && own !== "標準運送") continue;
         let p: HTMLElement | null = el;
-        for (let d = 0; d < 8 && p; d++) {
-          if (tryClickEditIn(p)) return { ok: true, how: "near-送貨", score: 0 };
+        for (let d = 0; d < 10 && p; d++) {
+          collectEdits(p, 90 - d * 5, "near-標準運送");
           p = p.parentElement;
         }
       }
-      return { ok: false, how: "none", score: bestScore };
+
+      // 全頁：有底線嘅「編輯」a，且祖先含送貨關鍵字
+      for (const el of Array.from(document.querySelectorAll("a")) as HTMLAnchorElement[]) {
+        if (!isEditLabel(el)) continue;
+        if (compact(el.innerText || "") !== "編輯" && compact(el.innerText || "") !== "Edit") continue;
+        let p: HTMLElement | null = el.parentElement;
+        let ctx = "";
+        for (let i = 0; i < 8 && p; i++) {
+          ctx = p.innerText || "";
+          const sc = scoreBlock(ctx);
+          if (sc >= 80) {
+            collectEdits(el.parentElement, sc + (hasUnderline(el) ? 50 : 20), "anchor-in-shipping");
+            break;
+          }
+          p = p.parentElement;
+        }
+      }
+
+      cands.sort((a, b) => b.score - a.score);
+      const top = cands[0];
+      if (!top) return { ok: false, how: "none", score: bestScore, n: 0 };
+
+      const target = top.el;
+      target.scrollIntoView({ block: "center", inline: "nearest" });
+      // 優先真實 click；若係 span 包住就撳外層 a
+      const clickable = (target.closest("a") as HTMLElement) || target;
+      clickable.click();
+      return { ok: true, how: top.why, score: top.score, n: cands.length, tag: clickable.tagName };
     })
-    .catch(() => ({ ok: false, how: "eval-fail", score: 0 }));
+    .catch(() => ({ ok: false, how: "eval-fail", score: 0, n: 0, tag: "" }));
 
   if (!clickedEdit.ok) {
-    // Playwright fallback：標準運送／送貨區塊內嘅「編輯」
+    // Playwright：送貨區塊內有底線嘅「編輯」link
     const shippingScope = page
       .locator("section, article, li, div")
       .filter({ hasText: /標準運送/ })
-      .filter({ hasText: /送貨/ })
+      .filter({ hasText: /送貨\s*[:：]|送貨/ })
+      .filter({ hasText: /Hennessy|軒尼詩|梁|Jason|大廈6座|大廈\s*6/i })
       .first();
-    const nearbyEdit = shippingScope
-      .getByRole("link", { name: /^編輯$|^Edit$/i })
-      .or(shippingScope.getByRole("button", { name: /^編輯$|^Edit$/i }))
-      .first();
-    if ((await nearbyEdit.count().catch(() => 0)) > 0) {
-      await nearbyEdit.scrollIntoViewIfNeeded().catch(() => {});
-      await nearbyEdit.click({ force: true, timeout: 4000 });
-      log("已撳送貨區塊「編輯」（Playwright）");
-    } else {
-      const byText = page
+    let target = shippingScope.locator("a").filter({ hasText: /^[\s]*編輯[\s]*$/ }).first();
+    if ((await target.count().catch(() => 0)) === 0) {
+      target = shippingScope.getByRole("link", { name: /^編輯$|^Edit$/i }).first();
+    }
+    if ((await target.count().catch(() => 0)) === 0) {
+      target = page
         .getByText(/標準運送/)
         .first()
-        .locator("xpath=ancestor::*[self::section or self::article or self::li or self::div][1]")
-        .getByRole("link", { name: /^編輯$|^Edit$/i })
-        .or(
-          page
-            .getByText(/標準運送/)
-            .first()
-            .locator("xpath=ancestor::*[self::section or self::article or self::li or self::div][1]")
-            .getByRole("button", { name: /^編輯$|^Edit$/i })
+        .locator(
+          "xpath=ancestor::*[.//text()[contains(.,'送貨')]][1]//a[normalize-space()='編輯' or normalize-space()='Edit']"
         )
         .first();
-      if ((await byText.count().catch(() => 0)) === 0) {
-        throw new Error("揾唔到「送貨／標準運送」底下嘅「編輯」掣");
-      }
-      await byText.click({ force: true, timeout: 4000 });
-      log("已撳標準運送附近「編輯」（xpath）");
     }
+    if ((await target.count().catch(() => 0)) === 0) {
+      throw new Error("揾唔到「送貨／標準運送」底下有底線嘅「編輯」連結");
+    }
+    await target.scrollIntoViewIfNeeded().catch(() => {});
+    await target.click({ force: true, timeout: 4000 });
+    log("已撳送貨區塊底線「編輯」（Playwright link）");
   } else {
-    log(`已撳送貨「編輯」（${clickedEdit.how}·score=${clickedEdit.score}）`);
+    log(
+      `已撳送貨底線「編輯」（${clickedEdit.how}·score=${clickedEdit.score}·${(clickedEdit as { tag?: string }).tag || "A"}·n=${(clickedEdit as { n?: number }).n || 0}）`
+    );
   }
   await sleep(800);
 
