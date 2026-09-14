@@ -343,6 +343,35 @@ function isAppleGuestOrderUrl(url: string): boolean {
   );
 }
 
+/** 同一個 context 只留一個 Apple 訂單頁，關掉其餘（避免開咗多個視窗） */
+async function keepSingleAppleOrderPage(
+  context: BrowserContext,
+  preferred?: Page | null
+): Promise<Page | null> {
+  const applePages = context.pages().filter((p) => {
+    if (p.isClosed()) return false;
+    const u = p.url();
+    return (
+      /store\.apple\.com|secure\d*\.store\.apple/i.test(u) &&
+      (/\/shop\/order|\/shop\/signIn/i.test(u) || isOrderPhoneGateUrl(u))
+    );
+  });
+  if (!applePages.length) return null;
+  const keep =
+    (preferred && applePages.includes(preferred) ? preferred : null) ||
+    applePages.find((p) => /\/shop\/order\/detail\//i.test(p.url())) ||
+    applePages.find((p) => isAppleGuestOrderUrl(p.url())) ||
+    applePages.find((p) => isOrderLinkVerifyUrl(p.url())) ||
+    applePages[0]!;
+  for (const p of applePages) {
+    if (p !== keep && !p.isClosed()) {
+      log(`關閉多餘 Apple 分頁：${p.url()}`);
+      await p.close().catch(() => {});
+    }
+  }
+  return keep;
+}
+
 /** 由 signIn/orders SSI 解出 continue 入面嘅 verify URL */
 function extractVerifyUrlFromSignInOrders(url: string): string {
   try {
@@ -2168,11 +2197,16 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
   };
 
   log(`搜尋郵件（訂單編號）：${keyword}…`);
-  // 開信前確保視窗喺最前（minimized 時 Gmail 好易開唔到）
+  // 開信前若 minimized 先還原（唔每次 maximize，避免多視窗錯覺）
   if (activeBrowser) {
     await setKeepBrowserOpen(true);
-    await maximizeBrowserWindow(page, activeBrowser).catch(() => {});
-    winRestoreBrowserWindow(activeBrowser);
+    const minimized = await isBrowserWindowMinimized(page).catch(() => false);
+    if (minimized) {
+      await maximizeBrowserWindow(page, activeBrowser).catch(() => {});
+      winRestoreBrowserWindow(activeBrowser);
+    } else {
+      await page.bringToFront().catch(() => {});
+    }
   }
   await writeStatus({
     phase: "search_email",
@@ -2287,11 +2321,15 @@ async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): 
   const keyword = String(orderNumber || "").trim();
   const enc = encodeURIComponent(keyword);
 
-  // 最小化／背景時 click／hash 往往唔生效
+  // 最小化／背景時 click／hash 往往唔生效（唔重複 maximize，避免多個視窗閃動）
   if (activeBrowser) {
-    await maximizeBrowserWindow(page, activeBrowser).catch(() => {});
-    winRestoreBrowserWindow(activeBrowser);
-    await sleep(400);
+    await page.bringToFront().catch(() => {});
+    const minimized = await isBrowserWindowMinimized(page).catch(() => false);
+    if (minimized) {
+      await maximizeBrowserWindow(page, activeBrowser).catch(() => {});
+      winRestoreBrowserWindow(activeBrowser);
+      await sleep(300);
+    }
   } else {
     await page.bringToFront().catch(() => {});
   }
@@ -2327,24 +2365,30 @@ async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): 
             "data-legacy-last-message-id",
             "data-message-id",
           ];
-          for (const a of attrs) {
-            const v = el.getAttribute(a);
-            if (v && v.length > 4) return v;
-          }
-          const nested = el.querySelector(
-            "[data-legacy-thread-id], [data-thread-id], [data-legacy-last-message-id]"
-          );
-          if (nested) {
+          const read = (node: Element | null): string => {
+            if (!node) return "";
             for (const a of attrs) {
-              const v = nested.getAttribute(a);
-              if (v && v.length > 4) return v;
+              const v = (node.getAttribute(a) || "").trim();
+              if (v.length > 4) return v;
             }
+            return "";
+          };
+          let cur: Element | null = el;
+          for (let i = 0; i < 8 && cur; i++) {
+            const v = read(cur);
+            if (v) return v;
+            const nested = cur.querySelector(
+              "[data-legacy-thread-id], [data-thread-id], [data-legacy-last-message-id]"
+            );
+            const nv = read(nested);
+            if (nv) return nv;
+            cur = cur.parentElement;
           }
           // href：#inbox/xxx、#search/q/xxx、#all/xxx
           for (const a of Array.from(el.querySelectorAll("a[href]")) as HTMLAnchorElement[]) {
             const href = a.getAttribute("href") || a.href || "";
             const m =
-              href.match(/#[\w.-]+\/(?:[^/]+\/)?([A-Za-z0-9:_-]{8,})/) ||
+              href.match(/#(?:inbox|all|search\/[^/]+)\/([A-Za-z0-9:_-]{10,})/) ||
               href.match(/[?&]th=([A-Za-z0-9:_-]+)/);
             if (m?.[1] && !/^(inbox|search|all|sent|starred|label)$/i.test(m[1])) return m[1];
           }
@@ -2366,6 +2410,7 @@ async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): 
         };
 
         const pick =
+          rows.find((r) => hasOrder(r) && /Apple/i.test(norm(r.innerText || ""))) ||
           rows.find((r) => isSelected(r) && hasOrder(r)) ||
           rows.find((r) => hasOrder(r)) ||
           rows.find((r) => isSelected(r)) ||
@@ -2435,13 +2480,24 @@ async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): 
   const diag = await page
     .evaluate(() => {
       const za = document.querySelectorAll("tr.zA").length;
-      const tid = document.querySelectorAll("[data-legacy-thread-id], [data-thread-id]").length;
+      const tidEls = Array.from(
+        document.querySelectorAll("[data-legacy-thread-id], [data-thread-id]")
+      ) as HTMLElement[];
+      const tid = tidEls.filter((el) => (el.getAttribute("data-legacy-thread-id") || el.getAttribute("data-thread-id") || "").length > 4).length;
       const sample = Array.from(document.querySelectorAll("tr.zA"))
-        .slice(0, 3)
-        .map((r) => ({
-          tid: r.getAttribute("data-legacy-thread-id") || r.getAttribute("data-thread-id") || "",
-          text: ((r as HTMLElement).innerText || "").replace(/\s+/g, " ").slice(0, 80),
-        }));
+        .slice(0, 5)
+        .map((r) => {
+          const nested =
+            r.getAttribute("data-legacy-thread-id") ||
+            r.getAttribute("data-thread-id") ||
+            r.querySelector("[data-legacy-thread-id]")?.getAttribute("data-legacy-thread-id") ||
+            r.querySelector("[data-thread-id]")?.getAttribute("data-thread-id") ||
+            "";
+          return {
+            tid: nested,
+            text: ((r as HTMLElement).innerText || "").replace(/\s+/g, " ").slice(0, 90),
+          };
+        });
       return { za, tid, sample };
     })
     .catch(() => ({ za: 0, tid: 0, sample: [] as { tid: string; text: string }[] }));
@@ -2651,22 +2707,20 @@ async function waitForGmailMessageOpen(
 }
 
 /**
- * 郵件已開時：最快路徑撳「訂單狀態」
- * — 一次 DOM 定位（優先文字＝訂單狀態，其次 Apple order href）
- * — 短等 popup／同頁導航，唔再巢狀 regex×scope 輪詢
+ * 郵件已開時：撳「訂單狀態」——優先抽 href 同 tab 導航（唔開多個瀏覽器／分頁）
  */
 async function clickOrderStatusInEmail(page: Page, context: BrowserContext): Promise<Page> {
   log("喺郵件詳情入面撳「訂單狀態」…");
   await dismissGmailOverlays(page).catch(() => {});
 
-  // 已在 thread URL（#search/訂單/threadId）就唔使再等正文；只短等 body
   const hashParts = (page.url().split("#")[1] || "").split("/").filter(Boolean);
-  const alreadyOnThread = hashParts[0] === "search" && hashParts.length >= 3;
+  const alreadyOnThread =
+    (hashParts[0] === "search" && hashParts.length >= 3) ||
+    ((hashParts[0] === "inbox" || hashParts[0] === "all") && hashParts.length >= 2);
   if (!alreadyOnThread && !(await isGmailMessageOpen(page))) {
-    await waitForGmailMessageOpen(page, { timeoutMs: 6_000 }).catch(() => false);
+    await waitForGmailMessageOpen(page, { timeoutMs: 8_000 }).catch(() => false);
   }
 
-  // 展開截斷郵件（一次、唔 sleep）
   await page
     .evaluate(() => {
       const nodes = Array.from(document.querySelectorAll("span, a, div, button")) as HTMLElement[];
@@ -2680,28 +2734,35 @@ async function clickOrderStatusInEmail(page: Page, context: BrowserContext): Pro
       return false;
     })
     .catch(() => false);
+  await sleep(400);
 
-  const before = new Set(context.pages());
-  // 先掛 popup listener，再 click，避免錯過新分頁
-  const popupPromise = context.waitForEvent("page", { timeout: 4_000 }).catch(() => null);
-
-  // 一次 evaluate：搵最佳連結並 click（最快、最穩）
-  const clickResult = await page
+  /** 從郵件 DOM 抽出最佳 Apple 訂單連結（含 google redirect unwrap） */
+  const pick = await page
     .evaluate(() => {
       const norm = (s: string) => (s || "").replace(/[\s\u00a0\u200b\u200c\u200d\ufeff]+/g, "");
+      const unwrapGoogle = (href: string): string => {
+        try {
+          const u = new URL(href, location.href);
+          if (/google\.[^/]+$/i.test(u.hostname) && u.pathname.includes("/url")) {
+            const q = u.searchParams.get("q") || u.searchParams.get("url");
+            if (q) return q;
+          }
+        } catch {
+          /* ignore */
+        }
+        return href;
+      };
       const roots = Array.from(
         document.querySelectorAll("div.a3s, div.adn, div[data-message-id], div.ii")
       ) as HTMLElement[];
       const searchRoots = roots.length ? roots : [document.body];
 
-      type Cand = { a: HTMLAnchorElement; score: number; why: string };
+      type Cand = { href: string; score: number; why: string };
       const cands: Cand[] = [];
 
-      const scoreAnchor = (a: HTMLAnchorElement): Cand | null => {
-        const href = a.href || a.getAttribute("href") || "";
-        const label = norm(
-          `${a.innerText || ""} ${a.getAttribute("aria-label") || ""} ${a.getAttribute("title") || ""}`
-        );
+      const scoreHref = (rawHref: string, label: string): Cand | null => {
+        const href = unwrapGoogle(rawHref || "");
+        if (!href) return null;
         let score = 0;
         let why = "";
         if (label === "訂單狀態" || label.includes("訂單狀態")) {
@@ -2714,29 +2775,33 @@ async function clickOrderStatusInEmail(page: Page, context: BrowserContext): Pro
           score += 70;
           why = "text:en";
         }
-        if (/store\.apple\.com|secure\d*\.store\.apple\.com/i.test(href)) score += 40;
-        if (/order\/link|vieworder|order\/guest|order\/detail|\/shop\/order/i.test(href)) score += 35;
-        if (/google\.com\/url/i.test(href) && /apple\.com/i.test(href)) score += 25;
-        if (score < 40) return null;
+        if (/secure\d*\.store\.apple\.com|store\.apple\.com/i.test(href)) score += 50;
+        if (/order\/link|vieworder|order\/guest|order\/detail|\/shop\/order|order\/signIn/i.test(href))
+          score += 40;
+        if (/apple\.com/i.test(href) && /order/i.test(href)) score += 30;
+        if (/google\.com\/url/i.test(rawHref) && /apple\.com/i.test(href)) score += 20;
+        if (score < 50) return null;
         if (!why) why = "href";
-        return { a, score, why };
+        return { href, score, why };
       };
 
       for (const root of searchRoots) {
         for (const a of Array.from(root.querySelectorAll("a[href]")) as HTMLAnchorElement[]) {
-          const c = scoreAnchor(a);
+          const label = norm(
+            `${a.innerText || ""} ${a.getAttribute("aria-label") || ""} ${a.getAttribute("title") || ""}`
+          );
+          const c = scoreHref(a.href || a.getAttribute("href") || "", label);
           if (c) cands.push(c);
         }
-        // 有時「訂單狀態」喺 button／span，外層先係 a
         for (const el of Array.from(root.querySelectorAll("span, td, font, div, button")) as HTMLElement[]) {
           const t = norm(el.innerText || "");
           if (!t.includes("訂單狀態") && !/View\s*Order/i.test(t)) continue;
-          if (t.length > 40) continue; // 避免整段正文
+          if (t.length > 48) continue;
           const a =
             (el.closest("a") as HTMLAnchorElement | null) ||
             (el.querySelector("a[href]") as HTMLAnchorElement | null);
           if (!a) continue;
-          const c = scoreAnchor(a);
+          const c = scoreHref(a.href || a.getAttribute("href") || "", t);
           if (c) {
             c.score += 20;
             c.why = "wrap:訂單狀態";
@@ -2744,94 +2809,94 @@ async function clickOrderStatusInEmail(page: Page, context: BrowserContext): Pro
           }
         }
       }
-
       cands.sort((x, y) => y.score - x.score);
       const best = cands[0];
-      if (!best) return { ok: false, why: "", href: "" };
-      best.a.scrollIntoView({ block: "center", inline: "nearest" });
-      const href = best.a.href || "";
-      best.a.setAttribute("target", "_blank");
-      best.a.click();
-      return { ok: true, why: best.why, href: href.slice(0, 180), score: best.score };
+      if (!best) return { ok: false as const, href: "", why: "", score: 0 };
+      return { ok: true as const, href: best.href, why: best.why, score: best.score };
     })
-    .catch(() => ({ ok: false, why: "", href: "" }));
+    .catch(() => ({ ok: false as const, href: "", why: "", score: 0 }));
 
-  if (!clickResult || !(clickResult as { ok?: boolean }).ok) {
-    // 極短 Playwright fallback（單一 selector）
-    const fallback = page
-      .locator("div.a3s a, div.adn a, div.ii a")
-      .filter({ hasText: /訂單狀態|Order Status|View [Yy]our [Oo]rder/i })
-      .first();
-    if ((await fallback.count().catch(() => 0)) === 0) {
-      throw new Error("郵件詳情入面揾唔到「訂單狀態」掣／連結");
-    }
-    await fallback.click({ timeout: 2500, force: true }).catch(async () => {
-      await fallback.evaluate((n) => {
-        (n as HTMLElement).setAttribute("target", "_blank");
-        (n as HTMLElement).click();
-      });
-    });
-    log("已撳「訂單狀態」（Playwright fallback）");
-  } else {
-    const info = clickResult as { why: string; href: string; score?: number };
-    log(`已撳「訂單狀態」（${info.why}${info.score != null ? `·${info.score}` : ""}）`);
+  if (!pick.ok || !pick.href) {
+    throw new Error("郵件詳情入面揾唔到「訂單狀態」掣／Apple 訂單連結");
   }
+  log(`已定位「訂單狀態」（${pick.why}·${pick.score}）→ 同 tab 開啟`);
 
-  // 短等新分頁（已喺 click 前掛 listener）
-  {
-    const popup = await popupPromise;
-    if (popup && !popup.isClosed()) {
-      await popup.waitForLoadState("domcontentloaded").catch(() => {});
-      log(`已開新分頁：${popup.url()}`);
-      return popup;
-    }
-    for (const p of context.pages()) {
-      if (!before.has(p) && !p.isClosed()) {
-        await p.waitForLoadState("domcontentloaded").catch(() => {});
-        log(`已開新分頁：${p.url()}`);
-        return p;
-      }
+  // 關掉多餘 Apple／空白分頁，之後淨係用本頁（或唯一一個 popup）
+  const keepGmail = page;
+  for (const p of context.pages()) {
+    if (p === keepGmail || p.isClosed()) continue;
+    const u = p.url();
+    if (/store\.apple\.com|about:blank|chrome:\/\//i.test(u) || u === "about:blank") {
+      await p.close().catch(() => {});
     }
   }
 
-  // 同頁導航（較少見）
-  await page
-    .waitForURL(
-      (u) => /store\.apple\.com|secure\d*\.store\.apple|google\.com\/url/i.test(u.toString()),
-      { timeout: 8_000 }
-    )
-    .catch(() => {});
+  // 同 tab 導航 —— 唔設 target=_blank，避免開多個瀏覽器視窗
+  await page.goto(pick.href, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(async () => {
+    // fallback：唔改 target，本頁 click
+    await page
+      .evaluate((want) => {
+        const unwrap = (href: string) => {
+          try {
+            const u = new URL(href, location.href);
+            if (u.pathname.includes("/url")) {
+              const q = u.searchParams.get("q") || u.searchParams.get("url");
+              if (q) return q;
+            }
+          } catch {
+            /* ignore */
+          }
+          return href;
+        };
+        for (const a of Array.from(document.querySelectorAll("a[href]")) as HTMLAnchorElement[]) {
+          const href = unwrap(a.href || "");
+          if (href === want || (a.href || "") === want) {
+            a.removeAttribute("target");
+            a.click();
+            return true;
+          }
+        }
+        return false;
+      }, pick.href)
+      .catch(() => false);
+  });
 
-  if (/google\.com\/url/i.test(page.url())) {
-    try {
-      const q = new URL(page.url()).searchParams.get("q");
-      if (q) {
-        await page.goto(q, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
-      } else {
-        await page
-          .waitForURL((u) => /store\.apple\.com|secure\d*\.store\.apple/i.test(u.toString()), {
-            timeout: 12_000,
-          })
-          .catch(() => {});
+  // 跟住 Google redirect
+  for (let i = 0; i < 4; i++) {
+    const url = page.url();
+    if (/google\.com\/url/i.test(url)) {
+      try {
+        const q = new URL(url).searchParams.get("q") || new URL(url).searchParams.get("url");
+        if (q) {
+          await page.goto(q, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+          continue;
+        }
+      } catch {
+        /* ignore */
       }
-    } catch {
-      /* ignore */
     }
+    break;
+  }
+
+  // 若仍然開咗 popup，只留一個 Apple 頁，關其餘
+  await sleep(500);
+  const applePages = context
+    .pages()
+    .filter((p) => !p.isClosed() && /store\.apple\.com|secure\d*\.store\.apple/i.test(p.url()));
+  if (applePages.length > 1) {
+    const primary = applePages[0]!;
+    for (const p of applePages.slice(1)) await p.close().catch(() => {});
+    log(`已關閉多餘 Apple 分頁，淨留 1 個：${primary.url()}`);
+    return primary;
+  }
+  if (applePages.length === 1) {
+    log(`訂單頁：${applePages[0]!.url()}`);
+    return applePages[0]!;
   }
 
   if (/store\.apple\.com|secure\d*\.store\.apple/i.test(page.url())) {
     log(`訂單頁：${page.url()}`);
     return page;
-  }
-
-  // 最後再掃一次新分頁（慢網絡）
-  await sleep(400);
-  for (const p of context.pages()) {
-    if (!before.has(p) && !p.isClosed()) {
-      await p.waitForLoadState("domcontentloaded").catch(() => {});
-      log(`已開新分頁：${p.url()}`);
-      return p;
-    }
   }
 
   throw new Error(`撳咗「訂單狀態」但未去到 Apple（${page.url()}）`);
@@ -3560,10 +3625,20 @@ async function clickAddToAppleIdOnce(page: Page): Promise<void> {
     return true;
   };
 
-  // 1) 新版訪客頁：data-autom="signin_orderpage"（文字「登入」）
-  if (await tryClick(page.locator('a[data-autom="signin_orderpage"], button[data-autom="signin_orderpage"]'), "signin_orderpage（登入）")) {
-    await sleep(500);
-    return;
+  // 1) 新版訪客頁：data-autom="signin_orderpage"（文字「登入」）— 同 tab，唔開新窗
+  {
+    const login = page.locator('a[data-autom="signin_orderpage"], button[data-autom="signin_orderpage"]').first();
+    if ((await login.count().catch(() => 0)) > 0 && (await login.isVisible().catch(() => false))) {
+      await login.evaluate((n) => {
+        const el = n as HTMLElement;
+        el.removeAttribute("target");
+        if (el.tagName === "A") (el as HTMLAnchorElement).target = "_self";
+      }).catch(() => {});
+      if (await tryClick(login, "signin_orderpage（登入）")) {
+        await sleep(500);
+        return;
+      }
+    }
   }
 
   // 2) 舊版「加入至 Apple ID」
@@ -3695,11 +3770,19 @@ async function processOneAccount(
       email: account.email,
     });
 
-    // 已喺 Apple verify／訂單頁（任何分頁）：跳過 Gmail，直接填電話／繼續
+    // 已喺 Apple verify／訂單頁（任何分頁）：跳過 Gmail，直接填電話／撳「登入」／繼續
     {
+      // 若之前誤開咗多個 Apple 視窗／分頁，先合併剩一個
+      const consolidated = await keepSingleAppleOrderPage(context, page);
+      if (consolidated) {
+        activePage = consolidated;
+        await consolidated.bringToFront().catch(() => {});
+      }
+
       // 已喺 order/detail 且可見送貨「編輯」→ 只做送貨編輯
       const detailPage =
-        context.pages().find((p) => !p.isClosed() && /\/shop\/order\/detail\//i.test(p.url())) || null;
+        context.pages().find((p) => !p.isClosed() && /\/shop\/order\/detail\//i.test(p.url())) ||
+        null;
       if (detailPage) {
         const canEdit = await detailPage
           .getByText(/標準運送|送貨\s*[:：]/i)
@@ -3709,16 +3792,15 @@ async function processOneAccount(
         if (canEdit) {
           log(`已在訂單詳情（${detailPage.url()}），直接編輯送貨`);
           activePage = detailPage;
-          await maybeMinimizeBrowserWindow(detailPage, browser);
           await editOrderShippingAddress(detailPage);
           await sealAddOrderComplete(detailPage, browser, account);
           return;
         }
       }
 
-      let applePage: Page | null = null;
+      let applePage: Page | null = consolidated;
       try {
-        applePage = await findOrderVerifyPage(context, page, orderNumber);
+        applePage = await findOrderVerifyPage(context, consolidated || page, orderNumber);
       } catch {
         applePage =
           context.pages().find((p) => {
@@ -3732,20 +3814,42 @@ async function processOneAccount(
             );
           }) || null;
       }
-      if (applePage && (isOrderPhoneGateUrl(applePage.url()) || (await pageHasOrderPhoneForm(applePage)) || isAppleGuestOrderUrl(applePage.url()) || /secure\d*\.store\.apple\.com.*\/shop\/order/i.test(applePage.url()))) {
-        log(`已在 Apple 訂單流程（${applePage.url()}），跳過 Gmail`);
-        activePage = applePage;
-        await maybeMinimizeBrowserWindow(applePage, browser);
-        if (!/\/shop\/order\/detail\//i.test(applePage.url())) {
-          await fillOrderVerifyPhoneAndContinue(applePage, orderNumber);
-          await waitForAppleGuestOrderPage(applePage);
-          await writeStatus({ phase: "add_to_apple_id", message: "加入至 Apple ID…", orderNumber });
-          await clickAddToAppleIdOnce(applePage);
-          await signInAppleIdOnOrderPage(applePage, appleEmail, applePassword);
+      // 訪客頁有「登入」掣都算
+      if (applePage && !applePage.isClosed()) {
+        const hasLoginCta = await applePage
+          .locator('[data-autom="signin_orderpage"]')
+          .or(applePage.getByRole("link", { name: /^登入$/ }))
+          .or(applePage.getByRole("button", { name: /^登入$/ }))
+          .first()
+          .isVisible()
+          .catch(() => false);
+        const onAppleFlow =
+          isOrderPhoneGateUrl(applePage.url()) ||
+          (await pageHasOrderPhoneForm(applePage)) ||
+          isAppleGuestOrderUrl(applePage.url()) ||
+          /secure\d*\.store\.apple\.com.*\/shop\/order/i.test(applePage.url()) ||
+          hasLoginCta;
+        if (onAppleFlow) {
+          log(`已在 Apple 訂單流程（${applePage.url()}），跳過 Gmail → 撳「登入」繼續`);
+          applePage = (await keepSingleAppleOrderPage(context, applePage)) || applePage;
+          activePage = applePage;
+          if (!/\/shop\/order\/detail\//i.test(applePage.url())) {
+            await fillOrderVerifyPhoneAndContinue(applePage, orderNumber).catch((err) => {
+              if (hasLoginCta || isAppleGuestOrderUrl(applePage!.url())) {
+                log(`verify 跳過：${err instanceof Error ? err.message : String(err)}`);
+                return;
+              }
+              throw err;
+            });
+            await waitForAppleGuestOrderPage(applePage);
+            await writeStatus({ phase: "add_to_apple_id", message: "撳「登入」…", orderNumber });
+            await clickAddToAppleIdOnce(applePage);
+            await signInAppleIdOnOrderPage(applePage, appleEmail, applePassword);
+          }
+          await editOrderShippingAddress(applePage);
+          await sealAddOrderComplete(applePage, browser, account);
+          return;
         }
-        await editOrderShippingAddress(applePage);
-        await sealAddOrderComplete(applePage, browser, account);
-        return;
       }
     }
 
@@ -3808,14 +3912,16 @@ async function processOneAccount(
       orderNumber,
     });
     let orderPage = await clickOrderStatusInEmail(page, context);
+    orderPage = (await keepSingleAppleOrderPage(context, orderPage)) || orderPage;
     activePage = orderPage;
-    await maybeMinimizeBrowserWindow(orderPage, browser);
+    await orderPage.bringToFront().catch(() => {});
 
     await writeStatus({ phase: "apple_order", message: "等待 Apple 訂單／verify 頁…", orderNumber });
     await waitForAppleOrderFlowPage(orderPage);
 
     // 正確分頁：verify 先填電話；已係 guest／detail 就直接去「登入」
     orderPage = await findOrderVerifyPage(context, orderPage, orderNumber).catch(() => orderPage);
+    orderPage = (await keepSingleAppleOrderPage(context, orderPage)) || orderPage;
     activePage = orderPage;
     if (isOrderLinkVerifyUrl(orderPage.url()) || (await pageHasOrderPhoneForm(orderPage))) {
       await fillOrderVerifyPhoneAndContinue(orderPage, orderNumber);
