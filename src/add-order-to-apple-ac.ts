@@ -78,6 +78,8 @@ let activeBrowser: Browser | null = null;
 let windowHidden = true;
 /** 用戶撳過 Open browser 之後，自動化唔好再自動 minimize */
 let userKeepBrowserOpen = false;
+/** 步驟完成後已用正常 Chrome 最大化（zoom 100%） */
+let finishedFullScreen = false;
 /** 同 Checkout Dashboard 嘅鋪位大小（Open browser 用） */
 let windowBounds: { left: number; top: number; width: number; height: number } = {
   left: 4,
@@ -645,6 +647,191 @@ async function maximizeBrowserWindow(page: Page, browser: Browser): Promise<void
   });
 }
 
+/** Zoom 100% + viewport 貼齊最大化視窗，避免右邊／底欄捲軸內縮 */
+async function applyFullWindowViewportAndZoom(page: Page, cdp: any, windowId: number): Promise<void> {
+  await cdp.send("Emulation.setPageScaleFactor", { pageScaleFactor: 1 }).catch(() => {});
+  await page
+    .evaluate(() => {
+      try {
+        const html = document.documentElement as HTMLElement | null;
+        const body = document.body as HTMLElement | null;
+        if (html) html.style.zoom = "1";
+        if (body) body.style.zoom = "1";
+      } catch {
+        /* ignore */
+      }
+    })
+    .catch(() => {});
+
+  const screen = await page
+    .evaluate(() => ({
+      aw: Math.max(window.screen.availWidth || 0, window.screen.width || 0, 1280),
+      ah: Math.max(window.screen.availHeight || 0, window.screen.height || 0, 720),
+    }))
+    .catch(() => ({ aw: 1920, ah: 1080 }));
+
+  let outerW = screen.aw;
+  let outerH = screen.ah;
+  try {
+    const got = (await cdp.send("Browser.getWindowBounds", { windowId })) as {
+      bounds?: { width?: number; height?: number };
+    };
+    if (got?.bounds?.width) outerW = Math.max(outerW, Number(got.bounds.width) || 0);
+    if (got?.bounds?.height) outerH = Math.max(outerH, Number(got.bounds.height) || 0);
+  } catch {
+    /* ignore */
+  }
+
+  const viewportW = Math.max(1024, outerW);
+  const viewportH = Math.max(700, outerH);
+  await page.setViewportSize({ width: viewportW, height: viewportH }).catch(() => {});
+
+  await cdp
+    .send("Browser.setWindowBounds", {
+      windowId,
+      bounds: { windowState: "maximized" },
+    })
+    .catch(() => {});
+  await new Promise((r) => setTimeout(r, 200));
+
+  const inner = await page
+    .evaluate(() => ({
+      w: Math.max(window.innerWidth || 0, document.documentElement?.clientWidth || 0, 1024),
+      h: Math.max(window.innerHeight || 0, document.documentElement?.clientHeight || 0, 700),
+    }))
+    .catch(() => ({ w: viewportW, h: viewportH }));
+  if (Math.abs(inner.w - viewportW) > 24 || Math.abs(inner.h - viewportH) > 24) {
+    await page
+      .setViewportSize({
+        width: Math.max(1024, inner.w),
+        height: Math.max(700, inner.h),
+      })
+      .catch(() => {});
+    await cdp
+      .send("Browser.setWindowBounds", {
+        windowId,
+        bounds: { windowState: "maximized" },
+      })
+      .catch(() => {});
+  }
+}
+
+/** 捲軸拉去最右／最底（修正 viewport 內縮後滑動掣偏移） */
+async function scrollPageToBottomRight(page: Page): Promise<void> {
+  await page
+    .evaluate(() => {
+      const root = (document.scrollingElement || document.documentElement) as HTMLElement;
+      const maxX = Math.max(
+        0,
+        (root.scrollWidth || 0) - (root.clientWidth || window.innerWidth || 0),
+        (document.body?.scrollWidth || 0) - (window.innerWidth || 0)
+      );
+      const maxY = Math.max(
+        0,
+        (root.scrollHeight || 0) - (root.clientHeight || window.innerHeight || 0),
+        (document.body?.scrollHeight || 0) - (window.innerHeight || 0)
+      );
+      window.scrollTo(maxX, maxY);
+      root.scrollLeft = maxX;
+      root.scrollTop = maxY;
+      if (document.body) {
+        document.body.scrollLeft = maxX;
+        document.body.scrollTop = maxY;
+      }
+      for (const el of Array.from(document.querySelectorAll("*"))) {
+        const h = el as HTMLElement;
+        try {
+          if (h.scrollWidth > h.clientWidth + 8) h.scrollLeft = h.scrollWidth;
+          if (h.scrollHeight > h.clientHeight + 8) h.scrollTop = h.scrollHeight;
+        } catch {
+          /* ignore */
+        }
+      }
+    })
+    .catch(() => {});
+}
+
+/**
+ * 最後一步完成：好似平時 Chrome 最大化，zoom 100%，捲軸貼最右／最底。
+ */
+async function maximizeBrowserLikeNormalChrome(page: Page, browser: Browser): Promise<void> {
+  await setKeepBrowserOpen(true);
+  const windowId = await getPageWindowId(page);
+  if (windowId == null) {
+    log("無 windowId，改用 Win32 最大化");
+    winRestoreBrowserWindow(browser);
+    windowHidden = false;
+    await writeStatus({
+      windowState: "maximized",
+      windowHidden: false,
+      keepOpen: true,
+    });
+    return;
+  }
+
+  const cdp = await page.context().newCDPSession(page);
+  try {
+    await cdp.send("Browser.setWindowBounds", {
+      windowId,
+      bounds: { windowState: "normal" },
+    });
+    await new Promise((r) => setTimeout(r, 200));
+
+    const screen = await page
+      .evaluate(() => ({
+        aw: Math.max(window.screen.availWidth || 0, 1280),
+        ah: Math.max(window.screen.availHeight || 0, 720),
+      }))
+      .catch(() => ({ aw: 1920, ah: 1080 }));
+
+    windowBounds = {
+      left: 0,
+      top: 0,
+      width: screen.aw,
+      height: screen.ah,
+    };
+
+    await cdp.send("Browser.setWindowBounds", {
+      windowId,
+      bounds: {
+        left: 0,
+        top: 0,
+        width: screen.aw,
+        height: screen.ah,
+        windowState: "normal",
+      },
+    });
+    await new Promise((r) => setTimeout(r, 150));
+
+    await cdp.send("Browser.setWindowBounds", {
+      windowId,
+      bounds: { windowState: "maximized" },
+    });
+    await new Promise((r) => setTimeout(r, 250));
+
+    await applyFullWindowViewportAndZoom(page, cdp, windowId);
+
+    await page.bringToFront().catch(() => {});
+    winRestoreBrowserWindow(browser);
+
+    await new Promise((r) => setTimeout(r, 200));
+    await scrollPageToBottomRight(page);
+    await new Promise((r) => setTimeout(r, 120));
+    await scrollPageToBottomRight(page);
+
+    windowHidden = false;
+    await writeStatus({
+      windowState: "maximized",
+      windowHidden: false,
+      keepOpen: true,
+      windowBounds,
+    });
+    log("步驟完成 → 已最大化（zoom 100%），捲軸貼最右／最底");
+  } finally {
+    await cdp.detach().catch(() => {});
+  }
+}
+
 /** 隱藏視窗（淨係 Hide 先會 force；Open browser 後自動呼叫會被拒絕） */
 async function minimizeBrowserWindow(
   page: Page,
@@ -722,7 +909,11 @@ async function syncWindowFlags(): Promise<void> {
     await setKeepBrowserOpen(true);
   }
   if (await consumeFlag(SHOW_FLAG)) {
-    await maximizeBrowserWindow(activePage, activeBrowser);
+    if (finishedFullScreen) {
+      await maximizeBrowserLikeNormalChrome(activePage, activeBrowser);
+    } else {
+      await maximizeBrowserWindow(activePage, activeBrowser);
+    }
     log("Open browser：已顯示視窗（會保持開啟直至 Hide／Close）");
   }
   if (await consumeFlag(HIDE_FLAG)) {
@@ -742,7 +933,11 @@ async function syncWindowFlags(): Promise<void> {
       const minimized = await isBrowserWindowMinimized(activePage).catch(() => false);
       if (minimized) {
         log("偵測到視窗被收埋 — 自動再 Open（keep-open）");
-        await maximizeBrowserWindow(activePage, activeBrowser).catch(() => {});
+        if (finishedFullScreen) {
+          await maximizeBrowserLikeNormalChrome(activePage, activeBrowser).catch(() => {});
+        } else {
+          await maximizeBrowserWindow(activePage, activeBrowser).catch(() => {});
+        }
       }
     }
   }
@@ -2646,72 +2841,87 @@ async function editOrderShippingAddress(page: Page): Promise<void> {
 
   await sleep(500);
 
-  // 喺「送貨／標準運送」區塊搵「編輯」
+  // 專搵「標準運送」區塊入面嘅「編輯」
   const clickedEdit = await page
     .evaluate(() => {
       const norm = (s: string) => (s || "").replace(/[\s\u00a0\u200b]+/g, "");
-      const blocks = Array.from(
-        document.querySelectorAll("section, div, li, article, tr, td")
-      ) as HTMLElement[];
-      let best: HTMLElement | null = null;
-      let bestScore = 0;
-      for (const el of blocks) {
-        const t = norm(el.innerText || "").slice(0, 400);
-        if (!t.includes("送貨")) continue;
-        let score = 0;
-        if (t.includes("標準運送")) score += 50;
-        if (t.includes("送貨：") || t.includes("送貨:")) score += 30;
-        if (/\bEdit\b|編輯/.test(t)) score += 20;
-        if (score > bestScore && score >= 50) {
-          bestScore = score;
-          best = el;
-        }
-      }
-      const roots = best ? [best, best.parentElement, document.body] : [document.body];
-      for (const root of roots) {
-        if (!root) continue;
-        const links = Array.from(root.querySelectorAll("a, button, [role='button']")) as HTMLElement[];
-        for (const el of links) {
-          const label = norm(`${el.innerText || ""} ${el.getAttribute("aria-label") || ""}`);
-          if (label === "編輯" || label === "Edit" || /^編輯/.test(label) || /^Edit$/i.test(label)) {
-            // 避免頂欄／無關編輯
+      const isEdit = (el: HTMLElement) => {
+        const label = norm(`${el.innerText || ""} ${el.getAttribute("aria-label") || ""}`);
+        return label === "編輯" || label === "Edit" || /^編輯$/.test(label) || /^Edit$/i.test(label);
+      };
+
+      // 1) 由「標準運送」文字向上搵，再喺該區塊撳「編輯」
+      const all = Array.from(document.querySelectorAll("span, div, p, li, td, h1, h2, h3, h4, strong, b, label")) as HTMLElement[];
+      const markers = all.filter((el) => {
+        const t = norm(el.innerText || "");
+        return t === "標準運送" || (t.includes("標準運送") && t.length < 40);
+      });
+      for (const marker of markers) {
+        let root: HTMLElement | null = marker;
+        for (let up = 0; up < 10 && root; up++) {
+          const edits = Array.from(root.querySelectorAll("a, button, [role='button']")) as HTMLElement[];
+          for (const el of edits) {
             if (el.closest("#globalnav")) continue;
+            if (!isEdit(el)) continue;
+            // 確認同一區塊仍有「標準運送」
+            const blockText = norm(root.innerText || "").slice(0, 800);
+            if (!blockText.includes("標準運送")) continue;
             el.scrollIntoView({ block: "center", inline: "nearest" });
             el.click();
-            return true;
+            return "標準運送→編輯";
           }
+          root = root.parentElement;
         }
       }
-      return false;
+
+      // 2) 所有「編輯」掣：祖先必須含「標準運送」
+      for (const el of Array.from(document.querySelectorAll("a, button, [role='button']")) as HTMLElement[]) {
+        if (el.closest("#globalnav")) continue;
+        if (!isEdit(el)) continue;
+        let p: HTMLElement | null = el.parentElement;
+        for (let i = 0; i < 10 && p; i++) {
+          const block = norm(p.innerText || "").slice(0, 800);
+          if (block.includes("標準運送")) {
+            el.scrollIntoView({ block: "center", inline: "nearest" });
+            el.click();
+            return "編輯←標準運送";
+          }
+          p = p.parentElement;
+        }
+      }
+      return "";
     })
-    .catch(() => false);
+    .catch(() => "");
 
   if (!clickedEdit) {
-    // Playwright fallback：送貨標題附近嘅「編輯」
-    const shippingHeading = page.getByText(/送貨\s*[:：]|標準運送/i).first();
-    const nearbyEdit = shippingHeading
-      .locator("xpath=ancestor::*[self::section or self::div or self::li][1]")
-      .getByRole("link", { name: /^編輯$|^Edit$/i })
-      .or(
-        shippingHeading
-          .locator("xpath=ancestor::*[self::section or self::div or self::li][1]")
-          .getByRole("button", { name: /^編輯$|^Edit$/i })
+    // Playwright：標準運送 → 祖先 → 編輯
+    const marker = page.getByText("標準運送", { exact: false }).first();
+    const nearbyEdit = marker
+      .locator(
+        'xpath=ancestor::*[self::section or self::div or self::li or self::article][.//a[normalize-space()="編輯"] or .//button[normalize-space()="編輯"] or .//*[@role="button"][normalize-space()="編輯"]][1]//a[normalize-space()="編輯"] | ancestor::*[self::section or self::div or self::li or self::article][.//button[normalize-space()="編輯"]][1]//button[normalize-space()="編輯"]'
       )
       .first();
-    if ((await nearbyEdit.count().catch(() => 0)) > 0) {
+    if ((await nearbyEdit.count().catch(() => 0)) > 0 && (await nearbyEdit.isVisible().catch(() => false))) {
+      await nearbyEdit.scrollIntoViewIfNeeded().catch(() => {});
       await nearbyEdit.click({ force: true, timeout: 4000 });
+      log("已撳送貨「編輯」（Playwright 標準運送）");
     } else {
-      const anyEdit = page
+      // 再試：has-text 容器
+      const scoped = page.locator("section, div, li, article").filter({ hasText: /標準運送/ }).first();
+      const editInScoped = scoped
         .getByRole("link", { name: /^編輯$|^Edit$/i })
-        .or(page.getByRole("button", { name: /^編輯$|^Edit$/i }))
+        .or(scoped.getByRole("button", { name: /^編輯$|^Edit$/i }))
         .first();
-      if ((await anyEdit.count().catch(() => 0)) === 0) {
-        throw new Error("揾唔到送貨區塊嘅「編輯」掣");
+      if ((await editInScoped.count().catch(() => 0)) > 0) {
+        await editInScoped.click({ force: true, timeout: 4000 });
+        log("已撳送貨「編輯」（scoped）");
+      } else {
+        throw new Error("揾唔到「標準運送」下面嘅「編輯」掣");
       }
-      await anyEdit.click({ force: true, timeout: 4000 });
     }
+  } else {
+    log(`已撳送貨「編輯」（${clickedEdit}）`);
   }
-  log("已撳送貨「編輯」");
   await sleep(800);
 
   // 等編輯表單
@@ -2820,6 +3030,30 @@ async function editOrderShippingAddress(page: Page): Promise<void> {
     message: "送貨地址已儲存",
     url: page.url(),
   });
+}
+
+/** 全部步驟做完：最大化 + finished status */
+async function sealAddOrderComplete(
+  page: Page,
+  browser: Browser,
+  account: Account
+): Promise<void> {
+  activePage = page;
+  finishedFullScreen = true;
+  await maximizeBrowserLikeNormalChrome(page, browser).catch((err) => {
+    log(`最大化失敗：${err instanceof Error ? err.message : String(err)}`);
+  });
+  await writeStatus({
+    phase: "steps_complete",
+    message: `步驟完成（${account.orderNumber}）· 送貨已儲存`,
+    orderNumber: account.orderNumber,
+    email: account.email,
+    windowHidden: false,
+    keepOpen: true,
+    windowState: "maximized",
+    url: page.url(),
+  });
+  log(`完成：${maskEmail(account.email)} · ${account.orderNumber} → 已儲存送貨並最大化`);
 }
 
 /**
@@ -3277,14 +3511,7 @@ async function processOneAccount(
           activePage = detailPage;
           await maybeMinimizeBrowserWindow(detailPage, browser);
           await editOrderShippingAddress(detailPage);
-          await writeStatus({
-            phase: "steps_complete",
-            message: `步驟完成（${orderNumber}）· 送貨已儲存`,
-            orderNumber,
-            windowHidden: !userKeepBrowserOpen,
-            keepOpen: userKeepBrowserOpen,
-          });
-          log(`完成：${maskEmail(account.email)} · ${orderNumber} → 送貨已儲存`);
+          await sealAddOrderComplete(detailPage, browser, account);
           return;
         }
       }
@@ -3317,14 +3544,7 @@ async function processOneAccount(
           await signInAppleIdOnOrderPage(applePage, appleEmail, applePassword);
         }
         await editOrderShippingAddress(applePage);
-        await writeStatus({
-          phase: "steps_complete",
-          message: `步驟完成（${orderNumber}）· 送貨已儲存`,
-          orderNumber,
-          windowHidden: !userKeepBrowserOpen,
-          keepOpen: userKeepBrowserOpen,
-        });
-        log(`完成：${maskEmail(account.email)} · ${orderNumber} → Apple ID + 送貨已儲存`);
+        await sealAddOrderComplete(applePage, browser, account);
         return;
       }
     }
@@ -3419,14 +3639,7 @@ async function processOneAccount(
     await clickAddToAppleIdOnce(orderPage);
     await signInAppleIdOnOrderPage(orderPage, appleEmail, applePassword);
     await editOrderShippingAddress(orderPage);
-    await writeStatus({
-      phase: "steps_complete",
-      message: `步驟完成（${orderNumber}）· 送貨已儲存`,
-      orderNumber,
-      windowHidden: !userKeepBrowserOpen,
-      keepOpen: userKeepBrowserOpen,
-    });
-    log(`完成：${maskEmail(account.email)} · ${orderNumber} → Apple ID + 送貨已儲存`);
+    await sealAddOrderComplete(orderPage, browser, account);
   };
 
   for (;;) {
@@ -3501,6 +3714,7 @@ async function main() {
   // 新 task 預設隱藏；舊 keepopen 清走（呢次 run 用戶再開先 lock）
   await fs.unlink(KEEP_OPEN_FLAG).catch(() => {});
   userKeepBrowserOpen = false;
+  finishedFullScreen = false;
 
   const cfg = await loadConfig();
   const account = cfg.accounts[ACCOUNT_INDEX];
