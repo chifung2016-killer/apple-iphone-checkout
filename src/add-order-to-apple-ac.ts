@@ -2219,15 +2219,35 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
   }
   if (!hasRows) throw new Error(`Gmail 搜尋訂單「${keyword}」搵唔到郵件列`);
 
-  // 只有「正確 search thread」先跳過再開；#inbox/xxx 唔算
+  // 只有「正確 search thread」先跳過再開；#search/訂單 列表唔算
   if (isCorrectOrderThreadUrl(page.url()) && (await isGmailMessageOpen(page))) {
     log("搜尋結果已打開訂單郵件詳情");
   } else {
     log("點開選中／第一封搜尋結果…");
-    const opened = await openSelectedOrFirstGmailResult(page, keyword);
-    if (!opened) {
-      throw new Error(`搜尋結果入面打唔開訂單「${keyword}」郵件（請確認 inbox 有結果）`);
+    let opened = await openSelectedOrFirstGmailResult(page, keyword);
+    // 仍停喺列表：再試一次（reload search 後再開）
+    if (!opened || !isCorrectOrderThreadUrl(page.url())) {
+      log("第一次開信未穩，reload 搜尋結果再試…");
+      await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
+      await sleep(800);
+      await dismissGmailOverlays(page);
+      opened = await openSelectedOrFirstGmailResult(page, keyword);
     }
+    if (!opened && !isCorrectOrderThreadUrl(page.url())) {
+      throw new Error(`搜尋結果入面打唔開訂單「${keyword}」郵件（仍喺 ${page.url()}）`);
+    }
+  }
+
+  // 確認已離開列表（hash 有 thread id）或正文已開
+  const confirmDeadline = Date.now() + 12_000;
+  while (Date.now() < confirmDeadline) {
+    await throwIfStopped();
+    if (isCorrectOrderThreadUrl(page.url())) break;
+    if (await isGmailMessageOpen(page)) break;
+    await sleep(300);
+  }
+  if (!isCorrectOrderThreadUrl(page.url()) && !(await isGmailMessageOpen(page))) {
+    throw new Error(`搜尋後仍未打開郵件詳情：${page.url()}`);
   }
 
   await writeStatus({
@@ -2239,123 +2259,166 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
 }
 
 /**
- * 點開 Gmail 搜尋結果：優先已選中（selected／highlight）嗰封，否則第一封。
- * 單擊可能淨係 highlight → 再用 Enter／o／dblclick 入詳情。
+ * 點開 Gmail 搜尋結果：優先已選中／含訂單編號嗰封，否則第一封。
+ * 單擊可能淨係 highlight → Enter／o／dblclick；最後用 thread id 直接改 hash。
  */
 async function openSelectedOrFirstGmailResult(page: Page, orderNumber: string): Promise<boolean> {
-  // 1) DOM：搵 selected／第一個 row，撳主旨（避開 checkbox）
-  const clickInfo = await page
-    .evaluate((order) => {
-      const rows = Array.from(
-        document.querySelectorAll(
-          "tr.zA, div[role='main'] div[role='row'], table.F tbody tr[jscontroller]"
-        )
-      ) as HTMLElement[];
-      if (!rows.length) return { ok: false, why: "no-rows" };
+  const keyword = String(orderNumber || "").trim();
+  const enc = encodeURIComponent(keyword);
 
-      const isSelected = (el: HTMLElement) => {
-        const aria = (el.getAttribute("aria-selected") || "").toLowerCase();
-        if (aria === "true") return true;
-        // Gmail：btb / x7 = keyboard／selected；zE = unread 唔等於 selected
-        return (
-          el.classList.contains("btb") ||
-          el.classList.contains("x7") ||
-          el.classList.contains("J-N-K")
-        );
-      };
-      const textOf = (el: HTMLElement) => (el.innerText || "").replace(/\s+/g, " ").trim();
-      const hasOrder = (el: HTMLElement) => {
-        const t = textOf(el);
-        const n = String(order || "");
-        return n && (t.includes(n) || t.replace(/[\s-]/g, "").includes(n.replace(/[\s-]/g, "")));
-      };
+  const urlIsOpenThread = () => {
+    const hash = page.url().split("#")[1] || "";
+    const parts = hash.split("/").filter(Boolean);
+    return parts[0] === "search" && parts.length >= 3 && (parts[1] === enc || decodeURIComponent(parts[1] || "").includes(keyword));
+  };
 
-      let target =
-        rows.find(isSelected) ||
-        rows.find(hasOrder) ||
-        rows[0]!;
+  // 從列抽出 thread id（Gmail 常見 data-legacy-thread-id / data-thread-id）
+  const extractThreadIdFromRows = async (): Promise<string> => {
+    return page
+      .evaluate((order) => {
+        const rows = Array.from(
+          document.querySelectorAll(
+            "tr.zA, div[role='main'] div[role='row'], table.F tbody tr"
+          )
+        ) as HTMLElement[];
+        if (!rows.length) return "";
 
-      // 避開 checkbox：撳主旨／snippet
-      const subject =
-        (target.querySelector("span.bog, .y6 span, td.a4W, span[data-thread-id], div.y6") as HTMLElement | null) ||
-        (target.querySelector("td.xY, span.bqe, span.y2") as HTMLElement | null) ||
-        target;
-
-      subject.scrollIntoView({ block: "center", inline: "nearest" });
-      const fire = (el: HTMLElement) => {
-        for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
-          el.dispatchEvent(
-            new MouseEvent(type, { bubbles: true, cancelable: true, view: window, buttons: 1 })
+        const textOf = (el: HTMLElement) => (el.innerText || "").replace(/\s+/g, " ").trim();
+        const hasOrder = (el: HTMLElement) => {
+          const t = textOf(el);
+          const n = String(order || "");
+          return n && (t.includes(n) || t.replace(/[\s-]/g, "").includes(n.replace(/[\s-]/g, "")));
+        };
+        const isSelected = (el: HTMLElement) => {
+          const aria = (el.getAttribute("aria-selected") || "").toLowerCase();
+          return (
+            aria === "true" ||
+            el.classList.contains("btb") ||
+            el.classList.contains("x7")
           );
-        }
-        el.click();
-      };
-      fire(subject);
-      // 再對整列補一次（有時要）
-      if (subject !== target) fire(target);
-      return {
-        ok: true,
-        why: isSelected(target) ? "selected" : hasOrder(target) ? "order-match" : "first",
-        preview: textOf(target).slice(0, 100),
-      };
-    }, orderNumber)
-    .catch(() => ({ ok: false, why: "eval-fail", preview: "" }));
+        };
+        const tidOf = (el: HTMLElement) =>
+          el.getAttribute("data-legacy-thread-id") ||
+          el.getAttribute("data-thread-id") ||
+          el.querySelector("[data-legacy-thread-id], [data-thread-id], [data-legacy-last-message-id]")?.getAttribute("data-legacy-thread-id") ||
+          el.querySelector("[data-thread-id]")?.getAttribute("data-thread-id") ||
+          "";
 
-  if (clickInfo.ok) {
-    log(`已撳郵件列（${clickInfo.why}）：${(clickInfo as { preview?: string }).preview || ""}`);
-  } else {
-    log(`DOM 撳列失敗（${(clickInfo as { why?: string }).why}），改用鍵盤…`);
+        const target =
+          rows.find((r) => isSelected(r) && hasOrder(r)) ||
+          rows.find(hasOrder) ||
+          rows.find(isSelected) ||
+          rows[0]!;
+        return tidOf(target) || "";
+      }, keyword)
+      .catch(() => "");
+  };
+
+  const gotoThreadById = async (tid: string): Promise<boolean> => {
+    if (!tid) return false;
+    const hash = `#search/${enc}/${tid}`;
+    log(`直接打開搜尋 thread：${hash}`);
+    await page
+      .evaluate((h) => {
+        location.hash = h;
+      }, hash)
+      .catch(() => {});
+    await sleep(700);
+    if (urlIsOpenThread()) return true;
+    await page
+      .goto(`https://mail.google.com/mail/u/0/${hash}`, {
+        waitUntil: "domcontentloaded",
+        timeout: 45_000,
+      })
+      .catch(() => {});
+    await sleep(600);
+    return urlIsOpenThread() || (await isGmailMessageOpen(page));
+  };
+
+  // 0) 已開正確 thread
+  if (urlIsOpenThread() && (await isGmailMessageOpen(page))) {
+    log("郵件詳情已打開");
+    return true;
   }
 
-  await sleep(400);
+  // 1) Playwright 撳第一／含訂單編號列（比 synthetic event 穩）
+  await dismissGmailOverlays(page);
+  const rowCandidates = [
+    page.locator("tr.zA").filter({ hasText: new RegExp(keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i") }).first(),
+    page.locator("tr.zA[aria-selected='true']").first(),
+    page.locator("tr.zA").first(),
+    page.locator("div[role='main'] div[role='row']").first(),
+  ];
+  for (const row of rowCandidates) {
+    if ((await row.count().catch(() => 0)) === 0) continue;
+    if (!(await row.isVisible().catch(() => false))) continue;
+    const subject = row.locator("span.bog, .y6 span, td.a4W, span.bqe").first();
+    const clickTarget = (await subject.count().catch(() => 0)) > 0 ? subject : row;
+    await clickTarget.scrollIntoViewIfNeeded().catch(() => {});
+    await clickTarget.click({ timeout: 3000, force: true }).catch(() => {});
+    await sleep(400);
+    if (urlIsOpenThread() || (await isGmailThreadDetailOpen(page, keyword))) {
+      log("Playwright 已撳開搜尋結果");
+      return true;
+    }
+    // dblclick
+    await clickTarget.dblclick({ timeout: 2500, force: true }).catch(() => {});
+    await sleep(500);
+    if (urlIsOpenThread() || (await isGmailThreadDetailOpen(page, keyword))) {
+      log("Playwright dblclick 已開郵件");
+      return true;
+    }
+    break;
+  }
 
-  // 2) 已 selected 但未開詳情：Enter / o 係 Gmail 開信快捷鍵
-  for (let attempt = 0; attempt < 8; attempt++) {
+  // 2) DOM fire + 鍵盤 Enter / o
+  await page
+    .evaluate((order) => {
+      const rows = Array.from(document.querySelectorAll("tr.zA")) as HTMLElement[];
+      if (!rows.length) return;
+      const textOf = (el: HTMLElement) => (el.innerText || "").replace(/\s+/g, " ");
+      const target =
+        rows.find((r) => textOf(r).includes(String(order || ""))) || rows[0]!;
+      const sub =
+        (target.querySelector("span.bog, .y6 span, td.a4W") as HTMLElement | null) || target;
+      sub.scrollIntoView({ block: "center" });
+      sub.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, view: window }));
+      sub.click();
+    }, keyword)
+    .catch(() => {});
+
+  for (let attempt = 0; attempt < 6; attempt++) {
     await throwIfStopped();
     await dismissGmailOverlays(page);
-
-    if (await isGmailThreadDetailOpen(page, orderNumber)) {
+    if (urlIsOpenThread() || (await isGmailThreadDetailOpen(page, keyword))) {
       log("郵件詳情已打開");
       return true;
     }
-
-    // 再確保有 selected：ArrowDown 有時會選第一封
-    if (attempt === 0) {
-      await page.keyboard.press("ArrowDown").catch(() => {});
-      await sleep(150);
-    }
-    if (attempt === 1) {
-      await page.keyboard.press("ArrowUp").catch(() => {});
-      await sleep(150);
-    }
-
+    if (attempt === 0) await page.keyboard.press("ArrowDown").catch(() => {});
+    if (attempt === 1) await page.keyboard.press("ArrowUp").catch(() => {});
     await page.keyboard.press("Enter").catch(() => {});
     await sleep(350);
-    if (await isGmailThreadDetailOpen(page, orderNumber)) return true;
-
+    if (urlIsOpenThread() || (await isGmailThreadDetailOpen(page, keyword))) return true;
     await page.keyboard.press("o").catch(() => {});
     await sleep(350);
-    if (await isGmailThreadDetailOpen(page, orderNumber)) return true;
-
-    // 再 DOM 撳一次 selected
-    if (attempt === 3 || attempt === 5) {
-      await page
-        .evaluate(() => {
-          const row =
-            (document.querySelector("tr.zA[aria-selected='true'], tr.zA.btb, tr.zA.x7") as HTMLElement | null) ||
-            (document.querySelector("tr.zA") as HTMLElement | null);
-          if (!row) return;
-          const sub = (row.querySelector("span.bog, .y6 span, td.a4W") as HTMLElement | null) || row;
-          sub.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, view: window }));
-          sub.click();
-        })
-        .catch(() => {});
-      await sleep(400);
-    }
+    if (urlIsOpenThread() || (await isGmailThreadDetailOpen(page, keyword))) return true;
   }
 
-  // 最後放寬：只要正文開咗就當成功（搜尋已係訂單編號）
-  return waitForGmailMessageOpen(page, { orderNumber, timeoutMs: 8_000, relaxOrderMatch: true });
+  // 3) 用 thread id 直接改 hash（最穩）
+  const tid = await extractThreadIdFromRows();
+  if (tid && (await gotoThreadById(tid))) {
+    log(`已用 thread id 打開：${tid}`);
+    await waitForGmailMessageOpen(page, { orderNumber: keyword, timeoutMs: 10_000, relaxOrderMatch: true });
+    return urlIsOpenThread() || (await isGmailMessageOpen(page));
+  }
+
+  // 4) 放寬等正文
+  const ok = await waitForGmailMessageOpen(page, {
+    orderNumber: keyword,
+    timeoutMs: 10_000,
+    relaxOrderMatch: true,
+  });
+  return ok || urlIsOpenThread();
 }
 
 async function isGmailThreadDetailOpen(page: Page, orderNumber?: string): Promise<boolean> {
