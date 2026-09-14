@@ -1560,58 +1560,68 @@ async function dismissGmailOverlays(page: Page): Promise<void> {
   }
 }
 
-/** 確保已喺 Gmail 收件箱 UI（登入後有時停喺 /mail/u/0/ 中轉頁） */
+/**
+ * 登入後只做極短就緒檢查——唔死等 #inbox 列表／搜尋欄。
+ * 下一步會直接 #search/訂單，唔使等收件箱 UI 齊。
+ */
 async function ensureGmailInbox(page: Page): Promise<void> {
   const target = "https://mail.google.com/mail/u/0/#inbox";
   const url0 = page.url();
-  // 即使已係 mail.google.com，都強制入 #inbox（避免停喺 /mail/u/0/）
-  if (!/#inbox\b/i.test(url0) || !isGmailInboxUrl(url0)) {
-    log("導向 Gmail 收件箱 #inbox…");
-    await page.goto(target, { waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
+
+  if (!isGmailInboxUrl(url0)) {
+    log("導向 Gmail…");
+    await page
+      .goto(target, { waitUntil: "domcontentloaded", timeout: 45_000 })
+      .catch(() => {});
+  } else if (!/#(?:inbox|search|all|sent|starred|label)\b/i.test(url0)) {
+    // /mail/u/0/ 中轉頁 → 輕推 #inbox（唔長等）
+    await page
+      .evaluate(() => {
+        location.hash = "#inbox";
+      })
+      .catch(() => {});
+    await sleep(300);
   }
+
   await dismissGmailOverlays(page);
 
-  for (let i = 0; i < 20; i++) {
+  // 最多 ~2.5 秒：見到 main／搜尋欄即走；否則都繼續（畀 search 步驟接手）
+  const deadline = Date.now() + 2_500;
+  while (Date.now() < deadline) {
     await throwIfStopped();
-    await syncWindowFlags().catch(() => {});
-    const url = page.url();
-    if (/accounts\.google\.com/i.test(url)) {
+    if (/accounts\.google\.com/i.test(page.url())) {
       await page
         .getByRole("button", { name: /^(Next|下一步|繼續|Continue|我了解)$/i })
         .first()
-        .click({ timeout: 1500 })
+        .click({ timeout: 800 })
         .catch(() => {});
-      await page.goto(target, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+      await page.goto(target, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
     }
-    await dismissGmailOverlays(page);
-
-    const search = page
+    const ready = await page
       .locator(
-        'input[aria-label*="Search" i], input[aria-label*="搜尋" i], input[name="q"], form[role="search"] input, input[placeholder*="Search mail" i]'
+        [
+          'input[aria-label*="Search" i]',
+          'input[aria-label*="搜尋" i]',
+          'input[name="q"]',
+          'form[role="search"] input',
+          'div[role="main"]',
+          "div.AO",
+          "table.F",
+        ].join(", ")
       )
-      .first();
-    if ((await search.count().catch(() => 0)) > 0 && (await search.isVisible().catch(() => false))) {
-      log(`已入 Gmail 收件箱：${page.url()}`);
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (ready || /mail\.google\.com\/mail\/.*#/i.test(page.url())) {
+      log(`已入 Gmail：${page.url()}`);
       await writeStatus({ phase: "gmail_ready", message: "Gmail 已開啟", url: page.url() });
-      await sleep(600);
       return;
     }
-    const inboxUi = page.locator('div[role="main"], div.AO, table.F, div.Cp').first();
-    if ((await inboxUi.count().catch(() => 0)) > 0) {
-      // 有主體但未有搜尋欄：再 refresh 一次 hash
-      if (!/#inbox\b/i.test(page.url())) {
-        await page.goto(target, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
-      } else {
-        log(`已入 Gmail UI：${page.url()}`);
-        await sleep(800);
-        return;
-      }
-    }
-    await sleep(700);
+    await sleep(200);
   }
-  await page.goto(target, { waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
-  await sleep(1500);
-  log(`Gmail 現況：${page.url()}`);
+
+  log(`Gmail 就緒（唔再等 inbox UI）：${page.url()}`);
+  await writeStatus({ phase: "gmail_ready", message: "Gmail 已開啟", url: page.url() });
 }
 
 /** 真正要額外驗證嘅 challenge（唔包括密碼頁 challenge/pwd、captcha 字元頁） */
@@ -2218,10 +2228,18 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
   // 喺 #inbox/… 或非本單 search：強制去 search（唔好停喺 inbox 亂開嘅信）
   if (!/#search\//i.test(page.url()) || !urlHasKeyword(page.url())) {
     log(`離開 ${page.url()} → 搜尋 ${keyword}`);
-    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
+    // 優先改 hash（快過整頁 goto）
+    await page
+      .evaluate((q) => {
+        location.hash = `#search/${encodeURIComponent(q)}`;
+      }, keyword)
+      .catch(() => {});
+    await sleep(400);
+    if (!/#search\//i.test(page.url()) || !urlHasKeyword(page.url())) {
+      await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
+    }
   }
   await dismissGmailOverlays(page);
-  await sleep(500);
 
   if (!/#search\//i.test(page.url()) || !urlHasKeyword(page.url())) {
     await page
@@ -2229,12 +2247,10 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
         location.hash = `#search/${encodeURIComponent(q)}`;
       }, keyword)
       .catch(() => {});
-    await sleep(600);
+    await sleep(400);
   }
-  // 仍唔係 search：再 goto 一次
   if (!/#search\//i.test(page.url()) || !urlHasKeyword(page.url())) {
-    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {});
-    await sleep(500);
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
   }
 
   log(`搜尋結果頁：${page.url()}`);
@@ -2298,12 +2314,18 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
     return true;
   };
 
-  // 等列表／訂單字出現
+  // 等列表／訂單字出現（短等；唔喺 #inbox／search 空轉）
   const listStarted = Date.now();
-  const listDeadline = listStarted + 45_000;
+  const listDeadline = listStarted + 18_000;
   let probe = await probeList();
   let triedSearchBox = false;
   let triedReload = false;
+  // 一到 search URL 即刻試搜尋欄（唔等 10 秒）
+  if (!probe.ok) {
+    await tryTypeSearch();
+    triedSearchBox = true;
+    probe = await probeList();
+  }
   while (Date.now() < listDeadline && !probe.ok) {
     await throwIfStopped();
     await syncWindowFlags().catch(() => {});
@@ -2317,18 +2339,19 @@ async function gmailSearchAndOpenOrderEmail(page: Page, orderNumber: string): Pr
       .catch(() => false);
     if (empty) throw new Error(`Gmail 搜尋訂單「${keyword}」冇結果`);
     const elapsed = Date.now() - listStarted;
-    if (!triedSearchBox && elapsed > 10_000) {
+    if (!triedSearchBox && elapsed > 2_000) {
       triedSearchBox = true;
       log("搜尋列表未就緒 — 改用搜尋欄再查…");
       await tryTypeSearch();
     }
-    if (!triedReload && elapsed > 20_000) {
+    if (!triedReload && elapsed > 6_000) {
       triedReload = true;
       log("reload 搜尋頁再等列表…");
-      await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
-      await sleep(800);
+      await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
+      await sleep(500);
+      await tryTypeSearch();
     }
-    await sleep(500);
+    await sleep(300);
   }
   if (!probe.ok) {
     await tryTypeSearch();
