@@ -1607,6 +1607,7 @@ async function snapshot() {
       stuck: Boolean(runtimeStatus?.stuck),
       stuckSince: runtimeStatus?.stuckSince ?? null,
       error: runtimeStatus?.error ?? null,
+      shop404Timing: runtimeStatus?.shop404Timing ?? null,
       runtimeStatus,
       card: {
         productType:

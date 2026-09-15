@@ -553,7 +553,7 @@
           </div>
           <p class="hint" id="monitorHint" style="margin-top:10px">
             <b>Start monitor</b>：Telegram 即時監察 iPhone 庫存／可買數量（撳一次變 Stop monitor）。
-            <b>Start monitor+buying</b>：預熱停喺 Fulfillment-init。有貨且同色同容量 → 等 1 秒 → refresh Fulfillment-init → 完整加購；冇新通知就返 Fulfillment-init 待命。
+            <b>Start monitor+buying</b>：預熱停喺 Fulfillment-init。有貨且同色同容量 → 等 1 秒 → refresh Fulfillment-init → 完整加購；冇新通知就返 Fulfillment-init 待命。「繼續前往取貨詳情」loading 停咗仍未去下一頁會即刻 refresh 重試；撞到 /shop/404 會記時差（runtime/shop-404-timing.jsonl）。
           </p>
           <div class="meta" id="monitorMeta" style="margin-top:8px">
             <span>Monitor: <b id="monitorState">off</b></span>
@@ -832,6 +832,8 @@
       if (/polling_continue|adding_cart/i.test(p)) return "adding cart";
       if (/cart_added/i.test(p)) return "cart added";
       if (/cart_ready/i.test(p)) return "cart ready";
+      if (/shop_404|recover_404/i.test(p)) return "shop/404";
+      if (/fulfillment_continue_refresh/i.test(p)) return "fulfillment refresh";
       if (/checkout|guest_or_signin/i.test(p)) return "checkout";
       if (/contact_filled/i.test(p)) return "contact filled";
       if (/waiting_for_stock_at_stores/i.test(p)) return "waiting for stock @ stores";
@@ -1052,6 +1054,10 @@
           b.runtimeStatus?.message ||
           b.error ||
           "";
+        const t404 = b.shop404Timing || b.runtimeStatus?.shop404Timing || null;
+        const t404Show = t404
+          ? `404 after ${t404.durationMs ?? "?"}ms (${t404.durationSec ?? "?"}s) from ${t404.fromUrl || "?"}`
+          : "";
         const lastNameShow = c.lastName || "—";
         const firstNameShow = c.firstName || "—";
         const orderNoShow = c.orderNumber || "—";
@@ -1091,6 +1097,7 @@
             <span><b>ETA</b>${esc(etaShow)}</span>
             ${c.proxy ? `<span class="wide"><b>Proxy</b>${esc(c.proxy)}</span>` : ""}
             ${msgShow ? `<span class="wide"><b>Status</b>${esc(msgShow)}</span>` : ""}
+            ${t404Show ? `<span class="wide"><b>404 timing</b>${esc(t404Show)}</span>` : ""}
             ${urlShow && urlShow !== "—" ? `<span class="wide"><b>URL</b>${esc(urlShow)}</span>` : ""}
           </div>
           ${

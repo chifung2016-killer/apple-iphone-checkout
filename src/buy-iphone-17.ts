@@ -994,12 +994,15 @@ async function humanClick(
 async function settleAfterNavigation(page: Page): Promise<void> {
   await withReleaseCheck(page.waitForLoadState("domcontentloaded").catch(() => {}));
   await withReleaseCheck(page.waitForLoadState("networkidle").catch(() => {}));
-  if (isShop404Url(page.url())) {
+  const url = page.url();
+  if (isShop404Url(url)) {
     await recoverFromShop404IfNeeded(page).catch((err) => {
       console.warn(
         `  404 復原失敗：${err instanceof Error ? err.message : String(err)}`
       );
     });
+  } else {
+    markCheckoutNav(url, "settleAfterNavigation");
   }
   await sleepCheckingRelease(CONFIG.clickDelayMs);
 }
@@ -2343,6 +2346,82 @@ function isShop404Url(url: string): boolean {
   return /\/shop\/404\b/i.test(url);
 }
 
+/** 上一頁時間戳：用嚟量 /shop/404 由邊頁跳過嚟、隔咗幾耐 */
+type CheckoutNavMark = {
+  url: string;
+  atMs: number;
+  atIso: string;
+  label?: string;
+};
+
+let lastNon404NavMark: CheckoutNavMark | null = null;
+
+function markCheckoutNav(url: string, label?: string): void {
+  const u = String(url || "").trim();
+  if (!u || isShop404Url(u)) return;
+  lastNon404NavMark = {
+    url: u,
+    atMs: Date.now(),
+    atIso: new Date().toISOString(),
+    label: label || undefined,
+  };
+}
+
+/**
+ * 進入 /shop/404 時記錄：上一頁 URL／時間 → 404 時間同間隔（status + jsonl）。
+ * 方便之後對照邊一步最易 404。
+ */
+async function recordShop404Timing(
+  page: Page,
+  context: string
+): Promise<{
+  context: string;
+  fromUrl: string | null;
+  fromAt: string | null;
+  fromLabel: string | null;
+  toUrl: string;
+  toAt: string;
+  durationMs: number | null;
+  durationSec: number | null;
+} | null> {
+  const toUrl = page.url();
+  if (!isShop404Url(toUrl)) return null;
+  const now = Date.now();
+  const from = lastNon404NavMark;
+  const durationMs = from ? Math.max(0, now - from.atMs) : null;
+  const timing = {
+    context,
+    fromUrl: from?.url || null,
+    fromAt: from?.atIso || null,
+    fromLabel: from?.label || null,
+    toUrl,
+    toAt: new Date(now).toISOString(),
+    durationMs,
+    durationSec:
+      durationMs == null ? null : Math.round(durationMs / 100) / 10,
+  };
+  const durLabel =
+    timing.durationMs == null ? "unknown" : `${timing.durationMs}ms (${timing.durationSec}s)`;
+  console.warn(
+    `  /shop/404 timing [${context}]: ${durLabel}｜from ${timing.fromUrl || "?"} → ${toUrl}`
+  );
+  await writeStatus({
+    phase: "shop_404",
+    url: toUrl,
+    shop404Timing: timing,
+    message: `shop/404 after ${durLabel} from ${timing.fromUrl || "?"}`,
+  }).catch(() => {});
+  await ensureRuntimeDir();
+  await fs
+    .appendFile(
+      path.join(RUNTIME_DIR, "shop-404-timing.jsonl"),
+      `${JSON.stringify({ sessionId: SESSION_ID, windowIndex: WINDOW_INDEX, ...timing })}\n`,
+      "utf8"
+    )
+    .catch(() => {});
+  return timing;
+}
+
 async function clickShoppingBagNavButton(page: Page): Promise<boolean> {
   const candidates = [
     page.locator("#globalnav-menubutton-link-bag"),
@@ -2442,13 +2521,23 @@ async function recoverFromShop404IfNeeded(
   }
   recovering404Pages.add(page);
   try {
+  const timing = await recordShop404Timing(page, tag || "recoverFromShop404").catch(
+    () => null
+  );
+  const dur =
+    timing?.durationMs == null
+      ? ""
+      : `（距上一頁 ${timing.durationMs}ms／${timing.durationSec}s｜${timing.fromUrl || "?"}）`;
   console.log(
-    `${prefix}偵測到 /shop/404 → 撳購物袋掣 →「查看購物袋」，再繼續流程`
+    `${prefix}偵測到 /shop/404${dur} → 撳購物袋掣 →「查看購物袋」，再繼續流程`
   );
   await writeStatus({
     phase: "recover_404_to_bag",
     url: page.url(),
-    message: "shop/404 → shopping bag → 查看購物袋",
+    shop404Timing: timing || undefined,
+    message: timing
+      ? `shop/404 after ${timing.durationMs}ms from ${timing.fromUrl || "?"} → bag`
+      : "shop/404 → shopping bag → 查看購物袋",
   }).catch(() => {});
 
   const bagNavClicked = await clickShoppingBagNavButton(page);
@@ -4851,6 +4940,34 @@ async function scrollPageToBottom(page: Page): Promise<void> {
   await page.waitForTimeout(400);
 }
 
+async function softRefreshFulfillmentNow(page: Page): Promise<void> {
+  console.log("  即刻 refresh Fulfillment-init（唔等 1 分鐘）…");
+  markCheckoutNav(page.url(), "pre-soft-refresh-fulfillment");
+  // refresh 後門市要重揀，清已試門市以免立刻冇掣可撳
+  usedPickupStoreKeys.clear();
+  const current = page.url();
+  if (/\/shop\/checkout/i.test(current) && /_s=Fulfillment/i.test(current)) {
+    const target = /_s=Fulfillment-init/i.test(current)
+      ? current
+      : current.replace(/([?&]_s=)[^&]*/i, "$1Fulfillment-init");
+    if (target === current) {
+      await withReleaseCheck(
+        page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {})
+      );
+    } else {
+      await withReleaseCheck(
+        page.goto(target, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(async () => {
+          await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+        })
+      );
+    }
+  } else {
+    await gotoFulfillmentInit(page);
+    return;
+  }
+  await settleAfterNavigation(page);
+}
+
 async function clickContinueToPickupDetails(page: Page): Promise<boolean> {
   // 已入 PickupContact 就即刻停，唔好再撳「繼續前往取貨詳情」
   if (isPickupContactPage(page.url())) {
@@ -4858,14 +4975,14 @@ async function clickContinueToPickupDetails(page: Page): Promise<boolean> {
     return true;
   }
 
-  // 所有取貨模式：同 pickup credit card訪客模式 — 門市撳完已捲底一次，呢度唔再重複捲，只撳「繼續」
-  const pickupStoreRules = usesPickupGuestStoreContinueRules();
-  if (pickupStoreRules) {
-    console.log("  取貨模式（同 pickup credit card訪客）：唔再捲頁，直接撳「繼續前往取貨詳情」…");
-  } else {
-    console.log("  捲去頁底，10 秒內每秒撳一次「繼續前往取貨詳情」…");
-  }
-  await sleepCheckingRelease(800);
+  const stayOnFulfillment = (url: string) =>
+    /_s=Fulfillment/i.test(url) &&
+    !isShop404Url(url) &&
+    !isPickupContactPage(url);
+
+  console.log(
+    "  「繼續前往取貨詳情」：撳掣 → 等 loading 停 → 若仍喺 Fulfillment-init 就 refresh 重試，直到下一頁…"
+  );
 
   const locators = [
     page.getByRole("button", { name: /繼續前往取貨詳情/ }),
@@ -4874,33 +4991,39 @@ async function clickContinueToPickupDetails(page: Page): Promise<boolean> {
     page.locator('button:has-text("繼續前往取貨詳情"), a:has-text("繼續前往取貨詳情")'),
   ];
 
-  const beforeUrl = page.url();
-  const deadline = Date.now() + (pickupStoreRules ? 8_000 : 10_000);
-  let attempt = 0;
-  let scrolledOnce = false;
+  const overallDeadline = Date.now() + 180_000;
+  let round = 0;
 
-  while (Date.now() < deadline) {
+  while (Date.now() < overallDeadline) {
     await throwIfReleased();
 
-    // URL 一變做 PickupContact 就停
     if (isPickupContactPage(page.url())) {
       console.log("  已進入 PickupContact，停止撳「繼續前往取貨詳情」");
       return true;
     }
+    if (isShop404Url(page.url())) {
+      await recoverFromShop404IfNeeded(page, "[continue-pickup]");
+      return false;
+    }
+    if (!stayOnFulfillment(page.url()) && round > 0) {
+      console.log(`  已離開 Fulfillment → ${page.url()}`);
+      return true;
+    }
 
-    attempt += 1;
+    round += 1;
+    markCheckoutNav(page.url(), "fulfillment-before-continue");
 
-    if (pickupStoreRules) {
-      // 取貨：唔喺呢度捲頁（門市撳完已捲一次）
+    if (usesPickupGuestStoreContinueRules()) {
+      // 取貨：唔喺呢度捲頁（門市撳完已捲一次）；refresh 後可能要再捲
+      if (round > 1) await scrollPageToBottom(page);
     } else {
       await scrollPageToBottom(page);
-      scrolledOnce = true;
     }
 
     let target: Locator | null = null;
     for (const loc of locators) {
       const el = loc.first();
-      if (await visible(el, 600)) {
+      if (await visible(el, 800)) {
         target = el;
         break;
       }
@@ -4911,66 +5034,81 @@ async function clickContinueToPickupDetails(page: Page): Promise<boolean> {
     }
 
     if (!target) {
-      console.warn(`  「繼續前往取貨詳情」第 ${attempt} 次：揾唔到掣`);
-    } else {
-      await target.scrollIntoViewIfNeeded().catch(() => {});
-      await humanClick(target, { force: true }).catch(async () => {
-        await target!.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
-      });
-      console.log(
-        pickupStoreRules
-          ? `  已撳「繼續前往取貨詳情」（第 ${attempt} 次，無重複捲頁）`
-          : `  已嘗試撳「繼續前往取貨詳情」（第 ${attempt} 次，每秒一次）`
-      );
-
-      await withReleaseCheck(
-        page
-          .waitForURL(
-            (url) =>
-              isPickupContactPage(url.toString()) ||
-              url.toString() !== beforeUrl ||
-              !/_s=Fulfillment/i.test(url.toString()),
-            { timeout: pickupStoreRules ? 2500 : 800 }
-          )
-          .catch(() => {})
-      );
-
-      if (isPickupContactPage(page.url())) {
-        console.log("  已離開 Fulfillment → PickupContact，停止繼續撳。");
-        return true;
+      console.warn(`  「繼續前往取貨詳情」第 ${round} 輪：揾唔到掣 → refresh 重試`);
+      await softRefreshFulfillmentNow(page);
+      if (isShop404Url(page.url())) {
+        await recoverFromShop404IfNeeded(page, "[continue-pickup-no-btn]");
+        return false;
       }
-
-      if (!/_s=Fulfillment/i.test(page.url()) && page.url() !== beforeUrl) {
-        console.log("  已離開 Fulfillment，進入下一步。");
-        return true;
+      // refresh 後要重新搜門市＋揀店先有掣
+      if (!(await fillPickupSearchAndWaitHeading(page))) {
+        await sleepCheckingRelease(800);
+        continue;
       }
-
-      // 取貨規則：撳到掣就當完成一次嘗試；成功離開先 return，否則短等再試撳（仍唔捲頁）
-      if (pickupStoreRules && attempt >= 3) {
-        break;
+      if (!(await clickAnyNearbyStore(page))) {
+        await sleepCheckingRelease(800);
+        continue;
       }
+      continue;
     }
 
-    // 每次 loop 結尾再檢查一次，避免 navigation 延遲仍繼續撳
+    await target.scrollIntoViewIfNeeded().catch(() => {});
+    await humanClick(target, { force: true }).catch(async () => {
+      await target!.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
+    });
+    console.log(`  已撳「繼續前往取貨詳情」（第 ${round} 輪）— 等 loading…`);
+
+    await waitForCheckoutLoadingSettled(page, {
+      timeoutMs: 25_000,
+      stayOn: stayOnFulfillment,
+    });
+
     if (isPickupContactPage(page.url())) {
-      console.log("  已進入 PickupContact，停止撳「繼續前往取貨詳情」");
+      console.log("  loading 完後已進入 PickupContact");
+      return true;
+    }
+    if (isShop404Url(page.url())) {
+      await recoverFromShop404IfNeeded(page, "[continue-pickup-after-loading]");
+      return false;
+    }
+    if (!stayOnFulfillment(page.url())) {
+      console.log(`  loading 完後已離開 Fulfillment → ${page.url()}`);
       return true;
     }
 
-    const remain = deadline - Date.now();
-    if (remain <= 0) break;
-    await sleepCheckingRelease(Math.min(1000, remain));
+    // loading 已停但仍喺 Fulfillment-init → refresh 再成個流程重試
+    console.log(
+      "  loading 已停但仍喺 Fulfillment-init → refresh 頁面，重複揀店＋繼續…"
+    );
+    await writeStatus({
+      phase: "fulfillment_continue_refresh",
+      url: page.url(),
+      message: `繼續前往取貨詳情 loading 停咗仍未去下一頁 → refresh（第 ${round} 輪）`,
+    }).catch(() => {});
+
+    await softRefreshFulfillmentNow(page);
+    if (isShop404Url(page.url())) {
+      await recoverFromShop404IfNeeded(page, "[continue-pickup-refresh]");
+      return false;
+    }
+    if (isPickupContactPage(page.url())) return true;
+
+    if (!(await fillPickupSearchAndWaitHeading(page))) {
+      await sleepCheckingRelease(800);
+      continue;
+    }
+    if (!(await clickAnyNearbyStore(page))) {
+      await sleepCheckingRelease(800);
+      continue;
+    }
   }
 
-  void scrolledOnce;
   if (isPickupContactPage(page.url())) {
     console.log("  已喺 PickupContact（超時後確認），當成功。");
     return true;
   }
   console.warn(
-    pickupStoreRules
-      ? "  「繼續前往取貨詳情」失敗（只捲過一次頁底）。"
-      : "  「繼續前往取貨詳情」10 秒重試仍失敗（之後會等 1 分鐘先 refresh）。"
+    "  「繼續前往取貨詳情」多次 refresh 仍未去下一頁（之後外層會再試）。"
   );
   return false;
 }
@@ -5108,6 +5246,7 @@ async function gotoFulfillmentInit(page: Page): Promise<void> {
     target = `${host}/hk-zh/shop/checkout?_s=Fulfillment-init`;
   }
   console.log(`  前往 Fulfillment-init：${target}`);
+  markCheckoutNav(target || current, "gotoFulfillmentInit");
   if (target === current || /_s=Fulfillment-init/i.test(current)) {
     await withReleaseCheck(
       page.reload({ waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {})
@@ -7642,9 +7781,16 @@ async function isCheckoutLoadingVisible(page: Page): Promise<boolean> {
         if (visible(el)) return true;
       }
       const btns = document.querySelectorAll(
-        '[data-autom="continueButton"], #rs-checkout-continue-button-bottom, #rs-checkout-continue-button-top, .rs-checkout-continuebutton button'
+        'button, a, [data-autom="continueButton"], #rs-checkout-continue-button-bottom, #rs-checkout-continue-button-top, .rs-checkout-continuebutton button'
       );
       for (const btn of btns) {
+        const text = (btn.textContent || "").replace(/\s+/g, "");
+        const isContinue =
+          /繼續前往取貨詳情|取貨詳情|檢查你的訂單|檢查您的訂單/i.test(text) ||
+          btn.matches(
+            '[data-autom="continueButton"], #rs-checkout-continue-button-bottom, #rs-checkout-continue-button-top, .rs-checkout-continuebutton button, .rs-checkout-continuebutton a'
+          );
+        if (!isContinue) continue;
         if (
           btn.getAttribute("aria-busy") === "true" ||
           /\b(loading|busy|pending)\b/i.test(String((btn as HTMLElement).className || ""))
@@ -7663,17 +7809,20 @@ async function isCheckoutLoadingVisible(page: Page): Promise<boolean> {
 /** 撳完 CTA 後：等 loading 出現（可選）再等消失 */
 async function waitForCheckoutLoadingSettled(
   page: Page,
-  opts?: { timeoutMs?: number }
+  opts?: { timeoutMs?: number; stayOn?: (url: string) => boolean }
 ): Promise<void> {
   const timeoutMs = opts?.timeoutMs ?? 20_000;
   const deadline = Date.now() + timeoutMs;
+  const stayOn =
+    opts?.stayOn ??
+    ((url: string) => isBillingPage(url) && !isReviewPage(url));
 
   // 畀少少時間等 loading 出現
   const appearUntil = Date.now() + 1_200;
   let saw = false;
   while (Date.now() < appearUntil) {
     await throwIfReleased();
-    if (isReviewPage(page.url()) || !isBillingPage(page.url())) return;
+    if (!stayOn(page.url())) return;
     if (await isCheckoutLoadingVisible(page)) {
       saw = true;
       break;
@@ -7684,7 +7833,7 @@ async function waitForCheckoutLoadingSettled(
 
   while (Date.now() < deadline) {
     await throwIfReleased();
-    if (isReviewPage(page.url()) || !isBillingPage(page.url())) return;
+    if (!stayOn(page.url())) return;
     if (!(await isCheckoutLoadingVisible(page))) {
       await sleepCheckingRelease(280);
       if (!(await isCheckoutLoadingVisible(page))) {
