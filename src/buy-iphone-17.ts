@@ -4830,7 +4830,10 @@ async function clickIfEnabled(
   return false;
 }
 
-async function findPickupSearchInput(page: Page): Promise<Locator | null> {
+async function findPickupSearchInput(
+  page: Page,
+  maxMs = 10_000
+): Promise<Locator | null> {
   // 唔好用頂欄「搜尋 apple.com」（role=button / globalnav）
   const candidates: Locator[] = [
     page.locator(
@@ -4846,13 +4849,13 @@ async function findPickupSearchInput(page: Page): Promise<Locator | null> {
     ),
   ];
 
-  const deadline = Date.now() + 10000;
+  const deadline = Date.now() + Math.max(200, maxMs);
   while (Date.now() < deadline) {
     for (const group of candidates) {
       const count = await group.count();
       for (let i = 0; i < count; i++) {
         const el = group.nth(i);
-        if (!(await visible(el, 400))) continue;
+        if (!(await visible(el, 200))) continue;
 
         const ok = await el
           .evaluate((node) => {
@@ -4874,7 +4877,7 @@ async function findPickupSearchInput(page: Page): Promise<Locator | null> {
         if (ok) return el;
       }
     }
-    await page.waitForTimeout(400);
+    await page.waitForTimeout(200);
   }
   return null;
 }
@@ -5337,33 +5340,57 @@ async function scrollPageToBottom(page: Page): Promise<void> {
   await page.waitForTimeout(400);
 }
 
-async function softRefreshFulfillmentNow(page: Page): Promise<void> {
-  noteFulfillmentRefresh("soft");
-  console.log("  即刻 refresh Fulfillment-init（唔等 1 分鐘）…");
-  markCheckoutNav(page.url(), "pre-soft-refresh-fulfillment");
-  // refresh 後門市要重揀，清已試門市以免立刻冇掣可撳
-  usedPickupStoreKeys.clear();
+/** Hard reload Fulfillment-init（同一 URL 用 reload，否則 goto） */
+async function hardRefreshFulfillmentInit(
+  page: Page,
+  label = "hard-refresh-fulfillment"
+): Promise<void> {
   const current = page.url();
-  if (/\/shop\/checkout/i.test(current) && /_s=Fulfillment/i.test(current)) {
-    const target = /_s=Fulfillment-init/i.test(current)
-      ? current
-      : current.replace(/([?&]_s=)[^&]*/i, "$1Fulfillment-init");
-    if (target === current) {
-      await withReleaseCheck(
-        page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {})
-      );
-    } else {
-      await withReleaseCheck(
-        page.goto(target, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(async () => {
-          await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  const target = fulfillmentInitUrlFrom(current);
+  noteFulfillmentRefresh("soft");
+  markCheckoutNav(target, label);
+  usedPickupStoreKeys.clear();
+  console.log(`  ★ hard refresh Fulfillment-init：${target}`);
+  if (
+    /\/shop\/checkout/i.test(current) &&
+    /_s=Fulfillment-init/i.test(current) &&
+    target === current
+  ) {
+    await withReleaseCheck(
+      page.reload({ waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {})
+    );
+  } else if (/\/shop\/checkout/i.test(current) && /_s=Fulfillment/i.test(current)) {
+    await withReleaseCheck(
+      page
+        .goto(target, { waitUntil: "domcontentloaded", timeout: 45_000 })
+        .catch(async () => {
+          await page.reload({ waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
         })
-      );
-    }
+    );
   } else {
     await gotoFulfillmentInit(page);
     return;
   }
+  await settleDom(page, 250);
+}
+
+async function softRefreshFulfillmentNow(page: Page): Promise<void> {
+  console.log("  即刻 refresh Fulfillment-init（唔等 1 分鐘）…");
+  await hardRefreshFulfillmentInit(page, "pre-soft-refresh-fulfillment");
   await settleAfterNavigation(page);
+}
+
+/** 快速數而家可見門市掣（唔等） */
+async function countVisiblePickupStoreOptions(page: Page): Promise<number> {
+  let stores = await collectStoresUnderHeading(page, /選擇取貨零售店/);
+  if (stores.length < 6) {
+    const nearby = await collectStoresUnderHeading(page, /你附近的所有零售店/);
+    if (nearby.length >= stores.length) stores = nearby;
+  }
+  if (stores.length === 0) {
+    stores = await collectVisiblePickupStores(page);
+  }
+  return stores.length;
 }
 
 async function clickContinueToPickupDetails(page: Page): Promise<boolean> {
@@ -5857,12 +5884,24 @@ async function waitForFulfillmentInitDetailsReady(page: Page): Promise<boolean> 
   return false;
 }
 
-/** 輸入「中環」後，等到「選擇取貨零售店」下面出現 6 個選項，再雙重確認 */
+/** 輸入「中環」後，等到「選擇取貨零售店」下面出現 6 個選項；0 掣時每 5s hard refresh */
 async function waitForSixPickupStoreOptions(page: Page): Promise<Locator[]> {
   console.log("  等待「選擇取貨零售店：」下面出現 6 個門市掣…");
-  const deadline = Date.now() + 120_000;
+  const REFRESH_MS = 5_000;
+  const deadline = Date.now() + 600_000; // 最長 10 分鐘
+  let lastCycleAt = Date.now();
+
   while (Date.now() < deadline) {
     await throwIfReleased();
+
+    if (
+      isPickupContactPage(page.url()) ||
+      isBillingPage(page.url()) ||
+      isReviewPage(page.url())
+    ) {
+      return [];
+    }
+
     let stores = await collectStoresUnderHeading(page, /選擇取貨零售店/);
     if (stores.length < 6) {
       const nearby = await collectStoresUnderHeading(page, /你附近的所有零售店/);
@@ -5870,7 +5909,7 @@ async function waitForSixPickupStoreOptions(page: Page): Promise<Locator[]> {
     }
     if (stores.length >= 6) {
       console.log(`  已見 ${stores.length} 個門市選項，再確認一次…`);
-      await sleepCheckingRelease(1200);
+      await sleepCheckingRelease(800);
       let again = await collectStoresUnderHeading(page, /選擇取貨零售店/);
       if (again.length < 6) {
         const nearby = await collectStoresUnderHeading(page, /你附近的所有零售店/);
@@ -5885,6 +5924,41 @@ async function waitForSixPickupStoreOptions(page: Page): Promise<Locator[]> {
     } else {
       console.log(`  而家得 ${stores.length}/6 個門市掣，繼續等…`);
     }
+
+    // pickup 訪客：門市未齊 → 固定每 5s hard refresh 成頁再搜
+    if (isPickupCreditCardGuest() && stores.length < 6) {
+      const elapsed = Date.now() - lastCycleAt;
+      const waitMore = Math.max(0, REFRESH_MS - elapsed);
+      if (waitMore > 0) {
+        await sleepCheckingRelease(waitMore);
+      }
+      console.log(
+        `  門市未齊（${stores.length}/6）→ hard refresh Fulfillment-init（固定 ${REFRESH_MS / 1000}s）`
+      );
+      await writeStatus({
+        phase: "fulfillment_pickup_wait",
+        message: `Fulfillment-init：門市 ${stores.length}/6，每 ${REFRESH_MS / 1000}s refresh`,
+        url: page.url(),
+      }).catch(() => {});
+      await hardRefreshFulfillmentInit(page, "pickup-stores-5s-refresh");
+      lastCycleAt = Date.now();
+      if (await isFulfillment503(page)) {
+        console.warn("  refresh 後 503 — 下一輪再試");
+        continue;
+      }
+      await clickIfEnabled(
+        [
+          page.getByRole("radio", { name: /我會前來取貨/ }),
+          page.getByRole("button", { name: /我會前來取貨/ }),
+          page.getByLabel(/我會前來取貨/),
+          page.getByText("我會前來取貨", { exact: false }),
+        ],
+        1200
+      );
+      await fillPickupSearchAndWaitHeading(page, { fast: true }).catch(() => false);
+      continue;
+    }
+
     await sleepCheckingRelease(1000);
   }
   console.warn("  逾時仍未等到 6 個門市掣。");
@@ -5975,8 +6049,12 @@ async function clickAnyNearbyStore(page: Page): Promise<boolean> {
   return true;
 }
 
-async function fillPickupSearchAndWaitHeading(page: Page): Promise<boolean> {
-  const search = await findPickupSearchInput(page);
+async function fillPickupSearchAndWaitHeading(
+  page: Page,
+  opts?: { fast?: boolean }
+): Promise<boolean> {
+  const fast = Boolean(opts?.fast);
+  const search = await findPickupSearchInput(page, fast ? 1500 : 10_000);
   if (!search) {
     console.warn("  揾唔到取貨搜尋欄。");
     return false;
@@ -5992,7 +6070,7 @@ async function fillPickupSearchAndWaitHeading(page: Page): Promise<boolean> {
       page.getByRole("button", { name: /套用/ }),
       page.getByRole("button", { name: /^Apply$/i }),
     ],
-    4000
+    fast ? 1200 : 4000
   );
   if (!applied) {
     await search.press("Enter").catch(() => {});
@@ -6000,11 +6078,15 @@ async function fillPickupSearchAndWaitHeading(page: Page): Promise<boolean> {
     console.log("  已撳「套用」");
   }
 
-  console.log("  已輸入搜尋，等待門市列表載入（出現 6 個選項先繼續）…");
+  console.log(
+    fast
+      ? "  已輸入搜尋（快速），檢查門市列表…"
+      : "  已輸入搜尋，等待門市列表載入（出現 6 個選項先繼續）…"
+  );
   await page
     .getByText(/選擇取貨零售店|你附近的所有零售店/, { exact: false })
     .first()
-    .waitFor({ state: "visible", timeout: 30000 })
+    .waitFor({ state: "visible", timeout: fast ? 1500 : 30_000 })
     .catch(() => {});
   return true;
 }
@@ -6425,44 +6507,16 @@ async function canContinuePickupScriptsAfterPickupClick(page: Page): Promise<boo
 
 /**
  * pickup credit card訪客模式：
- * Fulfillment-init 固定每 5 秒 hard refresh 一次，直到撳得「我會前來取貨」
- * 而且之後可以繼續原本腳本（輸入中環 → 揀店 → 繼續…）。
+ * Fulfillment-init 固定每 5 秒 hard refresh，直到：
+ * 撳得「我會前來取貨」→ 輸入中環 → 見到門市掣（先交俾後面揀店）。
  */
 async function ensurePickupClickThenContinueReady(page: Page): Promise<boolean> {
   const REFRESH_MS = 5_000;
   const maxRounds = 120; // ~10 分鐘
 
   console.log(
-    `  pickup credit card訪客：Fulfillment-init 固定每 ${REFRESH_MS / 1000}s hard refresh，直至可撳「我會前來取貨」並繼續腳本…`
+    `  pickup credit card訪客：Fulfillment-init 固定每 ${REFRESH_MS / 1000}s hard refresh，直至取貨＋搜尋＋門市可繼續…`
   );
-
-  const hardRefreshFulfillment = async (round: number) => {
-    const current = page.url();
-    const target = fulfillmentInitUrlFrom(current);
-    noteFulfillmentRefresh("soft");
-    markCheckoutNav(target, "pickup-cc-guest-5s-refresh");
-    console.log(`  ★ hard refresh Fulfillment-init #${round}：${target}`);
-    usedPickupStoreKeys.clear();
-    // 已喺同一 URL 時 goto 可能唔 reload，要用 reload 先見到真 refresh
-    if (
-      /\/shop\/checkout/i.test(current) &&
-      /_s=Fulfillment-init/i.test(current) &&
-      target === current
-    ) {
-      await withReleaseCheck(
-        page.reload({ waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {})
-      );
-    } else {
-      await withReleaseCheck(
-        page
-          .goto(target, { waitUntil: "domcontentloaded", timeout: 45_000 })
-          .catch(async () => {
-            await page.reload({ waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
-          })
-      );
-    }
-    await settleDom(page, 250);
-  };
 
   for (let round = 1; round <= maxRounds; round++) {
     const roundStarted = Date.now();
@@ -6482,10 +6536,10 @@ async function ensurePickupClickThenContinueReady(page: Page): Promise<boolean> 
         if (isShop404Url(page.url())) {
           await recoverFromShop404IfNeeded(page, "[pickup-cc-guest]").catch(() => {});
         }
-        await hardRefreshFulfillment(round);
+        await hardRefreshFulfillmentInit(page, `pickup-cc-guest-5s-#${round}`);
       }
     } else {
-      await hardRefreshFulfillment(round);
+      await hardRefreshFulfillmentInit(page, `pickup-cc-guest-5s-#${round}`);
     }
 
     if (await isFulfillment503(page)) {
@@ -6500,7 +6554,6 @@ async function ensurePickupClickThenContinueReady(page: Page): Promise<boolean> 
       continue;
     }
 
-    // 快速試撳「我會前來取貨」（最多 ~1.5s，唔等 60s 詳細載入）
     await page
       .getByText(/我會前來取貨/, { exact: false })
       .first()
@@ -6518,17 +6571,24 @@ async function ensurePickupClickThenContinueReady(page: Page): Promise<boolean> 
     );
     if (pickupClicked) {
       console.log("  已揀：我會前來取貨");
-      await sleepCheckingRelease(350);
-      if (await canContinuePickupScriptsAfterPickupClick(page)) {
-        console.log("  ✓ 已可繼續原腳本（搜尋／門市／繼續前往取貨詳情）");
-        return true;
-      }
-      console.warn("  已撳取貨但未見搜尋／門市 UI");
+      await sleepCheckingRelease(250);
     } else {
       console.warn(`  第 ${round} 輪：撳唔到「我會前來取貨」`);
     }
 
-    // 固定 5 秒節奏：由本輪開始計，唔夠 5s 就補夠再進入下一輪 refresh
+    // 一定要搜到門市掣先算「可繼續」——唔好淨係見到搜尋欄就停 refresh
+    const searched = await fillPickupSearchAndWaitHeading(page, { fast: true }).catch(
+      () => false
+    );
+    if (searched) {
+      const n = await countVisiblePickupStoreOptions(page);
+      if (n >= 1) {
+        console.log(`  ✓ 已見 ${n} 個門市掣，交俾揀店／繼續腳本`);
+        return true;
+      }
+      console.warn(`  第 ${round} 輪：搜尋後仍 0 門市掣`);
+    }
+
     const elapsed = Date.now() - roundStarted;
     const waitMore = Math.max(0, REFRESH_MS - elapsed);
     console.log(
