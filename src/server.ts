@@ -14,6 +14,8 @@ import {
   lookupCardMeta,
   peekCardLimitInfo,
   resolveOrderAmountSpent,
+  seedCardLimitsIfNeeded,
+  cardDigits,
 } from "./credit-card-pool.js";
 import {
   fulfillmentLabelFromPreference,
@@ -35,6 +37,7 @@ import {
 import {
   claimCheckoutCard,
   finalizeCheckoutCard,
+  findVaultCardByNumber,
   loadCardVault,
   loadCardVaultState,
   maskedRows,
@@ -68,6 +71,38 @@ const DASHBOARD_BUILD_ID = `${Date.now().toString(36)}-${Math.random().toString(
 
 function assignedCardPath(sessionId: string): string {
   return path.join(RUNTIME_DIR, `assigned-card-${sessionId}.enc`);
+}
+
+/** Credit cards 池：卡號 digits → limit（畀 Live card limits 即時計剩餘） */
+async function loadVaultLimitsMap(): Promise<Record<string, number>> {
+  const cards = await loadCardVault(CHECKOUT_CARDS_ENC, ADD_ORDER_KEY).catch(() => []);
+  const out: Record<string, number> = {};
+  for (const c of cards) {
+    if (c.limit == null || !Number.isFinite(c.limit)) continue;
+    const d = cardDigits(c.number);
+    if (!d) continue;
+    out[d] = c.limit;
+    if (d.length >= 4) out[d.slice(-4)] = c.limit;
+  }
+  return out;
+}
+
+async function vaultLimitOverrideForCard(
+  cardNumber: string | null | undefined
+): Promise<{ originalLimit?: number | null; company?: string; type?: string } | undefined> {
+  const vault = await findVaultCardByNumber(
+    CHECKOUT_CARDS_ENC,
+    ADD_ORDER_KEY,
+    cardNumber
+  ).catch(() => null);
+  if (!vault || vault.limit == null) {
+    const map = await loadVaultLimitsMap();
+    const d = cardDigits(cardNumber);
+    const lim = d ? map[d] ?? map[d.slice(-4)] : undefined;
+    if (lim == null) return undefined;
+    return { originalLimit: lim };
+  }
+  return { originalLimit: vault.limit };
 }
 
 function usesCreditCardAutofill(fulfillmentPreference: unknown): boolean {
@@ -1013,7 +1048,10 @@ async function spawnOneBrowser(
     _windowTotalOverride?: number;
     _windowIndexHint?: number;
   };
-  const sessionConfig = { ...cleanConfig, browserCount: 1 };
+  const sessionConfig = {
+    ...cleanConfig,
+    browserCount: 1,
+  } as Record<string, unknown> & { browserCount: number };
   // 多個 proxy：每個新 task 隨機揀一個（失敗會入黑名單，之後唔再用）
   const assignedProxy = await pickProxyForNewTask(cleanConfig.proxy);
   sessionConfig.proxy = assignedProxy;
@@ -1032,11 +1070,16 @@ async function spawnOneBrowser(
     if (claimed) {
       sessionConfig.checkoutCardId = claimed.id;
       sessionConfig.checkoutCardMasked = `****${String(claimed.number).slice(-4)}`;
+      if (claimed.limit != null) {
+        sessionConfig.cardLimit = String(Math.round(claimed.limit));
+      }
       console.log(
-        `[card] ${id} 分配信用卡 ****${String(claimed.number).slice(-4)}（加密檔；唔重複直至用完／排除）`
+        `[card] ${id} 分配信用卡 ****${String(claimed.number).slice(-4)}` +
+          (claimed.limit != null ? ` limit=${Math.round(claimed.limit)}` : "") +
+          `（加密檔；唔重複直至用完／排除）`
       );
     } else {
-      console.warn(`[card] ${id} 無可用信用卡（請喺 Dashboard 貼上 卡號,mm/yy,cvv 並 Save）`);
+      console.warn(`[card] ${id} 無可用信用卡（請喺 Dashboard 貼上 卡號,mm/yy,cvv,limit 並 Save）`);
     }
   }
   const configPath = path.join(RUNTIME_DIR, `config-${id}.json`);
@@ -1382,8 +1425,14 @@ async function collectOrders(): Promise<unknown[]> {
     }
 
     const meta = lookupCardMeta(String(cardNumber || ""));
+    const vaultOpts = await vaultLimitOverrideForCard(String(cardNumber || ""));
     const peek = cardNumber
-      ? await peekCardLimitInfo(ROOT, String(cardNumber), o.amountSpent ?? o.total)
+      ? await peekCardLimitInfo(
+          ROOT,
+          String(cardNumber),
+          o.amountSpent ?? o.total,
+          vaultOpts
+        )
       : null;
 
     o.cardCompany =
@@ -1395,7 +1444,13 @@ async function collectOrders(): Promise<unknown[]> {
       o.cardType ||
       "";
     o.cardLimit =
-      pickNonEmpty(o.cardLimit, card.cardLimit, peek?.cardLimit, meta?.limit) ||
+      pickNonEmpty(
+        o.cardLimit,
+        card.cardLimit,
+        peek?.cardLimit,
+        vaultOpts?.originalLimit != null ? String(Math.round(vaultOpts.originalLimit)) : null,
+        meta?.limit
+      ) ||
       o.cardLimit ||
       "";
     const rem =
@@ -1576,7 +1631,8 @@ async function snapshot() {
         ? await peekCardLimitInfo(
             ROOT,
             cardNumber,
-            card.total ?? order?.amountSpent ?? order?.total ?? estimatedTotal.label
+            card.total ?? order?.amountSpent ?? order?.total ?? estimatedTotal.label,
+            await vaultLimitOverrideForCard(cardNumber)
           )
         : null;
     const meta = cardNumber && !isApplePay ? lookupCardMeta(cardNumber) : null;
@@ -1731,8 +1787,13 @@ async function snapshot() {
             null,
         cardLimit: isApplePay
           ? null
-          : pickNonEmpty(card.cardLimit, order?.cardLimit, peek?.cardLimit, meta?.limit) ||
-            null,
+          : pickNonEmpty(
+              card.cardLimit,
+              order?.cardLimit,
+              peek?.cardLimit,
+              s.config.cardLimit,
+              meta?.limit
+            ) || null,
         remainingCreditCardLimit: remaining,
         remainingLimit: remaining,
         orderPlacedAt: card.orderPlacedAt ?? order?.orderPlacedAt ?? null,
@@ -1841,7 +1902,7 @@ async function snapshot() {
     browsers,
     logs: allLogs,
     orders,
-    cardLimits: await getLiveCardLimits(ROOT, orders),
+    cardLimits: await getLiveCardLimits(ROOT, orders, await loadVaultLimitsMap()),
     monitor: {
       running: monitorState.running,
       pid: monitorState.pid,
@@ -1890,7 +1951,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     return sendJson(res, 200, await collectOrders());
   }
   if (pathname === "/api/card-limits" && req.method === "GET") {
-    return sendJson(res, 200, await getLiveCardLimits(ROOT, await collectOrders()));
+    return sendJson(res, 200, await getLiveCardLimits(ROOT, await collectOrders(), await loadVaultLimitsMap()));
   }
 
   /** Checkout 信用卡池：加密存檔；只回 masked／統計 */
@@ -1920,6 +1981,10 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     });
     if (!result.ok) return sendJson(res, 400, result);
     const cards = await loadCardVault(CHECKOUT_CARDS_ENC, ADD_ORDER_KEY);
+    await seedCardLimitsIfNeeded(
+      ROOT,
+      cards.map((c) => ({ number: c.number, limit: c.limit }))
+    ).catch(() => 0);
     const state = await loadCardVaultState(CHECKOUT_CARDS_STATE);
     return sendJson(res, 200, {
       ...result,

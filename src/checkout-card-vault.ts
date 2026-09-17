@@ -1,7 +1,8 @@
 /**
  * Checkout Dashboard 信用卡池：AES-256-GCM 加密存檔。
- * 格式每行：卡號,mm/yy,cvv
+ * 格式每行：卡號,mm/yy,cvv,limit
  * 隨機分配、唔重複；拒單／失敗會 exclude。
+ * limit 會用嚟計 Live card limits 剩餘額度（成功落單後扣減）。
  */
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
@@ -13,6 +14,8 @@ export type VaultCard = {
   number: string;
   exp: string; // mm/yy
   cvv: string;
+  /** 信用額度（HKD）；null = 未提供 */
+  limit: number | null;
 };
 
 export type CardVaultState = {
@@ -29,10 +32,20 @@ export type CardVaultFile = {
 export type MaskedCardRow = {
   id: string;
   masked: string;
+  limit: number | null;
   status: "available" | "in_use" | "used" | "excluded";
 };
 
-function digitsOnly(s: string): string {
+export function parseLimitField(raw: unknown): number | null {
+  const s = String(raw ?? "").trim().replace(/,/g, "");
+  if (!s) return null;
+  const m = s.match(/(\d+(?:\.\d+)?)/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+function digitsOnly(s: string | null | undefined): string {
   return String(s || "").replace(/\D/g, "");
 }
 
@@ -50,17 +63,15 @@ export function maskCardNumber(number: string): string {
 export function parseCardLine(line: string): VaultCard | null {
   const raw = String(line || "").trim();
   if (!raw || raw.startsWith("#")) return null;
-  // 支援 卡號,mm/yy,cvv（主要）；舊格式 卡號:mm/yy:cvv 仍可讀
+  // 主要：卡號,mm/yy,cvv,limit；舊格式卡號:mm/yy:cvv 仍可讀；limit 可選（向後兼容）
   const parts = raw.includes(",")
     ? raw.split(",").map((p) => p.trim())
     : raw.split(":").map((p) => p.trim());
   if (parts.length < 3) return null;
   const number = digitsOnly(parts[0] || "");
   const exp = String(parts[1] || "").trim();
-  const cvv = String(parts.slice(2).join(raw.includes(",") ? "," : ":") || "").replace(
-    /\s+/g,
-    ""
-  );
+  const cvv = String(parts[2] || "").replace(/\s+/g, "");
+  const limit = parts.length >= 4 ? parseLimitField(parts[3]) : null;
   if (number.length < 13 || number.length > 19) return null;
   if (!/^\d{1,2}\/\d{2}$/.test(exp)) return null;
   if (!/^\d{3,4}$/.test(cvv)) return null;
@@ -73,6 +84,7 @@ export function parseCardLine(line: string): VaultCard | null {
     number,
     exp: normalizedExp,
     cvv,
+    limit,
   };
 }
 
@@ -116,11 +128,16 @@ export async function loadCardVault(
         const exp = String(c.exp || "").trim();
         const cvv = String(c.cvv || "").trim();
         if (!number || !exp || !cvv) return null;
+        const limit =
+          c.limit != null && Number.isFinite(Number(c.limit))
+            ? Number(c.limit)
+            : parseLimitField((c as { limit?: unknown }).limit);
         return {
           id: c.id || cardIdFromParts(number, exp, cvv),
           number,
           exp,
           cvv,
+          limit,
         } satisfies VaultCard;
       })
       .filter((c): c is VaultCard => Boolean(c));
@@ -167,14 +184,19 @@ export async function upsertCardsFromText(opts: {
 }): Promise<{ ok: true; total: number; added: number; parsed: number } | { ok: false; error: string }> {
   const parsed = parseCardLines(opts.text);
   if (!parsed.length) {
-    return { ok: false, error: "格式唔啱。每行：卡號,mm/yy,cvv" };
+    return { ok: false, error: "格式唔啱。每行：卡號,mm/yy,cvv,limit" };
   }
   const existing = opts.replace ? [] : await loadCardVault(opts.encPath, opts.keyPath);
   const map = new Map(existing.map((c) => [c.id, c]));
   let added = 0;
   for (const c of parsed) {
     if (!map.has(c.id)) added += 1;
-    map.set(c.id, c);
+    const prev = map.get(c.id);
+    // 新行冇寫 limit 時保留舊 limit
+    map.set(c.id, {
+      ...c,
+      limit: c.limit != null ? c.limit : prev?.limit ?? null,
+    });
   }
   const next = [...map.values()];
   await saveCardVault(opts.encPath, opts.keyPath, next);
@@ -217,9 +239,14 @@ export function maskedRows(cards: VaultCard[], state: CardVaultState): MaskedCar
     if (excluded.has(c.id)) status = "excluded";
     else if (used.has(c.id)) status = "used";
     else if (inUseIds.has(c.id)) status = "in_use";
+    const lim =
+      c.limit != null && Number.isFinite(c.limit) ? String(Math.round(c.limit)) : "";
     return {
       id: c.id,
-      masked: `${maskCardNumber(c.number)},${c.exp},***`,
+      masked: lim
+        ? `${maskCardNumber(c.number)},${c.exp},***,${lim}`
+        : `${maskCardNumber(c.number)},${c.exp},***`,
+      limit: c.limit,
       status,
     };
   });
@@ -270,15 +297,39 @@ export async function loadAssignedCheckoutCard(
     if (!plain) return null;
     const c = JSON.parse(plain) as VaultCard;
     if (!c?.number || !c?.exp || !c?.cvv) return null;
+    const limit =
+      c.limit != null && Number.isFinite(Number(c.limit))
+        ? Number(c.limit)
+        : parseLimitField(c.limit);
     return {
       id: c.id || cardIdFromParts(c.number, c.exp, c.cvv),
       number: digitsOnly(c.number),
       exp: String(c.exp).trim(),
       cvv: String(c.cvv).trim(),
+      limit,
     };
   } catch {
     return null;
   }
+}
+
+/** 用卡號（完整或尾四位唯一）喺加密池搵卡（含 limit） */
+export async function findVaultCardByNumber(
+  encPath: string,
+  keyPath: string,
+  cardNumber: string | null | undefined
+): Promise<VaultCard | null> {
+  const d = digitsOnly(cardNumber);
+  if (!d || d.length < 4) return null;
+  const cards = await loadCardVault(encPath, keyPath);
+  const full = cards.find((c) => digitsOnly(c.number) === d);
+  if (full) return full;
+  if (d.length >= 4) {
+    const last4 = d.slice(-4);
+    const matches = cards.filter((c) => digitsOnly(c.number).endsWith(last4));
+    if (matches.length === 1) return matches[0]!;
+  }
+  return null;
 }
 
 export async function finalizeCheckoutCard(opts: {

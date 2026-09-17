@@ -243,15 +243,52 @@ export type RemainingLimitResult = {
   amountSpent: number | null;
 };
 
+export type CardLimitOverride = {
+  /** Dashboard Credit cards 輸入嘅 limit；優先於 CREDIT_CARD_POOL */
+  originalLimit?: number | null;
+  company?: string;
+  type?: string;
+};
+
+function resolveCardForLimit(
+  cardNumber: string | null | undefined,
+  opts?: CardLimitOverride
+): CreditCardInfo | null {
+  const d = cardDigits(cardNumber);
+  if (!d || /applepay/i.test(String(cardNumber || "").replace(/\s+/g, ""))) return null;
+  const pool = findCreditCard(cardNumber);
+  const overrideLimit =
+    opts?.originalLimit != null && Number.isFinite(opts.originalLimit)
+      ? Number(opts.originalLimit)
+      : null;
+  if (pool) {
+    return {
+      ...pool,
+      limit: overrideLimit != null ? overrideLimit : pool.limit,
+      company: opts?.company || pool.company,
+      type: opts?.type || pool.type,
+    };
+  }
+  if (overrideLimit == null) return null;
+  return {
+    number: d,
+    company: opts?.company || "",
+    type: opts?.type || "",
+    limit: overrideLimit,
+  };
+}
+
 /**
- * 結帳成功：用卡號搵資料庫，剩餘限額 = 當前剩餘 − 今次消費，並持久化。
+ * 結帳成功：剩餘限額 = 當前剩餘 − 今次消費，並持久化。
+ * 可用 opts.originalLimit（Credit cards 池輸入嘅 limit）覆蓋資料庫額度。
  */
 export async function applySuccessfulCheckoutToCardLimit(
   rootDir: string,
   cardNumber: string | null | undefined,
-  amountSpentRaw: unknown
+  amountSpentRaw: unknown,
+  opts?: CardLimitOverride
 ): Promise<RemainingLimitResult | null> {
-  const card = findCreditCard(cardNumber);
+  const card = resolveCardForLimit(cardNumber, opts);
   if (!card) return null;
 
   const amountSpent = parseHkAmount(amountSpentRaw);
@@ -281,6 +318,25 @@ export async function applySuccessfulCheckoutToCardLimit(
   };
 }
 
+/** 首次寫入卡嘅起始剩餘額（唔覆蓋已扣過嘅卡） */
+export async function seedCardLimitsIfNeeded(
+  rootDir: string,
+  cards: Array<{ number: string; limit: number | null | undefined }>
+): Promise<number> {
+  const store = await readRemainingStore(rootDir);
+  let seeded = 0;
+  for (const c of cards) {
+    if (c.limit == null || !Number.isFinite(Number(c.limit))) continue;
+    const key = cardDigits(c.number);
+    if (!key) continue;
+    if (store[key] != null) continue;
+    store[key] = Number(c.limit);
+    seeded += 1;
+  }
+  if (seeded) await writeRemainingStore(rootDir, store);
+  return seeded;
+}
+
 /** 只查詢／帶出卡資料（唔扣額） */
 export function lookupCardMeta(cardNumber: string | null | undefined): {
   company: string;
@@ -300,7 +356,8 @@ export function lookupCardMeta(cardNumber: string | null | undefined): {
 export async function peekCardLimitInfo(
   rootDir: string,
   cardNumber: string | null | undefined,
-  amountSpentRaw?: unknown
+  amountSpentRaw?: unknown,
+  opts?: CardLimitOverride
 ): Promise<{
   company: string;
   type: string;
@@ -308,7 +365,7 @@ export async function peekCardLimitInfo(
   remainingLimit: number | null;
   remainingLabel: string;
 } | null> {
-  const card = findCreditCard(cardNumber);
+  const card = resolveCardForLimit(cardNumber, opts);
   if (!card) return null;
   const store = await readRemainingStore(rootDir);
   const key = cardDigits(card.number);
@@ -358,6 +415,8 @@ export type LiveOrderSpendRow = {
   cardMasked: string;
   company: string;
   type: string;
+  /** 起始信用額（Credit cards 輸入 / 資料庫） */
+  cardLimit: string;
   remainingLimit: number | null;
   remainingLabel: string;
 };
@@ -398,7 +457,8 @@ function orderAmountSpent(o: Record<string, unknown>): {
  */
 export async function getLiveCardLimits(
   rootDir: string,
-  orders: unknown[] = []
+  orders: unknown[] = [],
+  vaultLimits: Record<string, number> = {}
 ): Promise<{
   updatedAt: string;
   cards: LiveCardLimitRow[];
@@ -490,6 +550,19 @@ export async function getLiveCardLimits(
       String(o.amountSpent || o.total || "").trim() ||
       (amount != null ? formatHkLimit(amount) : "—");
 
+    const cardLimitLabel = isApplePay
+      ? "—"
+      : String(o.cardLimit || "").trim() ||
+        (digits
+          ? formatHkLimit(
+              vaultLimits[digits] ??
+                vaultLimits[cardDigits(poolCard?.number || "")] ??
+                vaultLimits[digits.slice(-4)]
+            )
+          : "") ||
+        formatHkLimit(poolCard?.limit) ||
+        "—";
+
     orderRows.push({
       orderNumber,
       orderPlacedAt: String(o.orderPlacedAt || o.scrapedAt || "") || "—",
@@ -510,6 +583,7 @@ export async function getLiveCardLimits(
       type: isApplePay
         ? String(o.cardType || "Apple Pay")
         : String(o.cardType || poolCard?.type || "") || "—",
+      cardLimit: cardLimitLabel,
       remainingLimit: isApplePay ? null : remainingNum,
       remainingLabel,
     });
@@ -518,6 +592,9 @@ export async function getLiveCardLimits(
   // 新單排前
   orderRows.sort((a, b) => String(b.orderPlacedAt).localeCompare(String(a.orderPlacedAt)));
 
+  // Live：同一張卡嘅剩餘額 = 起始 limit − 所有成功消費合計（即時）
+  applyLiveRemainingAcrossOrders(orderRows, store, vaultLimits);
+
   return {
     updatedAt: new Date().toISOString(),
     cards,
@@ -525,4 +602,105 @@ export async function getLiveCardLimits(
     touchedCount: cards.filter((c) => c.touched).length,
     orderCount: orderRows.length,
   };
+}
+
+/**
+ * 按卡號把 Live 剩餘額度重算：remaining = originalLimit − Σ(成功訂單金額)。
+ * originalLimit 優先用訂單 cardLimit／vaultLimits／pool。
+ */
+export function applyLiveRemainingAcrossOrders(
+  orderRows: LiveOrderSpendRow[],
+  store: Record<string, number> = {},
+  vaultLimits: Record<string, number> = {}
+): void {
+  type Acc = {
+    original: number | null;
+    spent: number;
+    keys: number[];
+  };
+  const byCard = new Map<string, Acc>();
+
+  for (let i = 0; i < orderRows.length; i++) {
+    const row = orderRows[i]!;
+    const digits = cardDigits(row.cardMasked);
+    if (!digits || digits.length < 4 || /apple\s*pay/i.test(row.cardMasked)) continue;
+    const pool = findCreditCard(row.cardMasked);
+    const fullKey = pool ? cardDigits(pool.number) : digits;
+    const key = fullKey.length >= 13 ? fullKey : digits.slice(-4);
+    let acc = byCard.get(key);
+    if (!acc) {
+      const fromOrder = parseHkAmount(row.cardLimit);
+      const fromVault =
+        vaultLimits[fullKey] ??
+        vaultLimits[digits] ??
+        vaultLimits[digits.slice(-4)] ??
+        null;
+      const original =
+        fromOrder ??
+        fromVault ??
+        pool?.limit ??
+        null;
+      acc = { original: original ?? null, spent: 0, keys: [] };
+      byCard.set(key, acc);
+    } else if (acc.original == null) {
+      const fromOrder = parseHkAmount(row.cardLimit);
+      if (fromOrder != null) acc.original = fromOrder;
+    }
+    if (row.amountSpent != null) acc.spent += row.amountSpent;
+    acc.keys.push(i);
+  }
+
+  for (const [, acc] of byCard) {
+    let remaining: number | null = null;
+    if (acc.original != null) {
+      remaining = Math.round((acc.original - acc.spent) * 100) / 100;
+    }
+    const label = remaining != null ? formatHkLimit(remaining) : "—";
+    for (const idx of acc.keys) {
+      const row = orderRows[idx]!;
+      row.remainingLimit = remaining;
+      row.remainingLabel = label;
+    }
+  }
+}
+
+/** 供 Dashboard：用 cardLimit + 成功訂單金額即時計剩餘 */
+export function liveRemainingByCardFromOrders(
+  orders: Array<{
+    cardNumber?: unknown;
+    cardLimit?: unknown;
+    amountSpent?: unknown;
+    total?: unknown;
+  }>
+): Map<string, { limit: number | null; spent: number; remaining: number | null }> {
+  const out = new Map<
+    string,
+    { limit: number | null; spent: number; remaining: number | null }
+  >();
+  for (const o of orders) {
+    const digits = cardDigits(String(o.cardNumber || ""));
+    if (!digits || digits.length < 4) continue;
+    if (/applepay/i.test(String(o.cardNumber || "").replace(/\s+/g, ""))) continue;
+    const key = digits.length >= 13 ? digits : digits.slice(-4);
+    let row = out.get(key);
+    if (!row) {
+      const lim =
+        parseHkAmount(o.cardLimit) ?? findCreditCard(String(o.cardNumber))?.limit ?? null;
+      row = { limit: lim, spent: 0, remaining: lim };
+      out.set(key, row);
+    } else if (row.limit == null) {
+      const lim =
+        parseHkAmount(o.cardLimit) ?? findCreditCard(String(o.cardNumber))?.limit ?? null;
+      if (lim != null) row.limit = lim;
+    }
+    const amt = parseHkAmount(o.amountSpent ?? o.total);
+    if (amt != null) row.spent += amt;
+  }
+  for (const row of out.values()) {
+    row.remaining =
+      row.limit != null
+        ? Math.round((row.limit - row.spent) * 100) / 100
+        : null;
+  }
+  return out;
 }

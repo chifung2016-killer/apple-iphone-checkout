@@ -573,7 +573,7 @@
             <textarea
               id="checkoutCards"
               name="checkoutCards"
-              placeholder="每行一張：卡號,mm/yy,cvv&#10;例如：&#10;4111111111111111,12/28,123&#10;5427136001956206,09/27,456"
+              placeholder="每行一張：卡號,mm/yy,cvv,limit&#10;例如：&#10;4111111111111111,12/28,123,100000&#10;5427136001956206,09/27,456,44994"
               autocomplete="off"
               spellcheck="false"
             ></textarea>
@@ -584,7 +584,7 @@
               <button type="button" class="btn-danger btn-sm" id="btnRemoveCheckoutCards" title="刪除已選信用卡（永久移出加密池）">Remove selected</button>
             </div>
             <p class="hint" style="margin:6px 0 0">
-              信用卡訪客模式（pickup／delivery）會<strong>隨機用不重複</strong>嘅卡去 Billing autofill →「檢查你的訂單」→ Review 自動撳「立即提交訂單」。拒單／失敗會排除該卡。Apple Pay 模式唔用。
+              格式：<code>卡號,mm/yy,cvv,limit</code>。信用卡訪客模式會隨機用不重複嘅卡 autofill →「檢查你的訂單」→「立即提交訂單」。成功落單會用 <strong>limit − 已付金額</strong> 即時更新 Live card limits。拒單會排除該卡。Apple Pay 模式唔用。
               <span id="checkoutCardsMeta">—</span>
             </p>
             <div id="checkoutCardsList" class="card-vault-list" aria-label="Saved credit cards"></div>
@@ -651,7 +651,7 @@
       <div class="card-limits-head">
         <div>
           <h2><span class="live-dot" aria-hidden="true"></span>Live card limits</h2>
-          <p class="hint">同 Order summary／Finished tab 對齊（同一訂單編號）。Email／Card／Company／Remaining／Amount 與摘要一致。</p>
+          <p class="hint">同 Order summary／Finished 對齊。Remaining = Credit cards 輸入嘅 limit − 該卡成功落單合計（即時更新）。</p>
         </div>
         <div class="card-limits-tools">
           <input type="search" id="cardLimitSearch" placeholder="搜尋訂單／電郵／產品／卡號／公司" />
@@ -1411,7 +1411,7 @@
     /** 同時刷新 Order summary + Live card limits（以 Finished 為準） */
     function syncOrdersAndCardLimitsFromSnap(snap) {
       if (!snap) return [];
-      const orders = collectSuccessfulOrders(snap);
+      const orders = applyLiveRemainingToOrders(collectSuccessfulOrders(snap));
       renderOrders(orders);
       renderCardLimitsFromOrders(orders);
       return orders;
@@ -1521,13 +1521,64 @@
       return Number(n).toLocaleString("en-HK");
     }
 
+    function parseMoneyAmount(raw) {
+      const s = String(raw ?? "").replace(/,/g, "");
+      const m = s.match(/(\d+(?:\.\d+)?)/);
+      if (!m) return null;
+      const n = Number(m[1]);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    function cardDigitsKey(raw) {
+      const d = String(raw || "").replace(/\D/g, "");
+      if (!d || d.length < 4) return "";
+      if (/applepay/i.test(String(raw || "").replace(/\s+/g, ""))) return "";
+      return d.length >= 13 ? d : d.slice(-4);
+    }
+
+    /** Live：同一張卡 Remaining = cardLimit − Σ(成功訂單金額) */
+    function applyLiveRemainingToOrders(orders) {
+      const list = Array.isArray(orders) ? orders : [];
+      const byCard = new Map();
+      for (const o of list) {
+        const d = orderDisplayFields(o);
+        if (/apple\s*pay/i.test(d.cardNumber)) continue;
+        const key = cardDigitsKey(d.cardNumber);
+        if (!key) continue;
+        let acc = byCard.get(key);
+        if (!acc) {
+          acc = { limit: parseMoneyAmount(d.cardLimit), spent: 0 };
+          byCard.set(key, acc);
+        } else if (acc.limit == null) {
+          const lim = parseMoneyAmount(d.cardLimit);
+          if (lim != null) acc.limit = lim;
+        }
+        const amt = parseMoneyAmount(d.amountSpent);
+        if (amt != null) acc.spent += amt;
+      }
+      return list.map((o) => {
+        const d = orderDisplayFields(o);
+        if (/apple\s*pay/i.test(d.cardNumber)) return o;
+        const key = cardDigitsKey(d.cardNumber);
+        const acc = key ? byCard.get(key) : null;
+        if (!acc || acc.limit == null) return o;
+        const remaining = Math.round((acc.limit - acc.spent) * 100) / 100;
+        return {
+          ...o,
+          cardLimit: o.cardLimit || String(Math.round(acc.limit)),
+          remainingCreditCardLimit: String(Math.round(remaining)),
+          remainingLimit: String(Math.round(remaining)),
+        };
+      });
+    }
+
     function renderCardLimitsFromOrders(orders) {
       const body = $("cardLimitsBody");
       const meta = $("cardLimitsMeta");
       if (!body) return;
-      const rows = (Array.isArray(orders) ? orders : [])
-        .filter(hasOrderNumber)
-        .map((o) => orderDisplayFields(o));
+      const rows = applyLiveRemainingToOrders(
+        (Array.isArray(orders) ? orders : []).filter(hasOrderNumber)
+      ).map((o) => orderDisplayFields(o));
       lastCardLimits = { orders: rows, updatedAt: new Date().toISOString() };
 
       const q = String($("cardLimitSearch")?.value || "").trim().toLowerCase();
@@ -1535,7 +1586,7 @@
       const filtered = rows.filter((r) => {
         if (cardOnly && /apple\s*pay/i.test(String(r.cardNumber))) return false;
         if (!q) return true;
-        const hay = `${r.orderNumber} ${r.email} ${r.product} ${r.color} ${r.storage} ${r.cardNumber} ${r.cardCompany} ${r.browser} ${r.amountSpent} ${r.deliveryMethod}`.toLowerCase();
+        const hay = `${r.orderNumber} ${r.email} ${r.product} ${r.color} ${r.storage} ${r.cardNumber} ${r.cardCompany} ${r.browser} ${r.amountSpent} ${r.deliveryMethod} ${r.remainingLimit}`.toLowerCase();
         return hay.includes(q);
       });
 
@@ -1547,7 +1598,7 @@
       if (meta) {
         const withAmt = rows.filter((r) => r.amountSpent && r.amountSpent !== "—").length;
         const updated = new Date().toLocaleTimeString("zh-HK", { hour12: false });
-        meta.innerHTML = `Live · 同 Order summary／Finished 對齊 · 成功訂單 <b>${rows.length}</b> · 有金額 ${withAmt} · 顯示 ${filtered.length} · 已選 <b>${cardLimitSelected.size}</b> · 更新 ${esc(updated)}`;
+        meta.innerHTML = `Live · Remaining = limit − 成功付款合計 · 成功訂單 <b>${rows.length}</b> · 有金額 ${withAmt} · 顯示 ${filtered.length} · 已選 <b>${cardLimitSelected.size}</b> · 更新 ${esc(updated)}`;
       }
 
       if (!filtered.length) {
@@ -2129,7 +2180,7 @@
       const ta = $("checkoutCards");
       const text = String(ta?.value || "").trim();
       if (!text) {
-        alert("請貼上至少一行：卡號,mm/yy,cvv");
+        alert("請貼上至少一行：卡號,mm/yy,cvv,limit");
         return;
       }
       const btn = $("btnSaveCheckoutCards");

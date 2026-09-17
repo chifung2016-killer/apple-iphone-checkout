@@ -21,6 +21,7 @@ import {
   applySuccessfulCheckoutToCardLimit,
   formatHkLimit,
   lookupCardMeta,
+  parseHkAmount,
   resolveOrderAmountSpent,
 } from "./credit-card-pool.js";
 import { fulfillmentLabelFromPreference } from "./fulfillment-label.js";
@@ -932,9 +933,9 @@ async function waitForEnter(
                 opts.session.cardCompany ||
                 "",
               cardLimit:
+                opts.session.cardLimit ||
                 poolMeta?.limit ||
                 resolveCardLimit() ||
-                opts.session.cardLimit ||
                 "",
               orderPlacedAt: opts.session.orderPlacedAt,
               paymentSucceeded: true,
@@ -6945,10 +6946,14 @@ async function autofillAssignedCreditCard(
   );
   if (session) {
     session.capturedCardNumber = card.number;
+    if (card.limit != null) {
+      session.cardLimit = formatHkLimit(card.limit);
+    }
     await writeStatus({
       card: {
         cardNumber: card.number,
         cardType: detectCardType(card.number),
+        cardLimit: card.limit != null ? formatHkLimit(card.limit) : undefined,
       },
       message: `autofill card ****${card.number.slice(-4)}`,
     }).catch(() => {});
@@ -9212,7 +9217,7 @@ async function holdSessionsHiddenUntilClose(
                 s.cardCompany ||
                 "",
               cardLimit:
-                poolMeta?.limit || resolveCardLimit() || s.cardLimit || "",
+                s.cardLimit || poolMeta?.limit || resolveCardLimit() || "",
               orderPlacedAt: s.orderPlacedAt,
               paymentSucceeded: true,
             }),
@@ -9903,13 +9908,25 @@ async function buildOrderRecord(
     scraped.cardNumber ||
     "Apple Pay";
   const poolMeta = lookupCardMeta(cardNumber);
+  const assignedForLimit = await loadAssignedCheckoutCard(
+    CHECKOUT_CARD_ASSIGN_PATH,
+    CHECKOUT_CARD_KEY_PATH
+  ).catch(() => null);
+  const vaultLimit =
+    assignedForLimit?.limit ??
+    parseHkAmount(session.cardLimit) ??
+    parseHkAmount(poolMeta?.limit);
   const cardCompany =
     poolMeta?.company ||
     resolveCardCompany() ||
     session.cardCompany ||
     (/apple\s*pay/i.test(String(cardNumber || "")) ? "Apple Pay" : "");
   const cardLimit =
-    poolMeta?.limit || resolveCardLimit() || session.cardLimit || "";
+    (vaultLimit != null ? formatHkLimit(vaultLimit) : "") ||
+    poolMeta?.limit ||
+    resolveCardLimit() ||
+    session.cardLimit ||
+    "";
   const cardTypeResolved =
     poolMeta?.type ||
     detectCardType(cardNumber) ||
@@ -9926,13 +9943,14 @@ async function buildOrderRecord(
   });
   const amountLabel = resolvedAmt.label || scraped.amountSpent || scraped.total || null;
 
-  // 成功落單：用資料庫額度 − 今次消費 = 剩餘限額（寫入 Google Sheet）
+  // 成功落單：Credit cards limit − 今次消費 = 剩餘限額（Live card limits／Google Sheet）
   let remainingCreditCardLimit = "";
   if (scraped.orderNumber && cardNumber && !/apple\s*pay/i.test(String(cardNumber))) {
     const applied = await applySuccessfulCheckoutToCardLimit(
       ROOT,
       cardNumber,
-      amountLabel
+      amountLabel,
+      vaultLimit != null ? { originalLimit: vaultLimit } : undefined
     ).catch(() => null);
     if (applied) {
       remainingCreditCardLimit = formatHkLimit(applied.remainingLimit);
@@ -9957,7 +9975,11 @@ async function buildOrderRecord(
     cardNumber,
     cardType: cardTypeResolved,
     cardCompany,
-    cardLimit: cardLimit || poolMeta?.limit || "",
+    cardLimit:
+      cardLimit ||
+      (vaultLimit != null ? formatHkLimit(vaultLimit) : "") ||
+      poolMeta?.limit ||
+      "",
     /** 成功結帳後剩餘信用額 */
     remainingCreditCardLimit,
     remainingLimit: remainingCreditCardLimit,
