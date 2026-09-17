@@ -622,14 +622,22 @@ async function writeStatus(patch: Record<string, unknown>): Promise<void> {
         next.stuckSince = prev.stuckSince ?? null;
       }
     }
-    // 終態／等人：唔標 stuck
+    // 終態／等人：唔標 stuck（page_error 除外，要保持紅閃）
     if (
       /waiting_for_payment|waiting_for_stock_at_stores|steps_complete|payment_succeeded|orders_ready|manual_control|closed|idle/i.test(
         phaseNext
-      )
+      ) &&
+      !/page_error/i.test(phaseNext)
     ) {
       next.stuck = false;
       next.stuckSince = null;
+    }
+
+    // page_error 必須保持 stuck 紅閃
+    if (/page_error/i.test(phaseNext)) {
+      next.stuck = true;
+      next.stuckSince =
+        next.stuckSince || prev.stuckSince || new Date().toISOString();
     }
 
     await fs.writeFile(STATUS_FILE, JSON.stringify(next, null, 2), "utf8").catch(() => {});
@@ -2402,6 +2410,47 @@ function isBagPage(url: string): boolean {
 /** Apple HK 錯誤頁：https://www.apple.com/hk-zh/shop/404 */
 function isShop404Url(url: string): boolean {
   return /\/shop\/404\b/i.test(url);
+}
+
+/** Soft 404 文案（URL 仍可能係 Fulfillment-init） */
+const PAGE_NOT_FOUND_TEXT_RE =
+  /The page you[\u2019']?re looking for can[\u2019']?t be found|找不到你要找的頁面|找不到你要尋找的頁面|找不到此頁面|頁面不存在/i;
+
+async function pageShowsNotFound(page: Page): Promise<boolean> {
+  if (isShop404Url(page.url())) return true;
+  return page
+    .evaluate(() => {
+      const title = document.title || "";
+      const body = (document.body?.innerText || "").slice(0, 12000);
+      const h1 = document.querySelector("h1")?.textContent || "";
+      return `${title}\n${h1}\n${body}`;
+    })
+    .then((text) => PAGE_NOT_FOUND_TEXT_RE.test(text || ""))
+    .catch(() => false);
+}
+
+/** Opened browsers：標 page error + red blink（stuck） */
+async function markPageErrorIfNotFound(
+  page: Page,
+  context = ""
+): Promise<boolean> {
+  if (!(await pageShowsNotFound(page))) return false;
+  const url = page.url();
+  const prefix = context ? `[${context}] ` : "";
+  console.warn(
+    `  ${prefix}★ page error：The page you're looking for can't be found.｜${url}`
+  );
+  await writeStatus({
+    phase: "page_error",
+    stuck: true,
+    url,
+    message: "page error: The page you're looking for can't be found.",
+    card: {
+      url,
+      message: "page error: The page you're looking for can't be found.",
+    },
+  }).catch(() => {});
+  return true;
 }
 
 /** 上一頁時間戳：用嚟量 /shop/404 由邊頁跳過嚟、隔咗幾耐 */
@@ -4779,6 +4828,11 @@ async function continueToShippingAddress(page: Page): Promise<void> {
 }
 
 async function startDeliveryFlow(page: Page): Promise<void> {
+  // pickup-only 任務永遠唔好撳「我希望送貨」（b210 誤踩）
+  if (prefersPickupOnly()) {
+    console.warn("  pickup-only：拒絕撳「我希望送貨」");
+    return;
+  }
   console.log("步驟：我希望送貨");
   await page.waitForTimeout(800);
 
@@ -5369,9 +5423,11 @@ async function hardRefreshFulfillmentInit(
     );
   } else {
     await gotoFulfillmentInit(page);
+    await markPageErrorIfNotFound(page, label).catch(() => false);
     return;
   }
   await settleDom(page, 250);
+  await markPageErrorIfNotFound(page, label).catch(() => false);
 }
 
 async function softRefreshFulfillmentNow(page: Page): Promise<void> {
@@ -6554,6 +6610,12 @@ async function ensurePickupClickThenContinueReady(page: Page): Promise<boolean> 
       continue;
     }
 
+    if (await markPageErrorIfNotFound(page, `pickup-cc-guest-#${round}`)) {
+      const waitMore = Math.max(0, REFRESH_MS - (Date.now() - roundStarted));
+      await sleepCheckingRelease(waitMore);
+      continue;
+    }
+
     await page
       .getByText(/我會前來取貨/, { exact: false })
       .first()
@@ -6607,6 +6669,10 @@ async function ensurePickupClickThenContinueReady(page: Page): Promise<boolean> 
 }
 
 async function clickDeliveryOption(page: Page): Promise<boolean> {
+  if (prefersPickupOnly()) {
+    console.warn("  pickup-only：跳過「我希望送貨」");
+    return false;
+  }
   const locators = [
     page.getByRole("radio", { name: /我希望送貨/ }),
     page.getByRole("button", { name: /我希望送貨/ }),
@@ -6673,20 +6739,32 @@ async function chooseFulfillment(page: Page): Promise<"pickup" | "delivery"> {
     return "delivery";
   }
 
-  // pickup credit card訪客：內層已每 5s refresh，外層唔使再刷多次
-  if (isPickupCreditCardGuest()) {
-    const ok = await tryPickupOnce(page, 1);
-    if (ok) {
-      console.log("  取貨流程成功。");
-      resetFulfillmentRefreshStats();
-      return "pickup";
+  // pickup-only（含 credit card訪客）：只取貨，永遠唔撳「我希望送貨」
+  if (prefersPickupOnly()) {
+    for (let attempt = 1; ; attempt++) {
+      await throwIfReleased();
+      await markPageErrorIfNotFound(page, "chooseFulfillment").catch(() => false);
+
+      if (attempt > 1) {
+        console.log(`  第 ${attempt} 次：refresh Fulfillment-init 再重試取貨（pickup-only）…`);
+        await hardRefreshFulfillmentInit(page, `pickup-only-retry-#${attempt}`);
+        if (isPickupContactPage(page.url())) return "pickup";
+      }
+
+      const ok = await tryPickupOnce(page, attempt);
+      if (ok) {
+        console.log("  取貨流程成功。");
+        resetFulfillmentRefreshStats();
+        return "pickup";
+      }
+      console.warn(
+        `  取貨第 ${attempt} 次未成功 — pickup-only，唔撳「我希望送貨」，繼續 refresh…`
+      );
+      await sleepCheckingRelease(5_000);
     }
-    console.warn("  pickup credit card訪客取貨失敗；仍嘗試送貨以免卡住。");
-    await startDeliveryFlow(page);
-    return "delivery";
   }
 
-  const pickupAttempts = prefersPickupOnly() ? 5 : 3;
+  const pickupAttempts = 3;
   for (let attempt = 1; attempt <= pickupAttempts; attempt++) {
     if (attempt > 1) {
       console.log(`  第 ${attempt}/${pickupAttempts} 次：refresh Fulfillment-init 再重試取貨…`);
@@ -6704,11 +6782,7 @@ async function chooseFulfillment(page: Page): Promise<"pickup" | "delivery"> {
     console.warn(`  取貨第 ${attempt} 次未成功（會 refresh 成頁再試）。`);
   }
 
-  if (prefersPickupOnly()) {
-    console.warn("  設定為只取貨，但多次失敗；仍嘗試送貨以免卡住。");
-  } else {
-    console.warn("  Fulfillment 已 refresh 重試仍失敗，改用「我希望送貨」。");
-  }
+  console.warn("  Fulfillment 已 refresh 重試仍失敗，改用「我希望送貨」。");
   await startDeliveryFlow(page);
   return "delivery";
 }

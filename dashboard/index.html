@@ -966,6 +966,7 @@
 
     function phaseClass(phase) {
       if (/payment_succeeded|orders_ready|paid/i.test(phase || "")) return "paid";
+      if (/page_error/i.test(phase || "")) return "stuck";
       if (/error|fail|stuck/i.test(phase || "")) return "stuck";
       if (/steps_complete|waiting_for_payment|waiting_user|awaiting_payment/i.test(phase || "")) return "steps";
       if (/waiting_for_stock_at_stores/i.test(phase || "")) return "wait";
@@ -978,6 +979,7 @@
 
     function phaseLabel(phase) {
       const p = String(phase || "");
+      if (/page_error/i.test(p)) return "page error";
       if (/polling_continue|adding_cart/i.test(p)) return "adding cart";
       if (/cart_added/i.test(p)) return "cart added";
       if (/cart_ready/i.test(p)) return "cart ready";
@@ -1019,6 +1021,8 @@
         Boolean(b.card?.orderNumber && String(b.card.orderNumber).trim()) ||
         /payment_succeeded|orders_ready/i.test(phase);
       if (paid) return false;
+      // soft 404／page error：即刻紅閃
+      if (/page_error/i.test(phase)) return true;
       if (/waiting_for_payment|waiting_for_stock_at_stores|steps_complete|waiting_user|awaiting_payment|manual_control|closed|idle|adding_cart|polling_continue/i.test(phase)) {
         return false;
       }
@@ -1163,10 +1167,15 @@
           !stepsFinished &&
           !waitingPayLabel &&
           /polling_continue|adding_cart/i.test(String(b.phase || ""));
+        const pageError =
+          !paid && /page_error/i.test(String(b.phase || ""));
         const stuck =
-          !paid && !stepsFinished && !waitingPayLabel && !addingCart && isTaskStuck(b);
+          pageError ||
+          (!paid && !stepsFinished && !waitingPayLabel && !addingCart && isTaskStuck(b));
         const pc = paid
           ? "paid"
+          : pageError
+            ? "stuck"
           : openedHighlight
             ? "opened-hl"
             : stuck
@@ -1178,6 +1187,8 @@
                   : phaseClass(b.phase);
         const label = paid
           ? phaseLabel("payment_succeeded")
+          : pageError
+            ? "page error"
           : openedHighlight
             ? "browser opened"
             : stuck
