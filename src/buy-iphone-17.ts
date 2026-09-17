@@ -6163,13 +6163,21 @@ async function attemptPickupCheckoutToPayment(
     message: `繼續：我會前來取貨 → ${CONFIG.pickupSearch || "中環"} → 其餘步驟`,
   }).catch(() => {});
 
-  const pickupClicked = await clickPickupOption(page);
-  if (pickupClicked) {
-    console.log("  已揀：我會前來取貨");
+  if (isPickupCreditCardGuest()) {
+    const ready = await ensurePickupClickThenContinueReady(page);
+    if (!ready) {
+      console.warn("  pickup credit card訪客：未能喺 Fulfillment-init 繼續");
+      return false;
+    }
   } else {
-    console.warn("  撳唔到「我會前來取貨」（可能已揀）— 仍試輸入搜尋／揀店");
+    const pickupClicked = await clickPickupOption(page);
+    if (pickupClicked) {
+      console.log("  已揀：我會前來取貨");
+    } else {
+      console.warn("  撳唔到「我會前來取貨」（可能已揀）— 仍試輸入搜尋／揀店");
+    }
+    await sleepCheckingRelease(usesFastPickupContactFill() ? 150 : 400);
   }
-  await sleepCheckingRelease(usesFastPickupContactFill() ? 150 : 400);
 
   const storeOk = await choosePickupStore(page);
   if (!storeOk && !isPickupContactPage(page.url())) {
@@ -6388,6 +6396,94 @@ async function clickPickupOption(page: Page): Promise<boolean> {
   );
 }
 
+/** 撳「我會前來取貨」之後，係咪已經可以繼續（搜尋中環／門市列表） */
+async function canContinuePickupScriptsAfterPickupClick(page: Page): Promise<boolean> {
+  if (isPickupContactPage(page.url())) return true;
+  if (isBillingPage(page.url()) || isReviewPage(page.url())) return true;
+  const search = await findPickupSearchInput(page);
+  if (search) return true;
+  const headingVisible = await page
+    .getByText(/選擇取貨零售店|你附近的所有零售店|城市或地區|郵遞區號/, {
+      exact: false,
+    })
+    .first()
+    .isVisible()
+    .catch(() => false);
+  return Boolean(headingVisible);
+}
+
+/**
+ * pickup credit card訪客模式：
+ * 喺 Fulfillment-init 每 5 秒 refresh，直到撳得「我會前來取貨」
+ * 而且之後可以繼續原本腳本（輸入中環 → 揀店 → 繼續…）。
+ */
+async function ensurePickupClickThenContinueReady(page: Page): Promise<boolean> {
+  const REFRESH_MS = 5_000;
+  const maxRounds = 120; // ~10 分鐘
+
+  console.log(
+    `  pickup credit card訪客：Fulfillment-init 每 ${REFRESH_MS / 1000}s refresh，直至可撳「我會前來取貨」並繼續腳本…`
+  );
+
+  for (let round = 1; round <= maxRounds; round++) {
+    await throwIfReleased();
+
+    if (isPickupContactPage(page.url()) || isBillingPage(page.url()) || isReviewPage(page.url())) {
+      return true;
+    }
+
+    if (!/_s=Fulfillment/i.test(page.url()) || isShop404Url(page.url())) {
+      if (isShop404Url(page.url())) {
+        await recoverFromShop404IfNeeded(page, "[pickup-cc-guest]").catch(() => {});
+      }
+      await gotoFulfillmentInit(page);
+    }
+
+    if (await isFulfillment503(page)) {
+      console.warn(
+        `  Fulfillment-init 503 — ${REFRESH_MS / 1000}s 後 refresh（第 ${round} 輪）…`
+      );
+      await writeStatus({
+        phase: "fulfillment_pickup_wait",
+        message: `Fulfillment 503：${REFRESH_MS / 1000}s 後 refresh（第 ${round} 輪）`,
+        url: page.url(),
+      }).catch(() => {});
+      await sleepCheckingRelease(REFRESH_MS);
+      await softRefreshFulfillmentNow(page);
+      continue;
+    }
+
+    await waitForFulfillmentInitDetailsReady(page).catch(() => false);
+
+    const pickupClicked = await clickPickupOption(page);
+    if (pickupClicked) {
+      console.log("  已揀：我會前來取貨");
+      await sleepCheckingRelease(500);
+    } else {
+      console.warn(`  第 ${round} 輪：撳唔到「我會前來取貨」`);
+    }
+
+    if (await canContinuePickupScriptsAfterPickupClick(page)) {
+      console.log("  ✓ 已可繼續原腳本（搜尋／門市／繼續前往取貨詳情）");
+      return true;
+    }
+
+    console.log(
+      `  未可繼續 → ${REFRESH_MS / 1000}s 後 refresh Fulfillment-init（第 ${round}/${maxRounds} 輪）…`
+    );
+    await writeStatus({
+      phase: "fulfillment_pickup_wait",
+      message: `Fulfillment-init：等可撳取貨並繼續，${REFRESH_MS / 1000}s 後 refresh（第 ${round} 輪）`,
+      url: page.url(),
+    }).catch(() => {});
+    await sleepCheckingRelease(REFRESH_MS);
+    await softRefreshFulfillmentNow(page);
+  }
+
+  console.warn("  pickup credit card訪客：多次 refresh 仍未能繼續原腳本");
+  return false;
+}
+
 async function clickDeliveryOption(page: Page): Promise<boolean> {
   const locators = [
     page.getByRole("radio", { name: /我希望送貨/ }),
@@ -6410,6 +6506,17 @@ async function clickDeliveryOption(page: Page): Promise<boolean> {
 
 async function tryPickupOnce(page: Page, attempt: number): Promise<boolean> {
   console.log(`  取貨嘗試 ${attempt}/3`);
+
+  // pickup credit card訪客：每 5 秒 refresh，直到撳得取貨並可繼續腳本
+  if (isPickupCreditCardGuest()) {
+    const ready = await ensurePickupClickThenContinueReady(page);
+    if (!ready) {
+      console.warn("  「我會前來取貨」後仍未能繼續原腳本。");
+      return false;
+    }
+    return choosePickupStore(page);
+  }
+
   const pickupClicked = await clickPickupOption(page);
   if (!pickupClicked) {
     console.warn("  「我會前來取貨」今次唔可用。");
@@ -6440,6 +6547,19 @@ async function chooseFulfillment(page: Page): Promise<"pickup" | "delivery"> {
 
   if (prefersDeliveryOnly()) {
     console.log("  Dashboard／設定指定：直接走送貨。");
+    await startDeliveryFlow(page);
+    return "delivery";
+  }
+
+  // pickup credit card訪客：內層已每 5s refresh，外層唔使再刷多次
+  if (isPickupCreditCardGuest()) {
+    const ok = await tryPickupOnce(page, 1);
+    if (ok) {
+      console.log("  取貨流程成功。");
+      resetFulfillmentRefreshStats();
+      return "pickup";
+    }
+    console.warn("  pickup credit card訪客取貨失敗；仍嘗試送貨以免卡住。");
     await startDeliveryFlow(page);
     return "delivery";
   }
