@@ -6313,16 +6313,36 @@ async function fillPickupSearchAndWaitHeading(
     return false;
   }
 
-  console.log(
-    fast
-      ? "  已輸入搜尋（快速），檢查門市列表…"
-      : "  已輸入搜尋，等待門市列表載入（出現 6 個選項先繼續）…"
-  );
+  // 套用後等列表載入：門市掣要時間先出現（b225 以前 1.5s 就 refresh 太快）
+  console.log("  已輸入搜尋，等待門市列表載入…");
+  await waitForCheckoutLoadingSettled(page, {
+    timeoutMs: 12_000,
+    stayOn: (u) => /_s=Fulfillment/i.test(u) || /\/shop\/checkout/i.test(u),
+  }).catch(() => {});
+
   await page
     .getByText(/選擇取貨零售店|你附近的所有零售店/, { exact: false })
     .first()
-    .waitFor({ state: "visible", timeout: fast ? 1500 : 30_000 })
+    .waitFor({ state: "visible", timeout: 12_000 })
     .catch(() => {});
+
+  // 輪詢等門市掣出現（最多 ~12s）
+  const storeWaitMs = 12_000;
+  const storeDeadline = Date.now() + storeWaitMs;
+  let lastCount = 0;
+  while (Date.now() < storeDeadline) {
+    await throwIfReleased();
+    if (await recoverFromWrongAppleSearchIfNeeded(page, "[pickup-search-wait]")) {
+      return false;
+    }
+    lastCount = await countVisiblePickupStoreOptions(page);
+    if (lastCount >= 1) {
+      console.log(`  ✓ 搜尋後已見 ${lastCount} 個門市掣`);
+      return true;
+    }
+    await sleepCheckingRelease(400);
+  }
+  console.warn(`  等 ${storeWaitMs / 1000}s 後仍 ${lastCount} 個門市掣`);
   return true;
 }
 
@@ -6823,7 +6843,7 @@ async function ensurePickupClickThenContinueReady(page: Page): Promise<boolean> 
       console.warn(`  第 ${round} 輪：撳唔到「我會前來取貨」`);
     }
 
-    // 一定要搜到門市掣先算「可繼續」——唔好淨係見到搜尋欄就停 refresh
+    // 一定要搜到門市掣先算「可繼續」——套用後會等列表載入
     const searched = await fillPickupSearchAndWaitHeading(page, { fast: true }).catch(
       () => false
     );
@@ -6833,13 +6853,14 @@ async function ensurePickupClickThenContinueReady(page: Page): Promise<boolean> 
         console.log(`  ✓ 已見 ${n} 個門市掣，交俾揀店／繼續腳本`);
         return true;
       }
-      console.warn(`  第 ${round} 輪：搜尋後仍 0 門市掣`);
+      console.warn(`  第 ${round} 輪：等載入後仍 0 門市掣`);
     }
 
+    // 套用後已等過門市載入；之後先補夠節奏再 hard refresh
     const elapsed = Date.now() - roundStarted;
     const waitMore = Math.max(0, REFRESH_MS - elapsed);
     console.log(
-      `  未可繼續 → ${waitMore}ms 後 hard refresh（第 ${round}/${maxRounds} 輪，固定 ${REFRESH_MS / 1000}s）`
+      `  未可繼續 → ${waitMore}ms 後 hard refresh（第 ${round}/${maxRounds} 輪）`
     );
     await writeStatus({
       phase: "fulfillment_pickup_wait",
