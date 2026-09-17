@@ -885,14 +885,13 @@
     function fillForm(cfg) {
       if (!cfg) return;
       // 唔覆寫 quantity / browserCount / fulfillmentPreference，等你自己填
-      for (const key of ["pickupSearch", "saleStartIso", "productPollIntervalMs", "proxy"]) {
+      // proxy：用家手動管（可清空＝本機 IP）；唔好用伺服器舊值填返
+      for (const key of ["pickupSearch", "saleStartIso", "productPollIntervalMs"]) {
         const el = $(key);
         if (!el || cfg[key] == null) continue;
         // 打緊／揀緊呢個欄就唔蓋
         if (document.activeElement === el) continue;
         const next = String(cfg[key] ?? "");
-        // proxy：伺服器空值唔好抹走你已貼嘅內容
-        if (key === "proxy" && !next.trim() && String(el.value || "").trim()) continue;
         el.value = next;
       }
     }
@@ -902,17 +901,20 @@
       const el = $("proxy");
       if (!el) return;
       try {
-        localStorage.setItem(PROXY_LS_KEY, String(el.value || ""));
+        // 允許存空字串＝之後用本機 IP
+        localStorage.setItem(PROXY_LS_KEY, String(el.value ?? ""));
       } catch {
         /* ignore */
       }
     }
     function restoreProxyField() {
       const el = $("proxy");
-      if (!el || String(el.value || "").trim()) return;
+      if (!el) return;
       try {
-        const saved = String(localStorage.getItem(PROXY_LS_KEY) || "");
-        if (saved.trim()) el.value = saved;
+        // null = 從未存過；"" = 用家刻意清空（本機 IP）
+        const saved = localStorage.getItem(PROXY_LS_KEY);
+        if (saved === null) return;
+        el.value = saved;
       } catch {
         /* ignore */
       }
