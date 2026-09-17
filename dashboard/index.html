@@ -1095,7 +1095,7 @@
           "";
         const t404 = b.shop404Timing || b.runtimeStatus?.shop404Timing || null;
         const t404Show = t404
-          ? `404 after ${t404.durationMs ?? "?"}ms (${t404.durationSec ?? "?"}s) from ${t404.fromUrl || "?"}`
+          ? `404 after ${t404.durationMs ?? "?"}ms (${t404.durationSec ?? "?"}s)｜Fulfillment refresh ×${t404.fulfillmentRefreshCount ?? "?"}${t404.fulfillmentRefreshLastKind ? ` (${t404.fulfillmentRefreshLastKind})` : ""} from ${t404.fromUrl || "?"}`
           : "";
         const lastNameShow = c.lastName || "—";
         const firstNameShow = c.firstName || "—";

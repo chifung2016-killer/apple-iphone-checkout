@@ -2356,6 +2356,31 @@ type CheckoutNavMark = {
 
 let lastNon404NavMark: CheckoutNavMark | null = null;
 
+/** 今次喺 Fulfillment-init 已 soft／full refresh 幾多次（撞 404 時寫入 jsonl） */
+let fulfillmentRefreshCount = 0;
+let fulfillmentRefreshFirstAt: string | null = null;
+let fulfillmentRefreshLastAt: string | null = null;
+let fulfillmentRefreshLastKind: "soft" | "full" | null = null;
+
+function resetFulfillmentRefreshStats(): void {
+  fulfillmentRefreshCount = 0;
+  fulfillmentRefreshFirstAt = null;
+  fulfillmentRefreshLastAt = null;
+  fulfillmentRefreshLastKind = null;
+}
+
+function noteFulfillmentRefresh(kind: "soft" | "full"): number {
+  fulfillmentRefreshCount += 1;
+  const at = new Date().toISOString();
+  if (!fulfillmentRefreshFirstAt) fulfillmentRefreshFirstAt = at;
+  fulfillmentRefreshLastAt = at;
+  fulfillmentRefreshLastKind = kind;
+  console.log(
+    `  Fulfillment-init refresh #${fulfillmentRefreshCount}（${kind}）`
+  );
+  return fulfillmentRefreshCount;
+}
+
 function markCheckoutNav(url: string, label?: string): void {
   const u = String(url || "").trim();
   if (!u || isShop404Url(u)) return;
@@ -2368,8 +2393,8 @@ function markCheckoutNav(url: string, label?: string): void {
 }
 
 /**
- * 進入 /shop/404 時記錄：上一頁 URL／時間 → 404 時間同間隔（status + jsonl）。
- * 方便之後對照邊一步最易 404。
+ * 進入 /shop/404 時記錄：上一頁 URL／時間 → 404 時間同間隔，
+ * 以及 Fulfillment-init 已 refresh 幾多次（status + jsonl）。
  */
 async function recordShop404Timing(
   page: Page,
@@ -2383,6 +2408,10 @@ async function recordShop404Timing(
   toAt: string;
   durationMs: number | null;
   durationSec: number | null;
+  fulfillmentRefreshCount: number;
+  fulfillmentRefreshFirstAt: string | null;
+  fulfillmentRefreshLastAt: string | null;
+  fulfillmentRefreshLastKind: "soft" | "full" | null;
 } | null> {
   const toUrl = page.url();
   if (!isShop404Url(toUrl)) return null;
@@ -2399,17 +2428,21 @@ async function recordShop404Timing(
     durationMs,
     durationSec:
       durationMs == null ? null : Math.round(durationMs / 100) / 10,
+    fulfillmentRefreshCount,
+    fulfillmentRefreshFirstAt,
+    fulfillmentRefreshLastAt,
+    fulfillmentRefreshLastKind,
   };
   const durLabel =
     timing.durationMs == null ? "unknown" : `${timing.durationMs}ms (${timing.durationSec}s)`;
   console.warn(
-    `  /shop/404 timing [${context}]: ${durLabel}｜from ${timing.fromUrl || "?"} → ${toUrl}`
+    `  /shop/404 timing [${context}]: ${durLabel}｜Fulfillment refresh ×${timing.fulfillmentRefreshCount}｜from ${timing.fromUrl || "?"} → ${toUrl}`
   );
   await writeStatus({
     phase: "shop_404",
     url: toUrl,
     shop404Timing: timing,
-    message: `shop/404 after ${durLabel} from ${timing.fromUrl || "?"}`,
+    message: `shop/404 after ${durLabel}｜Fulfillment refresh ×${timing.fulfillmentRefreshCount} from ${timing.fromUrl || "?"}`,
   }).catch(() => {});
   await ensureRuntimeDir();
   await fs
@@ -2527,7 +2560,7 @@ async function recoverFromShop404IfNeeded(
   const dur =
     timing?.durationMs == null
       ? ""
-      : `（距上一頁 ${timing.durationMs}ms／${timing.durationSec}s｜${timing.fromUrl || "?"}）`;
+      : `（距上一頁 ${timing.durationMs}ms／${timing.durationSec}s｜Fulfillment refresh ×${timing.fulfillmentRefreshCount}｜${timing.fromUrl || "?"}）`;
   console.log(
     `${prefix}偵測到 /shop/404${dur} → 撳購物袋掣 →「查看購物袋」，再繼續流程`
   );
@@ -2536,7 +2569,7 @@ async function recoverFromShop404IfNeeded(
     url: page.url(),
     shop404Timing: timing || undefined,
     message: timing
-      ? `shop/404 after ${timing.durationMs}ms from ${timing.fromUrl || "?"} → bag`
+      ? `shop/404 after ${timing.durationMs}ms｜Fulfillment refresh ×${timing.fulfillmentRefreshCount} from ${timing.fromUrl || "?"} → bag`
       : "shop/404 → shopping bag → 查看購物袋",
   }).catch(() => {});
 
@@ -4592,7 +4625,9 @@ async function goBackAndSettle(page: Page): Promise<void> {
 async function refreshFulfillmentPage(page: Page): Promise<void> {
   console.log("  等 1 分鐘先 refresh Fulfillment 頁…");
   await sleepCheckingRelease(60_000);
+  noteFulfillmentRefresh("full");
   console.log("  重新整理 Fulfillment 頁…");
+  markCheckoutNav(page.url(), "pre-full-refresh-fulfillment");
   const current = page.url();
   // 盡量留喺／回到 Fulfillment-init 再重試整個取貨流程
   if (/_s=Fulfillment/i.test(current)) {
@@ -4941,6 +4976,7 @@ async function scrollPageToBottom(page: Page): Promise<void> {
 }
 
 async function softRefreshFulfillmentNow(page: Page): Promise<void> {
+  noteFulfillmentRefresh("soft");
   console.log("  即刻 refresh Fulfillment-init（唔等 1 分鐘）…");
   markCheckoutNav(page.url(), "pre-soft-refresh-fulfillment");
   // refresh 後門市要重揀，清已試門市以免立刻冇掣可撳
@@ -5716,6 +5752,7 @@ async function tryPickupOnce(page: Page, attempt: number): Promise<boolean> {
 async function chooseFulfillment(page: Page): Promise<"pickup" | "delivery"> {
   console.log("步驟：揀取貨或送貨");
   usedPickupStoreKeys.clear();
+  resetFulfillmentRefreshStats();
   await page.waitForTimeout(prefersPickupOnly() ? 200 : 800);
 
   if (await isSignInPage(page)) {
@@ -5749,6 +5786,7 @@ async function chooseFulfillment(page: Page): Promise<"pickup" | "delivery"> {
     const ok = await tryPickupOnce(page, attempt);
     if (ok) {
       console.log("  取貨流程成功。");
+      resetFulfillmentRefreshStats();
       return "pickup";
     }
     console.warn(`  取貨第 ${attempt} 次未成功（會 refresh 成頁再試）。`);
