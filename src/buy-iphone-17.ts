@@ -1959,7 +1959,7 @@ async function selectIphone17OptionsSmooth(page: Page): Promise<void> {
         `input[value="${storageAutom}"]`,
         `label[for*="${storageAutom}" i]`,
       ],
-      [new RegExp(storage.replace(/\s+/g, "\\s*"), "i"), /256\s*GB/i]
+      [new RegExp(storage.replace(/\s+/g, "\\s*"), "i")]
     ).catch((err) => console.warn(`  容量：${err instanceof Error ? err.message : String(err)}`));
     await sleepCheckingRelease(120);
   }

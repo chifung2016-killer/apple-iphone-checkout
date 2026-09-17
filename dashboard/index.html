@@ -492,6 +492,10 @@
               <button type="button" class="btn-ghost" data-preset="iphone18promax_glacier">iPhone 18 Pro Max · 256GB · 冰川色</button>
               <button type="button" class="btn-ghost" data-preset="iphone18promax_silver">iPhone 18 Pro Max · 256GB · 銀色</button>
               <button type="button" class="btn-ghost" data-preset="iphone18promax_black">iPhone 18 Pro Max · 256GB · 黑色</button>
+              <button type="button" class="btn-ghost" data-preset="iphone18promax_512_burgundy">iPhone 18 Pro Max · 512GB · 布根地紅</button>
+              <button type="button" class="btn-ghost" data-preset="iphone18promax_512_glacier">iPhone 18 Pro Max · 512GB · 冰川色</button>
+              <button type="button" class="btn-ghost" data-preset="iphone18promax_512_silver">iPhone 18 Pro Max · 512GB · 銀色</button>
+              <button type="button" class="btn-ghost" data-preset="iphone18promax_512_black">iPhone 18 Pro Max · 512GB · 黑色</button>
             </div>
             <p class="hint" id="presetHint">請揀一個產品（會自動設定網址、型號、顏色、容量）。</p>
           </div>
@@ -665,8 +669,20 @@
 
     const URL_PM_256_BURGUNDY =
       "https://www.apple.com/hk-zh/shop/buy-iphone/iphone-18-pro/6.9-%E5%90%8B%E9%A1%AF%E7%A4%BA%E5%99%A8-256gb-%E5%B8%83%E6%A0%B9%E5%9C%B0%E7%B4%85%E8%89%B2";
+    const URL_PM_512_BURGUNDY = URL_PM_256_BURGUNDY.replace("256gb", "512gb");
 
     const SALE_START_IPHONE18 = "2026-09-12T20:00:00+08:00";
+
+    const COLOR_URL_SUFFIX = {
+      burgundy: "%E5%B8%83%E6%A0%B9%E5%9C%B0%E7%B4%85%E8%89%B2",
+      glacier: "%E5%86%B0%E5%B7%9D%E8%89%B2",
+      silver: "%E9%8A%80%E8%89%B2",
+      black: "%E9%BB%91%E8%89%B2",
+    };
+
+    function proMaxUrl(baseBurgundyUrl, colorKey) {
+      return baseBurgundyUrl.replace(COLOR_URL_SUFFIX.burgundy, COLOR_URL_SUFFIX[colorKey]);
+    }
 
     const PRODUCT_PRESETS = {
       iphone18promax_burgundy: {
@@ -678,10 +694,7 @@
         saleStartIso: SALE_START_IPHONE18,
       },
       iphone18promax_glacier: {
-        buyUrl: URL_PM_256_BURGUNDY.replace(
-          "%E5%B8%83%E6%A0%B9%E5%9C%B0%E7%B4%85%E8%89%B2",
-          "%E5%86%B0%E5%B7%9D%E8%89%B2"
-        ),
+        buyUrl: proMaxUrl(URL_PM_256_BURGUNDY, "glacier"),
         model: "iPhone 18 Pro Max",
         color: "冰川色",
         storage: "256GB",
@@ -689,10 +702,7 @@
         saleStartIso: SALE_START_IPHONE18,
       },
       iphone18promax_silver: {
-        buyUrl: URL_PM_256_BURGUNDY.replace(
-          "%E5%B8%83%E6%A0%B9%E5%9C%B0%E7%B4%85%E8%89%B2",
-          "%E9%8A%80%E8%89%B2"
-        ),
+        buyUrl: proMaxUrl(URL_PM_256_BURGUNDY, "silver"),
         model: "iPhone 18 Pro Max",
         color: "銀色",
         storage: "256GB",
@@ -700,14 +710,43 @@
         saleStartIso: SALE_START_IPHONE18,
       },
       iphone18promax_black: {
-        buyUrl: URL_PM_256_BURGUNDY.replace(
-          "%E5%B8%83%E6%A0%B9%E5%9C%B0%E7%B4%85%E8%89%B2",
-          "%E9%BB%91%E8%89%B2"
-        ),
+        buyUrl: proMaxUrl(URL_PM_256_BURGUNDY, "black"),
         model: "iPhone 18 Pro Max",
         color: "黑色",
         storage: "256GB",
         label: "iPhone 18 Pro Max · 256GB · 黑色",
+        saleStartIso: SALE_START_IPHONE18,
+      },
+      iphone18promax_512_burgundy: {
+        buyUrl: URL_PM_512_BURGUNDY,
+        model: "iPhone 18 Pro Max",
+        color: "布根地紅色",
+        storage: "512GB",
+        label: "iPhone 18 Pro Max · 512GB · 布根地紅",
+        saleStartIso: SALE_START_IPHONE18,
+      },
+      iphone18promax_512_glacier: {
+        buyUrl: proMaxUrl(URL_PM_512_BURGUNDY, "glacier"),
+        model: "iPhone 18 Pro Max",
+        color: "冰川色",
+        storage: "512GB",
+        label: "iPhone 18 Pro Max · 512GB · 冰川色",
+        saleStartIso: SALE_START_IPHONE18,
+      },
+      iphone18promax_512_silver: {
+        buyUrl: proMaxUrl(URL_PM_512_BURGUNDY, "silver"),
+        model: "iPhone 18 Pro Max",
+        color: "銀色",
+        storage: "512GB",
+        label: "iPhone 18 Pro Max · 512GB · 銀色",
+        saleStartIso: SALE_START_IPHONE18,
+      },
+      iphone18promax_512_black: {
+        buyUrl: proMaxUrl(URL_PM_512_BURGUNDY, "black"),
+        model: "iPhone 18 Pro Max",
+        color: "黑色",
+        storage: "512GB",
+        label: "iPhone 18 Pro Max · 512GB · 黑色",
         saleStartIso: SALE_START_IPHONE18,
       },
     };
