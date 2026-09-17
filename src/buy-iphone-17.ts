@@ -5354,19 +5354,49 @@ async function waitForMatchingStockResume(opts?: {
   }
 }
 
-async function gotoFulfillmentInit(page: Page): Promise<void> {
-  const current = page.url();
-  let target = "";
+function fulfillmentInitUrlFrom(current: string): string {
   if (/\/shop\/checkout/i.test(current)) {
     if (/[?&]_s=/i.test(current)) {
-      target = current.replace(/([?&]_s=)[^&]*/i, "$1Fulfillment-init");
-    } else {
-      target = `${current.split("#")[0]}${current.includes("?") ? "&" : "?"}_s=Fulfillment-init`;
+      return current.replace(/([?&]_s=)[^&]*/i, "$1Fulfillment-init");
     }
-  } else {
-    const host = current.match(/^(https?:\/\/[^/]+)/i)?.[1] || "https://secure6.store.apple.com";
-    target = `${host}/hk-zh/shop/checkout?_s=Fulfillment-init`;
+    return `${current.split("#")[0]}${current.includes("?") ? "&" : "?"}_s=Fulfillment-init`;
   }
+  const host =
+    current.match(/^(https?:\/\/[^/]+)/i)?.[1] || "https://secure6.store.apple.com";
+  return `${host}/hk-zh/shop/checkout?_s=Fulfillment-init`;
+}
+
+/** 頁面／HTTP 係咪 503 Service Temporarily Unavailable */
+async function isFulfillment503(
+  page: Page,
+  response?: { status?: () => number } | null
+): Promise<boolean> {
+  try {
+    if (response && typeof response.status === "function" && response.status() === 503) {
+      return true;
+    }
+  } catch {
+    /* ignore */
+  }
+  try {
+    const sniff = await page.evaluate(() => {
+      const title = document.title || "";
+      const body = (document.body?.innerText || "").slice(0, 3000);
+      const h1 = document.querySelector("h1")?.textContent || "";
+      return `${title}\n${h1}\n${body}`;
+    });
+    return (
+      /503\s*Service\s*Temporarily\s*Unavailable/i.test(sniff) ||
+      (/Service Temporarily Unavailable/i.test(sniff) && /\b503\b/.test(sniff))
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function gotoFulfillmentInit(page: Page): Promise<void> {
+  const current = page.url();
+  const target = fulfillmentInitUrlFrom(current);
   console.log(`  前往 Fulfillment-init：${target}`);
   markCheckoutNav(target || current, "gotoFulfillmentInit");
   if (target === current || /_s=Fulfillment-init/i.test(current)) {
@@ -5381,6 +5411,67 @@ async function gotoFulfillmentInit(page: Page): Promise<void> {
     );
   }
   await settleAfterNavigation(page);
+}
+
+/**
+ * Monitor+buying：refresh Fulfillment-init；若 503 就隔 6 秒再 refresh，直到頁面可用再交俾腳本。
+ */
+async function reloadFulfillmentInitUntilReady(page: Page): Promise<void> {
+  const RETRY_503_MS = 6_000;
+  for (let n = 1; ; n++) {
+    await throwIfReleased();
+    const current = page.url();
+    const target = fulfillmentInitUrlFrom(current);
+    markCheckoutNav(target || current, "stockResumeRefresh");
+    console.log(`  refresh Fulfillment-init #${n}：${target}`);
+
+    let response: { status?: () => number } | null = null;
+    if (target === current || /_s=Fulfillment-init/i.test(current)) {
+      response = await withReleaseCheck(
+        page
+          .reload({ waitUntil: "domcontentloaded", timeout: 60000 })
+          .catch(() => null)
+      );
+    } else {
+      response = await withReleaseCheck(
+        page
+          .goto(target, { waitUntil: "domcontentloaded", timeout: 60000 })
+          .catch(async () => {
+            return page.reload({ waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => null);
+          })
+      );
+    }
+
+    if (await isFulfillment503(page, response)) {
+      console.warn(
+        `  Fulfillment-init 503 Service Temporarily Unavailable — ${RETRY_503_MS / 1000}s 後再 refresh…`
+      );
+      await writeStatus({
+        phase: "resuming_after_stock",
+        message: `Fulfillment-init 503：${n} 次，${RETRY_503_MS / 1000}s 後再 refresh`,
+      }).catch(() => {});
+      await sleepCheckingRelease(RETRY_503_MS);
+      continue;
+    }
+
+    await settleAfterNavigation(page);
+
+    if (isShop404Url(page.url()) || !/\/shop\/checkout/i.test(page.url())) {
+      console.warn("  refresh 後唔喺 checkout — 拉返 Fulfillment-init 再試…");
+      await gotoFulfillmentInit(page);
+      if (await isFulfillment503(page)) {
+        await writeStatus({
+          phase: "resuming_after_stock",
+          message: `Fulfillment-init 503（返頁後）：${RETRY_503_MS / 1000}s 後再 refresh`,
+        }).catch(() => {});
+        await sleepCheckingRelease(RETRY_503_MS);
+        continue;
+      }
+    }
+
+    console.log("  Fulfillment-init 已可用，繼續腳本…");
+    return;
+  }
 }
 
 /** 輸入「中環」後，等到「選擇取貨零售店」下面出現 6 個選項，再雙重確認 */
@@ -5718,8 +5809,9 @@ async function attemptFullAddCartToPayment(
 
 /**
  * Monitor+buying：停喺 Fulfillment-init 待命。
- * 監察到同型號＋同色＋同容量有貨 → refresh 一次 Fulfillment-init → 繼續取貨／聯絡／付款。
- * 若 refresh 後落單失敗，先再試完整加購一次。
+ * 監察到同型號＋同色＋同容量有貨 → 每 5 秒 refresh Fulfillment-init → 繼續取貨／聯絡／付款。
+ * 若頁面 503 → 隔 6 秒再 refresh，直到可用再跑腳本。
+ * 若 refresh 後落單失敗，先再試完整加購一次；之後繼續每 5 秒 refresh。
  */
 async function runMonitorHoldBuyLoop(
   page: Page,
@@ -5729,17 +5821,19 @@ async function runMonitorHoldBuyLoop(
 ): Promise<void> {
   /** 連續幾耐冇「新」嘅匹配通知，就當呢波完 */
   const STOCK_IDLE_MS = 8_000;
+  /** 有貨期間：正常 refresh 間隔 */
+  const STOCK_REFRESH_MS = 5_000;
   let lastConsumedAt = 0;
 
   console.log(
-    `${tag} Monitor+buying hold：等 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage} 有貨 → refresh Fulfillment-init → 繼續加購`
+    `${tag} Monitor+buying hold：等 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage} 有貨 → 每 ${STOCK_REFRESH_MS / 1000}s refresh Fulfillment-init（503→6s）→ 繼續加購`
   );
 
   while (true) {
     await ensureFulfillmentInitStandby(page);
     await writeStatus({
       phase: "waiting_for_stock_at_stores",
-      message: `待命 Fulfillment-init：等 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage} 有貨再 refresh`,
+      message: `待命 Fulfillment-init：等 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage} 有貨再每 ${STOCK_REFRESH_MS / 1000}s refresh`,
       stuck: false,
       stuckSince: null,
     });
@@ -5756,70 +5850,80 @@ async function runMonitorHoldBuyLoop(
       const matchLabel = `${CONFIG.model}／${CONFIG.color}／${CONFIG.storage}`;
 
       console.log(
-        `  監察匹配有貨 — ${matchLabel}：等 1 秒 → refresh Fulfillment-init 一次 → 繼續剩餘步驟…`
+        `  監察匹配有貨 — ${matchLabel}：每 ${STOCK_REFRESH_MS / 1000}s refresh Fulfillment-init（503 則 6s）→ 繼續腳本…`
       );
-      await writeStatus({
-        phase: "resuming_after_stock",
-        message: `有貨（${matchLabel}）：refresh Fulfillment-init 後繼續加購`,
-      });
-      await sleepCheckingRelease(1000);
 
-      // 只 refresh 而家呢個 Fulfillment-init 頁，唔跳去產品頁
-      markCheckoutNav(page.url(), "stockResumeRefresh");
-      await withReleaseCheck(
-        page.reload({ waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {})
-      );
-      await settleAfterNavigation(page);
+      // 有貨波：持續 refresh，直到到付款頁或冇新匹配通知
+      for (;;) {
+        await writeStatus({
+          phase: "resuming_after_stock",
+          message: `有貨（${matchLabel}）：每 ${STOCK_REFRESH_MS / 1000}s refresh Fulfillment-init（503→6s）`,
+        });
 
-      // 若 refresh 後被踢離 checkout，先拉返 Fulfillment-init
-      if (!/\/shop\/checkout/i.test(page.url()) || isShop404Url(page.url())) {
-        console.warn("  refresh 後唔喺 checkout — 嘗試返 Fulfillment-init…");
-        await gotoFulfillmentInit(page);
-      } else if (!/_s=Fulfillment-init/i.test(page.url())) {
-        // 可能已經去咗下一步；若仍喺 checkout 就跟住做
-        console.log(`  refresh 後 URL：${page.url()}`);
-      } else {
-        console.log("  已 refresh Fulfillment-init，繼續取貨／聯絡／付款…");
-      }
+        await reloadFulfillmentInitUntilReady(page);
 
-      try {
-        let reachedPay = await attemptPickupCheckoutToPayment(
-          page,
-          identity,
-          tag,
-          session
-        );
-        if (!reachedPay) {
-          console.warn(
-            `${tag} refresh 後直接繼續失敗 — 改試完整加購（產品頁→入袋→結帳）…`
-          );
-          reachedPay = await attemptFullAddCartToPayment(
+        try {
+          let reachedPay = await attemptPickupCheckoutToPayment(
             page,
             identity,
             tag,
             session
           );
+          if (!reachedPay) {
+            console.warn(
+              `${tag} refresh 後直接繼續失敗 — 改試完整加購（產品頁→入袋→結帳）…`
+            );
+            reachedPay = await attemptFullAddCartToPayment(
+              page,
+              identity,
+              tag,
+              session
+            );
+          }
+          if (reachedPay) {
+            console.log(`${tag} 已到付款頁 — 結束 monitor hold loop`);
+            return;
+          }
+        } catch (err) {
+          if (err instanceof ReleaseError) throw err;
+          console.warn(
+            `${tag} 今次加購嘗試失敗：`,
+            err instanceof Error ? err.message : String(err)
+          );
         }
-        if (reachedPay) {
-          console.log(`${tag} 已到付款頁 — 結束 monitor hold loop`);
-          return;
-        }
-      } catch (err) {
-        if (err instanceof ReleaseError) throw err;
-        console.warn(
-          `${tag} 今次加購嘗試失敗：`,
-          err instanceof Error ? err.message : String(err)
-        );
-      }
 
-      pending = await waitForMatchingStockResume({
-        afterMs: lastConsumedAt,
-        timeoutMs: STOCK_IDLE_MS,
-      });
-      if (!pending) {
+        console.log(
+          `  未到付款頁 — ${STOCK_REFRESH_MS / 1000}s 後再 refresh Fulfillment-init…`
+        );
+        const nextSoon = await waitForMatchingStockResume({
+          afterMs: lastConsumedAt,
+          timeoutMs: STOCK_REFRESH_MS,
+        });
+        if (nextSoon) {
+          lastConsumedAt = nextSoon.atMs;
+          continue;
+        }
+
+        // 5s 內冇新 flag：若最近仍有匹配庫存訊號，繼續 refresh；否則再等 idle 窗口
+        const still = await readStockResumePayload();
+        const stillMatch =
+          still &&
+          still.skus.some((s) => stockSkuMatchesCheckout(s)) &&
+          Date.now() - still.atMs < STOCK_IDLE_MS;
+        if (stillMatch) continue;
+
+        pending = await waitForMatchingStockResume({
+          afterMs: lastConsumedAt,
+          timeoutMs: STOCK_IDLE_MS,
+        });
+        if (pending) {
+          lastConsumedAt = pending.atMs;
+          continue;
+        }
         console.log(
           `  已 ${STOCK_IDLE_MS / 1000}s 冇新嘅 ${matchLabel} 通知 → 返 Fulfillment-init 待命`
         );
+        break;
       }
     }
   }

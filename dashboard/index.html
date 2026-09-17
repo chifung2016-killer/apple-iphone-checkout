@@ -609,7 +609,7 @@
           </div>
           <p class="hint" id="monitorHint" style="margin-top:10px">
             <b>Start monitor</b>：Telegram 即時監察 iPhone 庫存／可買數量（撳一次變 Stop monitor）。
-            <b>Start monitor+buying</b>：預熱停喺 Fulfillment-init。監察到<strong>同型號＋同色＋同容量</strong>有貨 → 等 1 秒 → <strong>refresh 一次 Fulfillment-init</strong> → 繼續取貨／聯絡／付款；失敗先改完整加購。冇新通知就返 Fulfillment-init 待命。
+            <b>Start monitor+buying</b>：預熱停喺 Fulfillment-init。監察到<strong>同型號＋同色＋同容量</strong>有貨 → <strong>每 5 秒 refresh Fulfillment-init</strong> → 繼續取貨／聯絡／付款；若頁面 <strong>503</strong> 則隔 <strong>6 秒</strong>再 refresh 直到可用。失敗先改完整加購，之後繼續每 5 秒 refresh。冇新通知就返 Fulfillment-init 待命。
           </p>
           <div class="meta" id="monitorMeta" style="margin-top:8px">
             <span>Monitor: <b id="monitorState">off</b></span>

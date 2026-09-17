@@ -94,7 +94,8 @@ export const MONITOR_CONFIG = {
    * Dashboard「Start monitor+buying」會設 MONITOR_AUTO_CHECKOUT=1。
    * 而家流程：Dashboard 先開預熱 pickup task 停喺 Fulfillment-init；
    * 有貨時寫 stock-resume（含 model／color／storage），預熱頁只跟進同型號同色同容量，
-   * 1 秒後 refresh 一次 Fulfillment-init 再繼續加購；冇新通知就返待命。
+   * 每 5 秒 refresh Fulfillment-init 再繼續加購；若 503 則隔 6 秒再 refresh 直到可用；
+   * 冇新通知就返待命。
    */
   autoCheckout: {
     /** true = 偵測到有貨就自動開 headed 購買流程 */

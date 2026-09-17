@@ -668,12 +668,12 @@ async function maybeResumeHeldCheckoutBrowsers(
       }
       if (wasIdle) {
         console.log(
-          "  → 已寫 stock-resume-all.flag：通知預熱頁（同色同容量）refresh Fulfillment-init 落單"
+          "  → 已寫 stock-resume-all.flag：通知預熱頁（同色同容量）每 5s refresh Fulfillment-init 落單"
         );
         await notifyTelegram({
           title: "有貨 — 通知預熱瀏覽器加購",
           message: [
-            "已通知 Fulfillment-init 待命 task：1 秒後 refresh 一次，再繼續加購",
+            "已通知 Fulfillment-init 待命 task：每 5 秒 refresh（503 則 6 秒），再繼續加購",
             "（只會跟進同型號＋同色＋同容量）",
             ...available.map(
               (r) =>
