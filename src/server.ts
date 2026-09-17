@@ -53,6 +53,8 @@ const RUNTIME_CONFIG = path.join(ROOT, "runtime-config.json");
 const ORDERS_FILE = path.join(ROOT, "order-summary.json");
 const CONTINUE_ALL_FLAG = path.join(ROOT, "dashboard-continue.flag");
 const PROXY_BLACKLIST_FILE = path.join(RUNTIME_DIR, "proxy-blacklist.json");
+/** 每個 Proxy / IP 最多同時／累計分配畀幾多個 browser */
+const PROXY_BROWSERS_PER_IP = 5;
 const GMAIL_ACCOUNTS_ENC = path.join(RUNTIME_DIR, "gmail-accounts.enc");
 const GMAIL_ACCOUNTS_LEGACY = path.join(RUNTIME_DIR, "gmail-accounts-saved.txt");
 const ADD_ORDER_KEY = path.join(RUNTIME_DIR, ".add-order-key");
@@ -810,25 +812,35 @@ async function blacklistProxy(proxy: string, reason: string): Promise<void> {
   console.log(`[proxy] 已加入黑名單（之後唔再用）：${proxy}｜${reason}`);
 }
 
-/** 每個新 task 隨機揀一個未禁用、盡量未用緊嘅 proxy */
+/** 每個 Proxy / IP 用滿 PROXY_BROWSERS_PER_IP 個 browser 先換下一個；唔超額重複 */
 async function pickProxyForNewTask(poolRaw: unknown): Promise<string> {
   const pool = parseProxyPool(poolRaw);
   if (!pool.length) return "";
   const banned = await loadProxyBlacklist();
-  const inUse = new Set<string>();
+  const usage = new Map<string, number>();
+
   for (const s of sessions.values()) {
-    if (!s.running) continue;
-    const p = normalizeProxyKey(String(s.config?.proxy || ""));
-    if (p) inUse.add(p);
+    const key = normalizeProxyKey(String(s.config?.proxy || ""));
+    if (!key) continue;
+    usage.set(key, (usage.get(key) || 0) + 1);
   }
-  const available = pool.filter((p) => !banned.has(normalizeProxyKey(p)));
-  const preferred = available.filter((p) => !inUse.has(normalizeProxyKey(p)));
-  const candidates = preferred.length ? preferred : available;
-  if (!candidates.length) {
-    console.warn("[proxy] 池入面可用 proxy 已用盡／全被禁用，呢個 task 改用本機 IP");
-    return "";
+
+  // 跟用戶填寫順序：一條用滿 5 個 browser 先用下一條
+  for (const p of pool) {
+    const key = normalizeProxyKey(p);
+    if (!key || banned.has(key)) continue;
+    const count = usage.get(key) || 0;
+    if (count >= PROXY_BROWSERS_PER_IP) continue;
+    console.log(
+      `[proxy] 選用 ${p}（${count + 1}/${PROXY_BROWSERS_PER_IP}；同一條最多 ${PROXY_BROWSERS_PER_IP} 個 browser）`
+    );
+    return p;
   }
-  return candidates[Math.floor(Math.random() * candidates.length)]!;
+
+  console.warn(
+    `[proxy] 每條 proxy 已用滿 ${PROXY_BROWSERS_PER_IP} 個 browser／全被禁用，呢個 task 改用本機 IP`
+  );
+  return "";
 }
 
 /** 由 Opened browsers 移除卡片（保留 order-*.json 畀 Order summary） */
@@ -1052,7 +1064,7 @@ async function spawnOneBrowser(
     ...cleanConfig,
     browserCount: 1,
   } as Record<string, unknown> & { browserCount: number };
-  // 多個 proxy：每個新 task 隨機揀一個（失敗會入黑名單，之後唔再用）
+  // 多個 proxy：每條最多分配畀 5 個 browser，用滿先換下一條（唔隨機重複）
   const assignedProxy = await pickProxyForNewTask(cleanConfig.proxy);
   sessionConfig.proxy = assignedProxy;
   if (assignedProxy) {
