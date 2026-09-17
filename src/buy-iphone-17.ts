@@ -2,8 +2,9 @@
  * Apple 香港官網 iPhone 購買輔助腳本（headed browser）。
  *
  * 預設：iPhone 18 Pro Max / 256GB / 布根地紅色
- * 付款頁：Dashboard 加密信用卡池會 autofill 卡號／有效期／CVV 並撳「檢查你的訂單」；
- * 最終「下訂單／確認付款」仍要人手（或 Review 流程視 Delivery method）。
+ * 付款頁：Dashboard 加密信用卡池會 autofill 卡號／有效期／CVV，
+ * 撳「檢查你的訂單」後喺 Review 自動撳「立即提交訂單」。
+ * Apple Pay 模式仍要人手／裝置確認。
  *
  * 落單成功後撳 Enter，會輸出訂單編號同送貨／取貨資料，並寫入 order-summary.json。
  *
@@ -659,7 +660,18 @@ const PAYMENT_URL =
 const CARD_FIELD_RE =
   /card\s*number|信用卡|卡號|cvv|cvc|cid|安全碼|有效期|expiry|expiration/i;
 
-const PLACE_ORDER_RE = /下訂單|立即下單|確認付款|Place Your Order|Place Order/i;
+const PLACE_ORDER_RE =
+  /立即提交訂單|提交訂單|下訂單|立即下單|確認付款|Place Your Order|Place Order|Submit Order/i;
+const PLACE_ORDER_NEEDLES = [
+  "立即提交訂單",
+  "提交訂單",
+  "下訂單",
+  "立即下單",
+  "確認付款",
+  "Place Your Order",
+  "Place Order",
+  "Submit Order",
+];
 
 class StepError extends Error {
   constructor(step: string, message: string) {
@@ -7070,13 +7082,154 @@ async function autofillCardThenCheckOrder(
     await markAssignedCardRejected(card, "Billing 頁顯示拒單／錯誤");
     return;
   }
+  if (!isReviewPage(page.url())) {
+    await withReleaseCheck(
+      page
+        .waitForURL((url) => isReviewPage(url.toString()), { timeout: 12_000 })
+        .catch(() => {})
+    );
+  }
   if (isReviewPage(page.url())) {
-    console.log("  已到 Review（信用卡 autofill + 檢查你的訂單）");
+    console.log("  已到 Review（信用卡 autofill）→ 自動撳「立即提交訂單」…");
+    await completeCreditCardReviewSubmit(page, session, card);
     return;
   }
   if (!checked) {
     console.warn("  「檢查你的訂單」未成功，稍後人手／外層會再試");
   }
+}
+
+/** Credit cards 池：Review 頁撳「立即提交訂單」完成落單 */
+async function clickSubmitOrderOnReview(page: Page): Promise<boolean> {
+  console.log(`步驟：Review「立即提交訂單」｜${page.url()}`);
+  if (!isReviewPage(page.url())) {
+    await withReleaseCheck(
+      page
+        .waitForURL((url) => isReviewPage(url.toString()), { timeout: 10_000 })
+        .catch(() => {})
+    );
+  }
+  if (!isReviewPage(page.url())) {
+    console.warn(`  未喺 Review，跳過提交訂單：${page.url()}`);
+    return false;
+  }
+
+  await scrollPageToBottom(page).catch(() => {});
+  await sleepCheckingRelease(400);
+
+  const deadline = Date.now() + 45_000;
+  let clicks = 0;
+  while (Date.now() < deadline) {
+    await throwIfReleased();
+    if (!isReviewPage(page.url())) {
+      console.log(`  已離開 Review → ${page.url()}`);
+      return true;
+    }
+    if (CONFIRM_URL.test(page.url())) return true;
+
+    let hit = await clickCheckoutButtonByDomText(page, PLACE_ORDER_NEEDLES, {
+      allowDisabled: false,
+    });
+    if (!hit) {
+      const locs = [
+        page.getByRole("button", { name: PLACE_ORDER_RE }),
+        page.getByRole("link", { name: PLACE_ORDER_RE }),
+        page.locator(
+          'button:has-text("立即提交訂單"), a:has-text("立即提交訂單"), button:has-text("提交訂單"), button:has-text("下訂單")'
+        ),
+        page.locator(
+          '[data-autom*="placeOrder" i], [data-autom*="place-order" i], #rs-checkout-continue-button-bottom, .rs-checkout-continuebutton button'
+        ),
+      ];
+      for (const loc of locs) {
+        const el = loc.first();
+        if ((await el.count().catch(() => 0)) === 0) continue;
+        hit = await forceClickLocator(el, "立即提交訂單", clicks + 1);
+        if (hit) break;
+      }
+    }
+
+    if (!hit) {
+      console.warn("  今輪揾唔到「立即提交訂單」，稍後再試…");
+      await sleepCheckingRelease(600);
+      continue;
+    }
+
+    clicks += 1;
+    console.log(`  已撳「立即提交訂單」第 ${clicks} 次 — 等 loading／跳頁…`);
+    await waitForCheckoutLoadingSettled(page, {
+      timeoutMs: 20_000,
+      stayOn: (url) => isReviewPage(url) && !CONFIRM_URL.test(url),
+    }).catch(() => {});
+
+    await withReleaseCheck(
+      page
+        .waitForURL(
+          (url) => !isReviewPage(url.toString()) || CONFIRM_URL.test(url.toString()),
+          { timeout: 8_000 }
+        )
+        .catch(() => {})
+    );
+
+    if (!isReviewPage(page.url()) || CONFIRM_URL.test(page.url())) {
+      console.log(`  提交後頁面：${page.url()}`);
+      return true;
+    }
+    if (await detectBillingCardDecline(page)) {
+      console.warn("  Review／提交後偵測到拒單文案");
+      return false;
+    }
+  }
+
+  console.warn(`  Review 仍未提交成功（已撳 ${clicks} 次）：${page.url()}`);
+  return clicks > 0 && !isReviewPage(page.url());
+}
+
+async function completeCreditCardReviewSubmit(
+  page: Page,
+  session?: BrowserSession,
+  card?: VaultCard | null
+): Promise<void> {
+  const assigned =
+    card ||
+    (await loadAssignedCheckoutCard(
+      CHECKOUT_CARD_ASSIGN_PATH,
+      CHECKOUT_CARD_KEY_PATH
+    ).catch(() => null));
+
+  const ok = await clickSubmitOrderOnReview(page);
+  if (await detectBillingCardDecline(page)) {
+    await markAssignedCardRejected(assigned, "Review／提交訂單拒單");
+    return;
+  }
+  if (!ok && isReviewPage(page.url())) {
+    console.warn("  「立即提交訂單」未成功離開 Review");
+    return;
+  }
+
+  // 等確認頁／訂單編號短暫出現
+  await settleDom(page, 400);
+  await withReleaseCheck(
+    page
+      .waitForURL((url) => CONFIRM_URL.test(url.toString()), { timeout: 15_000 })
+      .catch(() => {})
+  );
+
+  if (session) {
+    await writeStatus({
+      phase: CONFIRM_URL.test(page.url()) ? "orders_ready" : "steps_complete",
+      message: CONFIRM_URL.test(page.url())
+        ? "已撳立即提交訂單 → 確認頁"
+        : "已撳立即提交訂單",
+      card: cardFieldsFromSession(session, {
+        url: page.url(),
+        cardNumber: assigned?.number || session.capturedCardNumber,
+      }),
+    }).catch(() => {});
+  }
+  console.log(
+    `  Credit card 流程：已處理「立即提交訂單」｜而家 ${page.url()}`
+  );
 }
 
 async function selectCreditOrDebitCard(page: Page): Promise<boolean> {
@@ -8557,6 +8710,17 @@ async function fillBillingAddressFields(
     await completeDeliveryApplePayReview(page, opts?.session);
     return;
   }
+  if (isReviewPage(page.url())) {
+    const assigned = await loadAssignedCheckoutCard(
+      CHECKOUT_CARD_ASSIGN_PATH,
+      CHECKOUT_CARD_KEY_PATH
+    ).catch(() => null);
+    if (assigned) {
+      console.log("步驟：已喺 Review — Credit cards 池 →「立即提交訂單」");
+      await completeCreditCardReviewSubmit(page, opts?.session, assigned);
+      return;
+    }
+  }
 
   // delivery／pickup applepay訪客／Apple 帳戶 apple pay：Apple Pay → 檢查訂單 → Review 繼續
   if (selectsApplePayAtBilling()) {
@@ -9120,6 +9284,17 @@ async function fillShippingAndGoToPayment(
       });
     }
     return;
+  }
+  if (isReviewPage(page.url())) {
+    const assigned = await loadAssignedCheckoutCard(
+      CHECKOUT_CARD_ASSIGN_PATH,
+      CHECKOUT_CARD_KEY_PATH
+    ).catch(() => null);
+    if (assigned) {
+      console.log(`${tag} 已喺 Review，Credit cards →「立即提交訂單」`);
+      await completeCreditCardReviewSubmit(page, session, assigned);
+      return;
+    }
   }
 
   if (await isOnPaymentStep(page) || isBillingPage(page.url())) {
@@ -10762,10 +10937,24 @@ async function main(): Promise<void> {
             await runCheckoutToPayment(session);
             const onBilling = isBillingPage(session.page.url());
             const onReview = isReviewPage(session.page.url());
+            const assignedCard = await loadAssignedCheckoutCard(
+              CHECKOUT_CARD_ASSIGN_PATH,
+              CHECKOUT_CARD_KEY_PATH
+            ).catch(() => null);
             if (onReview && selectsApplePayAtBilling()) {
               await completeDeliveryApplePayReview(session.page, session).catch((err) => {
                 console.warn(
                   `${session.tag} Review CTA：${err instanceof Error ? err.message : String(err)}`
+                );
+              });
+            } else if (onReview && assignedCard) {
+              await completeCreditCardReviewSubmit(
+                session.page,
+                session,
+                assignedCard
+              ).catch((err) => {
+                console.warn(
+                  `${session.tag} 立即提交訂單：${err instanceof Error ? err.message : String(err)}`
                 );
               });
             } else if (onBilling) {
@@ -10777,7 +10966,9 @@ async function main(): Promise<void> {
             await sealStepsComplete(session);
             const payHint = usesApplePay()
               ? "請喺裝置完成 Apple Pay 確認"
-              : "請手動輸入信用卡卡號並確認";
+              : assignedCard
+                ? "已嘗試 autofill 信用卡並撳「立即提交訂單」"
+                : "請手動輸入信用卡卡號並確認";
             console.log(
               `\n${session.tag} 自動化步驟完成（視窗保持隱藏）；${payHint}`
             );
@@ -10792,7 +10983,7 @@ async function main(): Promise<void> {
       console.log(
         usesApplePay()
           ? "腳本唔會完成 Apple Pay 認證／落單。請喺裝置／瀏覽器完成確認。"
-          : "腳本唔會填信用卡，亦唔會撳「下訂單／確認付款」。請分別喺瀏覽器完成付款同落單。"
+          : "Credit cards 池：已 autofill 並嘗試撳「立即提交訂單」；請喺 Dashboard 核對訂單結果。"
       );
       await finishAfterPayment();
     };
