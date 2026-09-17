@@ -4973,44 +4973,138 @@ function resolvePickupStoreCode(text: string): { code: string; name: string } | 
   return null;
 }
 
-/** 由門市掣文字解析可取貨數量 */
+/** 由門市掣文字／aria 解析可取貨數量 */
 function parseStoreButtonStock(text: string): { qty: number | null; available: boolean } {
   const t = text.replace(/\s+/g, " ").trim();
   if (
-    /暫時缺貨|已售罄|暫時無貨|不可取貨|無貨可取|Currently unavailable|Out of stock|Unavailable/i.test(
+    /暫時缺貨|已售罄|暫時無貨|不可取貨|無貨可取|Currently unavailable|Out of stock|Unavailable|Not available/i.test(
       t
     )
   ) {
     return { qty: 0, available: false };
   }
-  const mRemain = t.match(/尚餘\s*(\d+)/i) || t.match(/剩餘\s*(\d+)/i);
-  if (mRemain) return { qty: Number(mRemain[1]), available: Number(mRemain[1]) > 0 };
-  const mUnits = t.match(/(\d+)\s*部/);
-  if (mUnits) return { qty: Number(mUnits[1]), available: Number(mUnits[1]) > 0 };
+
+  const patterns: RegExp[] = [
+    /尚餘\s*(\d+)/i,
+    /剩餘\s*(\d+)/i,
+    /庫存\s*[:：]?\s*(\d+)/i,
+    /可買\s*[:：]?\s*(\d+)/i,
+    /可取貨?\s*[:：]?\s*(\d+)/i,
+    /available\s*[:：]?\s*(\d+)/i,
+    /qty\s*[:：]?\s*(\d+)/i,
+    /quantity\s*[:：]?\s*(\d+)/i,
+    /(\d+)\s*部/,
+    /(\d+)\s*件/,
+    /\(\s*(\d+)\s*\)/,
+  ];
+  for (const re of patterns) {
+    const m = t.match(re);
+    if (m?.[1]) {
+      const n = Number(m[1]);
+      if (Number.isFinite(n) && n >= 0) return { qty: n, available: n > 0 };
+    }
+  }
+
   if (/今日可取貨|可取貨|有貨|Available for pickup|Pick\s*up\s*available|available today/i.test(t)) {
     return { qty: null, available: true };
   }
-  // 有門市名但未標缺貨 → 當可撳／可能有貨
   if (resolvePickupStoreCode(t)) return { qty: null, available: true };
   return { qty: null, available: true };
 }
 
 function formatStoreStockLabel(snap: StoreStockSnap): string {
   if (!snap.available || snap.qty === 0) return `${snap.code} (0)`;
-  if (snap.qty != null) return `${snap.code} (${snap.qty})`;
-  return `${snap.code} (有貨)`;
+  if (snap.qty != null && Number.isFinite(snap.qty)) return `${snap.code} (${snap.qty})`;
+  return `${snap.code} (?)`;
 }
 
 function formatStoreStocksLine(snaps: StoreStockSnap[]): string {
   const byCode = new Map(snaps.map((s) => [s.code, s]));
   return PICKUP_STORE_CODES.map((def) => {
     const s = byCode.get(def.code);
-    if (!s) return `${def.code} (—)`;
+    if (!s) return `${def.code} (0)`;
     return formatStoreStockLabel(s);
   }).join(" · ");
 }
 
-async function scrapePickupStoreStocks(page: Page): Promise<StoreStockSnap[]> {
+/** Checkout 頁數量下拉／input 嘅最大可選數量（門市級庫存） */
+async function readVisibleMaxOrderQty(page: Page): Promise<number | null> {
+  return page.evaluate(() => {
+    const parseMax = (raw: string): number | null => {
+      const n = parseInt(String(raw || "").replace(/[^\d]/g, ""), 10);
+      return Number.isFinite(n) && n > 0 ? n : null;
+    };
+    let best: number | null = null;
+    const bump = (n: number | null) => {
+      if (n == null) return;
+      if (best == null || n > best) best = n;
+    };
+
+    const selects = Array.from(
+      document.querySelectorAll(
+        'select[data-autom*="quantity" i], select[name*="quantity" i], select[id*="quantity" i], select[aria-label*="數量" i], select[aria-label*="Qty" i], select[aria-label*="Quantity" i]'
+      )
+    ) as HTMLSelectElement[];
+    for (const s of selects) {
+      let local = 0;
+      for (const o of Array.from(s.options)) {
+        const n = parseMax(o.value) ?? parseMax(o.textContent || "");
+        if (n != null && n > local) local = n;
+      }
+      bump(local > 0 ? local : null);
+    }
+
+    for (const input of Array.from(
+      document.querySelectorAll(
+        'input[type="number"], input[data-autom*="quantity" i], input[name*="quantity" i], input[id*="quantity" i]'
+      )
+    )) {
+      bump(parseMax(input.getAttribute("max") || ""));
+      bump(parseMax((input as HTMLInputElement).value || ""));
+    }
+
+    // 數量 option 列表（role=option）
+    for (const opt of Array.from(document.querySelectorAll('[role="option"], [data-autom*="quantity" i] option'))) {
+      bump(parseMax(opt.textContent || ""));
+    }
+
+    return best;
+  });
+}
+
+async function readStoreElementBlob(el: Locator): Promise<string> {
+  return el
+    .evaluate((n) => {
+      const e = n as HTMLElement;
+      const bits = [
+        e.innerText || "",
+        e.getAttribute("aria-label") || "",
+        e.getAttribute("title") || "",
+        e.getAttribute("data-autom") || "",
+        e.getAttribute("value") || "",
+      ];
+      const labelled = e.getAttribute("aria-labelledby");
+      if (labelled) {
+        for (const id of labelled.split(/\s+/)) {
+          const node = document.getElementById(id);
+          if (node) bits.push(node.textContent || "");
+        }
+      }
+      // 父層 label／listitem 文字（Apple 門市掣常見結構）
+      const parent = e.closest("label, li, [role='radio'], [role='option'], .form-selector, [class*='selector']");
+      if (parent && parent !== e) bits.push((parent as HTMLElement).innerText || "");
+      return bits.join("\n");
+    })
+    .catch(async () => ((await el.innerText().catch(() => "")) || "").trim());
+}
+
+/**
+ * 掃 6 門市庫存。優先讀掣上數字；冇就逐粒撳門市讀數量下拉 max（精確部數）。
+ */
+async function scrapePickupStoreStocks(
+  page: Page,
+  opts?: { probeQty?: boolean }
+): Promise<StoreStockSnap[]> {
   let stores = await collectStoresUnderHeading(page, /選擇取貨零售店/);
   if (stores.length < 1) {
     stores = await collectStoresUnderHeading(page, /你附近的所有零售店/);
@@ -5018,25 +5112,88 @@ async function scrapePickupStoreStocks(page: Page): Promise<StoreStockSnap[]> {
   if (stores.length < 1) {
     stores = await collectVisiblePickupStores(page);
   }
-  const out: StoreStockSnap[] = [];
+
+  type Item = {
+    el: Locator;
+    code: string;
+    name: string;
+    qty: number | null;
+    available: boolean;
+    raw: string;
+  };
+  const items: Item[] = [];
   const seenCode = new Set<string>();
+
   for (const el of stores) {
-    const raw = ((await el.innerText().catch(() => "")) || "").trim();
+    const blob = await readStoreElementBlob(el);
+    const raw = blob.replace(/\s+/g, " ").trim();
     if (!raw || isNoisePickupText(raw)) continue;
     const id = resolvePickupStoreCode(raw);
-    if (!id) continue;
-    if (seenCode.has(id.code)) continue;
+    if (!id || seenCode.has(id.code)) continue;
     seenCode.add(id.code);
     const { qty, available } = parseStoreButtonStock(raw);
-    out.push({
+    items.push({
+      el,
       code: id.code,
       name: id.name,
       qty,
       available,
-      raw: raw.replace(/\s+/g, " ").slice(0, 160),
+      raw: raw.slice(0, 200),
     });
   }
-  return out;
+
+  const needProbe =
+    opts?.probeQty !== false &&
+    items.some((it) => it.available && (it.qty == null || !Number.isFinite(it.qty)));
+
+  if (needProbe) {
+    console.log("  探測各門市精確庫存（撳門市 → 讀數量上限）…");
+    for (const it of items) {
+      await throwIfReleased();
+      if (!it.available) {
+        it.qty = 0;
+        continue;
+      }
+      try {
+        await it.el.scrollIntoViewIfNeeded().catch(() => {});
+        await humanClick(it.el, { force: true }).catch(async () => {
+          await it.el.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
+        });
+        await sleepCheckingRelease(450);
+        // 選中後再讀掣文字（有時先出數字）
+        const afterBlob = await readStoreElementBlob(it.el);
+        const parsed = parseStoreButtonStock(afterBlob);
+        if (parsed.qty != null) {
+          it.qty = parsed.qty;
+          it.available = parsed.available;
+        }
+        const maxQ = await readVisibleMaxOrderQty(page);
+        if (maxQ != null) {
+          it.qty = maxQ;
+          it.available = maxQ > 0;
+        }
+        if (it.qty == null && parsed.available) {
+          // 有貨但頁面唔顯示數字 → 至少標 1（可取），之後仍顯示 ?
+          it.available = true;
+        }
+        console.log(
+          `    ${it.code}: ${it.qty != null ? it.qty : it.available ? "?" : 0}｜${it.raw.slice(0, 48)}`
+        );
+      } catch (err) {
+        console.warn(
+          `    ${it.code} 探測失敗：${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+  }
+
+  return items.map((it) => ({
+    code: it.code,
+    name: it.name,
+    qty: it.available ? it.qty : 0,
+    available: it.available,
+    raw: it.raw,
+  }));
 }
 
 function formatHkNowForLog(): string {
@@ -5052,12 +5209,14 @@ function formatHkNowForLog(): string {
   }).format(new Date());
 }
 
-/** 將各門市庫存寫入 Live 補貨紀錄（有變先寫） */
+/** 將各門市庫存寫入 Live 補貨紀錄（有變先寫）；顯示精確部數 */
 async function recordStoreStocksToRestockHistory(
   page: Page,
-  opts?: { force?: boolean }
+  opts?: { force?: boolean; probeQty?: boolean }
 ): Promise<StoreStockSnap[]> {
-  const snaps = await scrapePickupStoreStocks(page);
+  const snaps = await scrapePickupStoreStocks(page, {
+    probeQty: opts?.probeQty !== false,
+  });
   if (!snaps.length) return snaps;
   const line = formatStoreStocksLine(snaps);
   const fp = `${CONFIG.model}|${CONFIG.color}|${CONFIG.storage}|${line}`;
@@ -5065,7 +5224,7 @@ async function recordStoreStocksToRestockHistory(
   lastStoreStockFingerprint = fp;
 
   const totalKnown = snaps.reduce(
-    (sum, s) => sum + (typeof s.qty === "number" ? s.qty : s.available ? 1 : 0),
+    (sum, s) => sum + (typeof s.qty === "number" && s.qty > 0 ? s.qty : 0),
     0
   );
   const row = {

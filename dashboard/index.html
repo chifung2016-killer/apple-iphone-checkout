@@ -620,7 +620,7 @@
           <div class="restock-history" style="margin-top:12px">
             <div class="restock-history-head">
               <h3 style="margin:0 0 6px;font-size:0.95rem">Live 補貨紀錄</h3>
-              <p class="hint" style="margin:0">實時列出補貨時間、型號、顏色、容量、數量；門市庫存格式如 <b>IFC (2) · TST (0) · CWB (有貨)</b>（最新喺上）。</p>
+              <p class="hint" style="margin:0">實時列出補貨時間、型號、顏色、容量、數量；門市庫存顯示精確部數，例如 <b>IFC (2) · TST (0) · CWB (1)</b>（最新喺上）。</p>
             </div>
             <div class="card-limits-wrap restock-wrap" style="max-height:260px;margin-top:8px">
               <table class="card-limits" id="restockHistoryTable">
@@ -1785,14 +1785,23 @@
           if (e.event === "store_stock") {
             if (Array.isArray(e.storeStocks) && e.storeStocks.length) {
               qty = e.storeStocks
-                .map((s) => s.label || `${s.code} (${s.qty ?? (s.available ? "有貨" : "0")})`)
+                .map((s) => {
+                  if (s.label && /\(\d+\)/.test(String(s.label))) return s.label;
+                  const n =
+                    s.qty != null && Number.isFinite(Number(s.qty))
+                      ? Number(s.qty)
+                      : s.available
+                        ? null
+                        : 0;
+                  return `${s.code} (${n != null ? n : "?"})`;
+                })
                 .join(" · ");
             } else if (e.detail) {
-              qty = String(e.detail);
+              qty = String(e.detail).replace(/\(有貨\)/g, "(?)");
             }
           } else if (e.event === "qty_up" && e.prevStockQty != null) {
             qty = `${e.prevStockQty} → ${e.stockQty ?? "?"}`;
-          } else if (e.stockQty != null) {
+          } else if (e.stockQty != null && e.stockQty !== "") {
             qty = String(e.stockQty);
           } else if (e.detail) {
             qty = String(e.detail);
