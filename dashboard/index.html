@@ -608,6 +608,29 @@
             <span>合計可買: <b id="monitorStockTotal">—</b></span>
             <span id="monitorSkuLine"></span>
           </div>
+          <div class="restock-history" style="margin-top:12px">
+            <div class="restock-history-head">
+              <h3 style="margin:0 0 6px;font-size:0.95rem">Live 補貨紀錄</h3>
+              <p class="hint" style="margin:0">實時列出補貨時間、型號、顏色、容量、數量（最新喺上）。</p>
+            </div>
+            <div class="card-limits-wrap restock-wrap" style="max-height:260px;margin-top:8px">
+              <table class="card-limits" id="restockHistoryTable">
+                <thead>
+                  <tr>
+                    <th>時間</th>
+                    <th>事件</th>
+                    <th>型號</th>
+                    <th>顏色</th>
+                    <th>容量</th>
+                    <th>補貨／庫存數量</th>
+                  </tr>
+                </thead>
+                <tbody id="restockHistoryBody">
+                  <tr><td colspan="6" class="empty">未有補貨紀錄。Start monitor 後有貨會即時顯示。</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
         </form>
       </section>
 
@@ -1666,6 +1689,49 @@
       }
     }
 
+    function restockEventLabel(ev) {
+      const t = String(ev || "");
+      if (t === "restock") return "補貨上架";
+      if (t === "qty_up") return "數量增加";
+      if (t === "sold_out") return "售罄";
+      return t || "—";
+    }
+
+    function renderRestockHistory(events) {
+      const body = $("restockHistoryBody");
+      if (!body) return;
+      const list = Array.isArray(events) ? events : [];
+      if (!list.length) {
+        body.innerHTML =
+          '<tr><td colspan="6" class="empty">未有補貨紀錄。Start monitor 後有貨會即時顯示。</td></tr>';
+        return;
+      }
+      body.innerHTML = list
+        .map((e) => {
+          const qty =
+            e.event === "qty_up" && e.prevStockQty != null
+              ? `${e.prevStockQty} → ${e.stockQty ?? "?"}`
+              : e.stockQty != null
+                ? String(e.stockQty)
+                : "—";
+          const cls =
+            e.event === "restock" || e.event === "qty_up"
+              ? "touched"
+              : e.event === "sold_out"
+                ? "low"
+                : "";
+          return `<tr class="${cls}">
+            <td>${esc(e.atHk || e.at || "—")}</td>
+            <td>${esc(restockEventLabel(e.event))}</td>
+            <td>${esc(e.model || e.name || "—")}</td>
+            <td>${esc(e.color || "—")}</td>
+            <td>${esc(e.storage || "—")}</td>
+            <td class="num">${esc(qty)}</td>
+          </tr>`;
+        })
+        .join("");
+    }
+
     function applyMonitorUI(mon) {
       if (!$("monitorState")) return;
       const running = Boolean(mon?.running);
@@ -1681,10 +1747,12 @@
         ? skus
             .map(
               (s) =>
-                `${s.name}: ${s.label}｜庫存=${s.stockQty ?? "?"}｜落單=${s.buyQty}`
+                `${s.model || s.name} ${s.color || ""} ${s.storage || ""}: ${s.label}｜庫存=${s.stockQty ?? "?"}｜落單=${s.buyQty}`
             )
             .join(" · ")
         : "";
+
+      renderRestockHistory(mon?.restockHistory);
 
       const toggle = $("btnMonitorToggle");
       if (toggle) {

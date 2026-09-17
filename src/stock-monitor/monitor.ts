@@ -13,6 +13,8 @@ import { escapeMd, formatHkNow, notifyAll, notifyTelegram, upsertTelegramStockMo
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const RUNTIME_DIR = path.join(ROOT, "runtime");
 const MONITOR_STATUS_FILE = path.join(RUNTIME_DIR, "monitor-status.json");
+const RESTOCK_HISTORY_FILE = path.join(RUNTIME_DIR, "restock-history.jsonl");
+const RESTOCK_HISTORY_MAX = 300;
 
 /** Dashboard 可透過 env 覆寫目標數量 */
 function effectiveSkus(): SkuConfig[] {
@@ -42,6 +44,20 @@ type CheckResult = {
   error?: string;
 };
 
+export type RestockHistoryEvent = {
+  at: string;
+  atHk: string;
+  event: "restock" | "qty_up" | "sold_out";
+  name: string;
+  model: string;
+  color: string;
+  storage: string;
+  stockQty: number | null;
+  buyQty: number;
+  prevStockQty?: number | null;
+  detail?: string;
+};
+
 type SkuRuntime = {
   lastStatus: StockStatus | null;
   consecutiveFailures: number;
@@ -49,6 +65,8 @@ type SkuRuntime = {
   failureAlertSent: boolean;
   /** 呢次有貨週期已啟動過自動結帳 */
   checkoutTriggered: boolean;
+  /** 上次見到嘅可買數量（用嚟偵測補貨加量） */
+  lastStockQty: number | null;
 };
 
 const runtime = new Map<string, SkuRuntime>();
@@ -62,6 +80,7 @@ function getRuntime(name: string): SkuRuntime {
       notifiedAvailable: false,
       failureAlertSent: false,
       checkoutTriggered: false,
+      lastStockQty: null,
     };
     runtime.set(name, r);
   }
@@ -70,6 +89,37 @@ function getRuntime(name: string): SkuRuntime {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+async function appendRestockHistory(
+  event: Omit<RestockHistoryEvent, "at" | "atHk"> & { at?: string; atHk?: string }
+): Promise<void> {
+  const row: RestockHistoryEvent = {
+    at: event.at || new Date().toISOString(),
+    atHk: event.atHk || formatHkNow(),
+    event: event.event,
+    name: event.name,
+    model: event.model,
+    color: event.color,
+    storage: event.storage,
+    stockQty: event.stockQty,
+    buyQty: event.buyQty,
+    prevStockQty: event.prevStockQty,
+    detail: event.detail,
+  };
+  try {
+    await fs.mkdir(RUNTIME_DIR, { recursive: true });
+    await fs.appendFile(RESTOCK_HISTORY_FILE, `${JSON.stringify(row)}\n`, "utf8");
+    // 截斷過長紀錄
+    const raw = await fs.readFile(RESTOCK_HISTORY_FILE, "utf8").catch(() => "");
+    const lines = raw.split(/\r?\n/).filter((l) => l.trim());
+    if (lines.length > RESTOCK_HISTORY_MAX) {
+      const keep = lines.slice(-RESTOCK_HISTORY_MAX);
+      await fs.writeFile(RESTOCK_HISTORY_FILE, `${keep.join("\n")}\n`, "utf8");
+    }
+  } catch (err) {
+    console.warn("  ! 寫 restock-history 失敗：", err instanceof Error ? err.message : err);
+  }
 }
 
 function statusLabel(status: StockStatus): string {
@@ -467,10 +517,25 @@ async function handleResult(result: CheckResult): Promise<void> {
   rt.consecutiveFailures = 0;
   rt.failureAlertSent = false;
 
+  const stockNum = result.stockQty ?? result.buyQty;
+  const baseEvent = {
+    name: result.sku.name,
+    model: result.sku.model,
+    color: result.sku.color || "—",
+    storage: result.sku.storage,
+    stockQty: result.stockQty,
+    buyQty: result.buyQty,
+    detail: result.detail,
+  };
+
   if (isPositiveAvailable(result.status) && wasUnavailable(rt.lastStatus)) {
     if (!rt.notifiedAvailable) {
       rt.notifiedAvailable = true;
-      const stockNum = result.stockQty ?? result.buyQty;
+      await appendRestockHistory({
+        ...baseEvent,
+        event: "restock",
+        prevStockQty: rt.lastStockQty,
+      });
       await notifyAll({
         title: "Apple 有貨／可訂購",
         message: [
@@ -484,13 +549,40 @@ async function handleResult(result: CheckResult): Promise<void> {
       });
       console.log(`  → 已通知：${result.sku.name}（庫存=${stockNum} 落單×${result.buyQty}）`);
     }
+  } else if (
+    isPositiveAvailable(result.status) &&
+    rt.lastStatus === "available" &&
+    result.stockQty != null &&
+    rt.lastStockQty != null &&
+    result.stockQty > rt.lastStockQty
+  ) {
+    // 已經有貨但數量上升 = 再補貨
+    await appendRestockHistory({
+      ...baseEvent,
+      event: "qty_up",
+      prevStockQty: rt.lastStockQty,
+    });
+    console.log(
+      `  → 補貨加量：${result.sku.name} ${rt.lastStockQty} → ${result.stockQty}`
+    );
   }
 
   if (!isPositiveAvailable(result.status) && rt.lastStatus === "available") {
     rt.notifiedAvailable = false;
     rt.checkoutTriggered = false;
+    await appendRestockHistory({
+      ...baseEvent,
+      event: "sold_out",
+      prevStockQty: rt.lastStockQty,
+      stockQty: 0,
+    });
   }
 
+  if (isPositiveAvailable(result.status)) {
+    rt.lastStockQty = result.stockQty ?? stockNum ?? rt.lastStockQty;
+  } else {
+    rt.lastStockQty = null;
+  }
   rt.lastStatus = result.status;
 }
 
@@ -619,6 +711,9 @@ async function publishCycleStatus(results: CheckResult[]): Promise<void> {
     totalAvailableStock: totalAvailable,
     skus: results.map((r) => ({
       name: r.sku.name,
+      model: r.sku.model,
+      color: r.sku.color || "—",
+      storage: r.sku.storage,
       status: r.status,
       label: r.label,
       stockQty: r.stockQty,

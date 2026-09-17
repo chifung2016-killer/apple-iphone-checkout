@@ -55,6 +55,7 @@ const CONTINUE_ALL_FLAG = path.join(ROOT, "dashboard-continue.flag");
 const PROXY_BLACKLIST_FILE = path.join(RUNTIME_DIR, "proxy-blacklist.json");
 /** 每個 Proxy / IP 最多同時／累計分配畀幾多個 browser */
 const PROXY_BROWSERS_PER_IP = 3;
+const RESTOCK_HISTORY_FILE = path.join(RUNTIME_DIR, "restock-history.jsonl");
 const GMAIL_ACCOUNTS_ENC = path.join(RUNTIME_DIR, "gmail-accounts.enc");
 const GMAIL_ACCOUNTS_LEGACY = path.join(RUNTIME_DIR, "gmail-accounts-saved.txt");
 const ADD_ORDER_KEY = path.join(RUNTIME_DIR, ".add-order-key");
@@ -1573,6 +1574,25 @@ function browserIndexFromId(id: string): number {
   return m ? Math.max(0, Number(m[1]) - 1) : 0;
 }
 
+async function readRestockHistory(limit = 100): Promise<unknown[]> {
+  try {
+    const raw = await fs.readFile(RESTOCK_HISTORY_FILE, "utf8");
+    const lines = raw.split(/\r?\n/).filter((l) => l.trim());
+    const out: unknown[] = [];
+    for (const line of lines.slice(-Math.max(1, limit))) {
+      try {
+        out.push(JSON.parse(line));
+      } catch {
+        /* skip bad line */
+      }
+    }
+    // 最新喺前
+    return out.reverse();
+  } catch {
+    return [];
+  }
+}
+
 async function snapshot() {
   const browsers: Array<Record<string, unknown>> = [];
   const seen = new Set<string>();
@@ -1922,6 +1942,7 @@ async function snapshot() {
       autoBuy: monitorState.autoBuy,
       logs: monitorState.logs.slice(-40),
       status: monitorStatus,
+      restockHistory: await readRestockHistory(120),
     },
   };
 }
@@ -2154,6 +2175,14 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
   if (pathname === "/api/monitor/stop" && req.method === "POST") {
     await stopStockMonitor();
     return sendJson(res, 200, { ok: true, state: await snapshot() });
+  }
+
+  if (pathname === "/api/monitor/restock-history" && req.method === "GET") {
+    return sendJson(res, 200, {
+      ok: true,
+      updatedAt: new Date().toISOString(),
+      events: await readRestockHistory(200),
+    });
   }
 
   if (pathname === "/api/stop" && req.method === "POST") {
