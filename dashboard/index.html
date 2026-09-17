@@ -872,8 +872,36 @@
     function fillForm(cfg) {
       if (!cfg) return;
       // 唔覆寫 quantity / browserCount / fulfillmentPreference，等你自己填
-      for (const key of ["pickupSearch","saleStartIso","productPollIntervalMs","proxy"]) {
-        if (cfg[key] != null && $(key)) $(key).value = cfg[key];
+      for (const key of ["pickupSearch", "saleStartIso", "productPollIntervalMs", "proxy"]) {
+        const el = $(key);
+        if (!el || cfg[key] == null) continue;
+        // 打緊／揀緊呢個欄就唔蓋
+        if (document.activeElement === el) continue;
+        const next = String(cfg[key] ?? "");
+        // proxy：伺服器空值唔好抹走你已貼嘅內容
+        if (key === "proxy" && !next.trim() && String(el.value || "").trim()) continue;
+        el.value = next;
+      }
+    }
+
+    const PROXY_LS_KEY = "apple-checkout:proxy-pool";
+    function persistProxyField() {
+      const el = $("proxy");
+      if (!el) return;
+      try {
+        localStorage.setItem(PROXY_LS_KEY, String(el.value || ""));
+      } catch {
+        /* ignore */
+      }
+    }
+    function restoreProxyField() {
+      const el = $("proxy");
+      if (!el || String(el.value || "").trim()) return;
+      try {
+        const saved = String(localStorage.getItem(PROXY_LS_KEY) || "");
+        if (saved.trim()) el.value = saved;
+      } catch {
+        /* ignore */
       }
     }
 
@@ -891,7 +919,7 @@
       const browserCount = Number(browserCountRaw);
       if (!Number.isFinite(quantity) || quantity < 1) throw new Error("Quantity 要係 ≥ 1 嘅數字");
       if (!Number.isFinite(browserCount) || browserCount < 1) throw new Error("Launch count 要係 ≥ 1 嘅數字");
-      return {
+      const cfg = {
         presetKey: selectedPresetKey,
         buyUrl: preset.buyUrl,
         model: preset.model,
@@ -907,6 +935,8 @@
         skipTradeIn: true,
         addAppleCare: false,
       };
+      persistProxyField();
+      return cfg;
     }
 
     function appendLogs(lines) {
@@ -2328,6 +2358,10 @@
       }
     });
 
+    $("proxy")?.addEventListener("input", () => persistProxyField());
+    $("proxy")?.addEventListener("change", () => persistProxyField());
+
+    restoreProxyField();
     refresh();
     void refreshCheckoutCardsUi();
     setInterval(refresh, 3000);
