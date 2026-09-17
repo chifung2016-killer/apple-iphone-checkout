@@ -5469,9 +5469,88 @@ async function reloadFulfillmentInitUntilReady(page: Page): Promise<void> {
       }
     }
 
-    console.log("  Fulfillment-init 已可用，繼續腳本…");
+    console.log("  Fulfillment-init 已可用，等待詳細內容載入…");
+    const detailsOk = await waitForFulfillmentInitDetailsReady(page);
+    if (!detailsOk) {
+      if (await isFulfillment503(page)) {
+        await writeStatus({
+          phase: "resuming_after_stock",
+          message: `Fulfillment-init 503（等詳細時）：${RETRY_503_MS / 1000}s 後再 refresh`,
+        }).catch(() => {});
+        await sleepCheckingRelease(RETRY_503_MS);
+        continue;
+      }
+      console.warn(
+        `  Fulfillment-init 詳細內容未齊 — ${RETRY_503_MS / 1000}s 後再 refresh…`
+      );
+      await writeStatus({
+        phase: "resuming_after_stock",
+        message: `等 Fulfillment-init 詳細內容逾時：${RETRY_503_MS / 1000}s 後再 refresh`,
+      }).catch(() => {});
+      await sleepCheckingRelease(RETRY_503_MS);
+      continue;
+    }
+
+    console.log("  Fulfillment-init 詳細已齊，繼續：我會前來取貨 → 中環 → 其餘步驟…");
     return;
   }
+}
+
+/**
+ * 等 Fulfillment-init 載入齊取貨／送貨等詳細 UI，先好撳「我會前來取貨」。
+ */
+async function waitForFulfillmentInitDetailsReady(page: Page): Promise<boolean> {
+  console.log("  等待 Fulfillment-init 詳細內容（我會前來取貨／送貨選項）…");
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    await throwIfReleased();
+    if (await isFulfillment503(page)) {
+      console.warn("  等詳細內容期間出現 503");
+      return false;
+    }
+    if (isShop404Url(page.url())) return false;
+    if (
+      isPickupContactPage(page.url()) ||
+      isBillingPage(page.url()) ||
+      isReviewPage(page.url())
+    ) {
+      return true;
+    }
+
+    const pickupVisible = await page
+      .getByText(/我會前來取貨/, { exact: false })
+      .first()
+      .isVisible()
+      .catch(() => false);
+    const deliveryVisible = await page
+      .getByText(/我希望送貨/, { exact: false })
+      .first()
+      .isVisible()
+      .catch(() => false);
+    const search = await findPickupSearchInput(page);
+
+    if (pickupVisible || deliveryVisible || search) {
+      await settleDom(page, 500);
+      const stillPickup = await page
+        .getByText(/我會前來取貨/, { exact: false })
+        .first()
+        .isVisible()
+        .catch(() => false);
+      const stillDelivery = await page
+        .getByText(/我希望送貨/, { exact: false })
+        .first()
+        .isVisible()
+        .catch(() => false);
+      const stillSearch = await findPickupSearchInput(page);
+      if (stillPickup || stillDelivery || stillSearch) {
+        console.log("  Fulfillment-init 詳細內容已載入");
+        return true;
+      }
+    }
+    await sleepCheckingRelease(400);
+  }
+  console.warn("  等待 Fulfillment-init 詳細內容逾時");
+  return false;
 }
 
 /** 輸入「中環」後，等到「選擇取貨零售店」下面出現 6 個選項，再雙重確認 */
@@ -5692,6 +5771,11 @@ async function ensureFulfillmentInitStandby(page: Page): Promise<void> {
   console.log("  待命：回到 Fulfillment-init，預熱中環＋6 門市…");
   await gotoFulfillmentInit(page);
   usedPickupStoreKeys.clear();
+  const detailsOk = await waitForFulfillmentInitDetailsReady(page);
+  if (!detailsOk) {
+    console.warn("  待命：Fulfillment-init 詳細未齊，仍會停低等有貨");
+    return;
+  }
   const pickupClicked = await clickPickupOption(page);
   if (!pickupClicked) {
     console.warn("  待命：撳唔到「我會前來取貨」（可能已揀）");
@@ -5713,6 +5797,7 @@ async function ensureFulfillmentInitStandby(page: Page): Promise<void> {
 
 /**
  * 由而家頁面跑取貨→聯絡→付款（一次嘗試）。
+ * Fulfillment-init 詳細載入後：撳「我會前來取貨」→ 輸入「中環」→ 其餘步驟。
  * @returns true = 已到付款／帳單頁
  */
 async function attemptPickupCheckoutToPayment(
@@ -5722,8 +5807,36 @@ async function attemptPickupCheckoutToPayment(
   session?: BrowserSession
 ): Promise<boolean> {
   usedPickupStoreKeys.clear();
+
+  if (
+    /\/shop\/checkout/i.test(page.url()) &&
+    !isPickupContactPage(page.url()) &&
+    !isBillingPage(page.url()) &&
+    !isReviewPage(page.url())
+  ) {
+    const ready = await waitForFulfillmentInitDetailsReady(page);
+    if (!ready) {
+      console.warn("  Fulfillment-init 詳細內容未就緒，今次未能繼續");
+      return false;
+    }
+  }
+
+  console.log(
+    `  繼續腳本：撳「我會前來取貨」→ 輸入「${CONFIG.pickupSearch || "中環"}」→ 揀店／聯絡／付款…`
+  );
+  await writeStatus({
+    phase: "resuming_after_stock",
+    message: `繼續：我會前來取貨 → ${CONFIG.pickupSearch || "中環"} → 其餘步驟`,
+  }).catch(() => {});
+
   const pickupClicked = await clickPickupOption(page);
-  if (pickupClicked) console.log("  已揀：我會前來取貨");
+  if (pickupClicked) {
+    console.log("  已揀：我會前來取貨");
+  } else {
+    console.warn("  撳唔到「我會前來取貨」（可能已揀）— 仍試輸入搜尋／揀店");
+  }
+  await sleepCheckingRelease(usesFastPickupContactFill() ? 150 : 400);
+
   const storeOk = await choosePickupStore(page);
   if (!storeOk && !isPickupContactPage(page.url())) {
     console.warn("  今次取貨揀店失敗");
