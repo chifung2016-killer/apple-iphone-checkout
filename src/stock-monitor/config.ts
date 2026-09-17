@@ -143,19 +143,57 @@ export const MONITOR_CONFIG = {
  * 1. 用瀏覽器開 https://www.apple.com/hk-zh/shop/buy-iphone
  * 2. 揀好型號／容量／顏色，抄 address bar 完整 URL
  * 3. 貼落面 `url` 欄
+ *
+ * 而家只監察 iPhone 18 Pro Max（唔再監察 iPhone 17）。
  */
+const PM_BASE =
+  "https://www.apple.com/hk-zh/shop/buy-iphone/iphone-18-pro/6.9-%E5%90%8B%E9%A1%AF%E7%A4%BA%E5%99%A8-256gb-";
+const PM_COLOR = {
+  burgundy: "%E5%B8%83%E6%A0%B9%E5%9C%B0%E7%B4%85%E8%89%B2",
+  glacier: "%E5%86%B0%E5%B7%9D%E8%89%B2",
+  silver: "%E9%8A%80%E8%89%B2",
+  black: "%E9%BB%91%E8%89%B2",
+} as const;
+
+function proMax256Url(colorKey: keyof typeof PM_COLOR): string {
+  return `${PM_BASE}${PM_COLOR[colorKey]}`;
+}
+
 export const SKUS: SkuConfig[] = [
   {
-    name: "iPhone 17 256GB 薰衣草紫色",
-    /** 監察：attach 頁（有「查看購物袋」= 可訂） */
-    url: "https://www.apple.com/hk-zh/shop/buy-iphone/iphone-17?product=mg6m4za/a&step=attach",
-    /** 結帳：設定頁（可真正加入購物袋） */
-    checkoutUrl:
-      "https://www.apple.com/hk-zh/shop/buy-iphone/iphone-17/6.3-%E5%90%8B%E9%A1%AF%E7%A4%BA%E5%99%A8-256gb-%E8%96%B0%E8%A1%A3%E8%8D%89%E7%B4%AB%E8%89%B2",
-    model: "iPhone 17",
+    name: "iPhone 18 Pro Max 256GB 布根地紅色",
+    url: proMax256Url("burgundy"),
+    checkoutUrl: proMax256Url("burgundy"),
+    model: "iPhone 18 Pro Max",
     storage: "256GB",
-    color: "薰衣草紫色",
-    /** 目標數量；實際會跟頁面限購同呢個數取細 */
+    color: "布根地紅色",
+    quantity: 2,
+  },
+  {
+    name: "iPhone 18 Pro Max 256GB 冰川色",
+    url: proMax256Url("glacier"),
+    checkoutUrl: proMax256Url("glacier"),
+    model: "iPhone 18 Pro Max",
+    storage: "256GB",
+    color: "冰川色",
+    quantity: 2,
+  },
+  {
+    name: "iPhone 18 Pro Max 256GB 銀色",
+    url: proMax256Url("silver"),
+    checkoutUrl: proMax256Url("silver"),
+    model: "iPhone 18 Pro Max",
+    storage: "256GB",
+    color: "銀色",
+    quantity: 2,
+  },
+  {
+    name: "iPhone 18 Pro Max 256GB 黑色",
+    url: proMax256Url("black"),
+    checkoutUrl: proMax256Url("black"),
+    model: "iPhone 18 Pro Max",
+    storage: "256GB",
+    color: "黑色",
     quantity: 2,
   },
 ];
