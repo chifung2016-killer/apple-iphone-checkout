@@ -2,8 +2,8 @@
  * Apple 香港官網 iPhone 購買輔助腳本（headed browser）。
  *
  * 預設：iPhone 18 Pro Max / 256GB / 布根地紅色
- * 付款頁會停低等你手動入信用卡並落單；腳本唔會填卡號 / CVV，
- * 亦唔會自動撳最終「下訂單 / 確認付款」。
+ * 付款頁：Dashboard 加密信用卡池會 autofill 卡號／有效期／CVV 並撳「檢查你的訂單」；
+ * 最終「下訂單／確認付款」仍要人手（或 Review 流程視 Delivery method）。
  *
  * 落單成功後撳 Enter，會輸出訂單編號同送貨／取貨資料，並寫入 order-summary.json。
  *
@@ -23,6 +23,11 @@ import {
   resolveOrderAmountSpent,
 } from "./credit-card-pool.js";
 import { fulfillmentLabelFromPreference } from "./fulfillment-label.js";
+import {
+  excludeCheckoutCardById,
+  loadAssignedCheckoutCard,
+  type VaultCard,
+} from "./checkout-card-vault.js";
 
 // =============================================================================
 // 請喺呢度改你自己嘅選項（Dashboard 會用 runtime-config.json 覆寫）
@@ -319,6 +324,14 @@ const WINDOW_TOTAL = Math.max(
   Number(process.env.CHECKOUT_WINDOW_TOTAL || "0") || 0
 );
 const RUNTIME_DIR = path.join(ROOT, "runtime");
+const CHECKOUT_CARD_KEY_PATH =
+  process.env.CHECKOUT_CARD_KEY_PATH || path.join(RUNTIME_DIR, ".add-order-key");
+const CHECKOUT_CARD_ASSIGN_PATH =
+  process.env.CHECKOUT_CARD_ASSIGN_PATH ||
+  path.join(RUNTIME_DIR, `assigned-card-${SESSION_ID}.enc`);
+const CHECKOUT_CARD_STATE_PATH =
+  process.env.CHECKOUT_CARD_STATE_PATH ||
+  path.join(RUNTIME_DIR, "checkout-cards-state.json");
 const OUT_FILE = path.join(
   RUNTIME_DIR,
   SESSION_ID === "default" ? "order-summary.json" : `order-${SESSION_ID}.json`
@@ -6804,6 +6817,268 @@ async function clickContinueToPayment(
   }
 }
 
+async function fillInputInAnyFrame(
+  page: Page,
+  selectors: string[],
+  value: string
+): Promise<boolean> {
+  const frames = page.frames();
+  for (const frame of frames) {
+    for (const sel of selectors) {
+      const el = frame.locator(sel).first();
+      if ((await el.count().catch(() => 0)) === 0) continue;
+      const tag = await el.evaluate((n) => n.tagName.toLowerCase()).catch(() => "");
+      if (tag === "select") {
+        const ok = await el
+          .selectOption({ value })
+          .then(() => true)
+          .catch(async () =>
+            el
+              .selectOption({ label: value })
+              .then(() => true)
+              .catch(async () =>
+                el.selectOption({ index: Number(value) }).then(() => true).catch(() => false)
+              )
+          );
+        if (ok) return true;
+        continue;
+      }
+      const ok = await el
+        .fill(value, { timeout: 1500 })
+        .then(() => true)
+        .catch(async () => {
+          await el.click({ force: true, timeout: 800 }).catch(() => {});
+          await el.fill("").catch(() => {});
+          await el.type(value, { delay: 15 }).catch(() => {});
+          return true;
+        })
+        .catch(() => false);
+      if (ok) return true;
+    }
+  }
+  // DOM evaluate fallback across frames
+  for (const frame of frames) {
+    const filled = await frame
+      .evaluate(
+        ({ sels, val }) => {
+          for (const sel of sels) {
+            let nodes: NodeListOf<Element>;
+            try {
+              nodes = document.querySelectorAll(sel);
+            } catch {
+              continue;
+            }
+            for (const node of Array.from(nodes)) {
+              const el = node as HTMLInputElement | HTMLSelectElement;
+              if (!el || (el as HTMLInputElement).disabled) continue;
+              const style = window.getComputedStyle(el);
+              if (style.display === "none" || style.visibility === "hidden") continue;
+              el.focus();
+              if (el.tagName.toLowerCase() === "select") {
+                const selEl = el as HTMLSelectElement;
+                const opt = Array.from(selEl.options).find(
+                  (o) => o.value === val || o.textContent?.trim() === val || o.value.endsWith(val)
+                );
+                if (opt) {
+                  selEl.value = opt.value;
+                  selEl.dispatchEvent(new Event("input", { bubbles: true }));
+                  selEl.dispatchEvent(new Event("change", { bubbles: true }));
+                  return true;
+                }
+                continue;
+              }
+              const input = el as HTMLInputElement;
+              input.value = val;
+              input.dispatchEvent(new Event("input", { bubbles: true }));
+              input.dispatchEvent(new Event("change", { bubbles: true }));
+              return true;
+            }
+          }
+          return false;
+        },
+        { sels: selectors, val: value }
+      )
+      .catch(() => false);
+    if (filled) return true;
+  }
+  return false;
+}
+
+async function detectBillingCardDecline(page: Page): Promise<boolean> {
+  const text = ((await page.locator("body").innerText().catch(() => "")) || "").slice(0, 8000);
+  return /未能處理|無法處理|付款失敗|交易被拒|信用卡被拒|卡被拒絕|declined|could not process|payment failed|card was declined|invalid card|無效.*卡|請檢查.*卡|驗證失敗/i.test(
+    text
+  );
+}
+
+async function autofillAssignedCreditCard(
+  page: Page,
+  session?: BrowserSession
+): Promise<boolean> {
+  if (selectsApplePayAtBilling()) return false;
+  const card = await loadAssignedCheckoutCard(
+    CHECKOUT_CARD_ASSIGN_PATH,
+    CHECKOUT_CARD_KEY_PATH
+  ).catch(() => null);
+  if (!card) {
+    console.warn("  無分配信用卡（Dashboard 未 Save／池已用盡）— 跳過 autofill");
+    return false;
+  }
+
+  console.log(
+    `步驟：Billing autofill 信用卡 ****${card.number.slice(-4)}（${card.exp}）`
+  );
+  if (session) {
+    session.capturedCardNumber = card.number;
+    await writeStatus({
+      card: {
+        cardNumber: card.number,
+        cardType: detectCardType(card.number),
+      },
+      message: `autofill card ****${card.number.slice(-4)}`,
+    }).catch(() => {});
+  }
+
+  await sleepCheckingRelease(400);
+  const numberOk = await fillInputInAnyFrame(
+    page,
+    [
+      'input[autocomplete="cc-number"]',
+      'input[name*="cardNumber" i]',
+      'input[id*="cardNumber" i]',
+      'input[name*="card-number" i]',
+      'input[data-autom*="cardNumber" i]',
+      'input[data-autom*="card-number" i]',
+      'input[placeholder*="卡號" i]',
+      'input[placeholder*="Card number" i]',
+      'input[aria-label*="卡號" i]',
+      'input[aria-label*="Card number" i]',
+    ],
+    card.number
+  );
+
+  const [mm, yy] = card.exp.split("/");
+  const expCombined = card.exp;
+  const expOkCombined = await fillInputInAnyFrame(
+    page,
+    [
+      'input[autocomplete="cc-exp"]',
+      'input[name*="expiration" i]',
+      'input[name*="expiry" i]',
+      'input[id*="expiration" i]',
+      'input[id*="expiry" i]',
+      'input[data-autom*="expiration" i]',
+      'input[data-autom*="expiry" i]',
+      'input[placeholder*="月" i]',
+      'input[placeholder*="MM" i]',
+      'input[aria-label*="有效期" i]',
+      'input[aria-label*="Expiry" i]',
+    ],
+    expCombined
+  );
+  let expOk = expOkCombined;
+  if (!expOk && mm && yy) {
+    const monthOk = await fillInputInAnyFrame(
+      page,
+      [
+        'input[autocomplete="cc-exp-month"]',
+        'input[name*="expMonth" i]',
+        'input[name*="month" i]',
+        'select[name*="expMonth" i]',
+        'select[autocomplete="cc-exp-month"]',
+      ],
+      mm
+    );
+    const yearOk = await fillInputInAnyFrame(
+      page,
+      [
+        'input[autocomplete="cc-exp-year"]',
+        'input[name*="expYear" i]',
+        'input[name*="year" i]',
+        'select[name*="expYear" i]',
+        'select[autocomplete="cc-exp-year"]',
+      ],
+      yy.length === 2 ? `20${yy}` : yy
+    );
+    // also try 2-digit year
+    if (!yearOk) {
+      await fillInputInAnyFrame(
+        page,
+        [
+          'input[autocomplete="cc-exp-year"]',
+          'input[name*="expYear" i]',
+          'select[name*="expYear" i]',
+        ],
+        yy
+      );
+    }
+    expOk = monthOk || yearOk;
+  }
+
+  const cvvOk = await fillInputInAnyFrame(
+    page,
+    [
+      'input[autocomplete="cc-csc"]',
+      'input[name*="securityCode" i]',
+      'input[name*="cvv" i]',
+      'input[name*="cvc" i]',
+      'input[id*="cvv" i]',
+      'input[id*="cvc" i]',
+      'input[data-autom*="security" i]',
+      'input[data-autom*="cvv" i]',
+      'input[placeholder*="安全碼" i]',
+      'input[placeholder*="CVV" i]',
+      'input[aria-label*="安全碼" i]',
+      'input[aria-label*="CVV" i]',
+      'input[aria-label*="CVC" i]',
+    ],
+    card.cvv
+  );
+
+  console.log(
+    `  卡號=${numberOk ? "OK" : "fail"}｜有效期=${expOk ? "OK" : "fail"}｜CVV=${cvvOk ? "OK" : "fail"}`
+  );
+  return numberOk || expOk || cvvOk;
+}
+
+async function markAssignedCardRejected(card: VaultCard | null, reason: string): Promise<void> {
+  if (!card) return;
+  await excludeCheckoutCardById(CHECKOUT_CARD_STATE_PATH, card.id).catch(() => {});
+  await writeStatus({
+    phase: "card_rejected",
+    cardRejected: true,
+    message: `信用卡被拒／失敗 ****${card.number.slice(-4)}：${reason}`,
+  }).catch(() => {});
+  console.warn(`  已排除信用卡 ****${card.number.slice(-4)}｜${reason}`);
+}
+
+async function autofillCardThenCheckOrder(
+  page: Page,
+  session?: BrowserSession
+): Promise<void> {
+  const card = await loadAssignedCheckoutCard(
+    CHECKOUT_CARD_ASSIGN_PATH,
+    CHECKOUT_CARD_KEY_PATH
+  ).catch(() => null);
+  const filled = await autofillAssignedCreditCard(page, session);
+  if (!filled) return;
+
+  await sleepCheckingRelease(500);
+  console.log("  autofill 後自動撳「檢查你的訂單」…");
+  const checked = await clickCheckYourOrder(page);
+  if (await detectBillingCardDecline(page)) {
+    await markAssignedCardRejected(card, "Billing 頁顯示拒單／錯誤");
+    return;
+  }
+  if (isReviewPage(page.url())) {
+    console.log("  已到 Review（信用卡 autofill + 檢查你的訂單）");
+    return;
+  }
+  if (!checked) {
+    console.warn("  「檢查你的訂單」未成功，稍後人手／外層會再試");
+  }
+}
+
 async function selectCreditOrDebitCard(page: Page): Promise<boolean> {
   console.log("步驟：揀「信用卡或扣賬卡」");
   await page.waitForTimeout(500);
@@ -8337,13 +8612,15 @@ async function fillBillingAddressFields(
       const ok = await selectUseShippingAddressForBilling(page);
       if (ok) {
         console.log("  Delivery：已用送貨地址作帳單地址，唔再亂填帳單欄位");
+        await autofillCardThenCheckOrder(page, opts?.session);
         return;
       }
       console.warn(`  Delivery 勾送貨地址失敗 round ${round}/3，再等帳單區…`);
       await page.waitForTimeout(1200);
       await selectCreditOrDebitCard(page).catch(() => {});
     }
-    console.warn("  Delivery 仍未能勾「使用我的送貨地址」，將嘗試人手頁面狀態");
+    console.warn("  Delivery 仍未能勾「使用我的送貨地址」，仍嘗試 autofill 卡");
+    await autofillCardThenCheckOrder(page, opts?.session);
     return;
   }
 
@@ -8432,6 +8709,7 @@ async function fillBillingAddressFields(
   ).catch(() => {});
 
   console.log("  帳單地址欄位已嘗試自動填寫");
+  await autofillCardThenCheckOrder(page, opts?.session);
 }
 
 async function scrollPageToBottomRight(page: Page): Promise<void> {

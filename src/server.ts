@@ -32,6 +32,15 @@ import {
   secureWipeFile,
   type ShippingAddress,
 } from "./add-order-secrets.js";
+import {
+  claimCheckoutCard,
+  finalizeCheckoutCard,
+  loadCardVault,
+  loadCardVaultState,
+  maskedRows,
+  summarizeVault,
+  upsertCardsFromText,
+} from "./checkout-card-vault.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PUBLIC = path.join(ROOT, "dashboard");
@@ -47,12 +56,26 @@ const SHIPPING_ENC = path.join(RUNTIME_DIR, "shipping-address.enc");
 const GMAIL_COPY_PASSWORD_ENC = path.join(RUNTIME_DIR, "gmail-copy-password.enc");
 /** 只用作首次 seed 寫入加密檔；之後只由密文檔讀 */
 const GMAIL_COPY_PASSWORD_BOOTSTRAP = "yY6594083";
+const CHECKOUT_CARDS_ENC = path.join(RUNTIME_DIR, "checkout-cards.enc");
+const CHECKOUT_CARDS_STATE = path.join(RUNTIME_DIR, "checkout-cards-state.json");
 const ADD_ORDER_JOB_ENC = path.join(RUNTIME_DIR, "add-order-job.enc");
 const ADD_ORDER_JOB_LEGACY = path.join(RUNTIME_DIR, "add-order-apple-ac.json");
 const ADD_ORDER_STOP_FLAG = path.join(RUNTIME_DIR, "add-order-stop.flag");
 const PORT = Number(process.env.DASHBOARD_PORT || 8787);
 /** 每次 server 啟動／tsx watch 重載都會變 → 瀏覽器自動 refresh */
 const DASHBOARD_BUILD_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+function assignedCardPath(sessionId: string): string {
+  return path.join(RUNTIME_DIR, `assigned-card-${sessionId}.enc`);
+}
+
+function usesCreditCardAutofill(fulfillmentPreference: unknown): boolean {
+  const p = String(fulfillmentPreference || "");
+  if (!p) return false;
+  if (/apple_pay|applepay/i.test(p)) return false;
+  // pickup / delivery 訪客信用卡模式
+  return p === "pickup" || p === "delivery" || p === "auto";
+}
 
 type BrowserSession = {
   id: string;
@@ -976,6 +999,25 @@ async function spawnOneBrowser(
   if (assignedProxy) {
     console.log(`[proxy] ${id} 分配：${assignedProxy}`);
   }
+  // 信用卡訪客模式：隨機分配加密卡（唔重複）；Apple Pay 唔分配
+  if (usesCreditCardAutofill(sessionConfig.fulfillmentPreference)) {
+    const claimed = await claimCheckoutCard({
+      encPath: CHECKOUT_CARDS_ENC,
+      keyPath: ADD_ORDER_KEY,
+      statePath: CHECKOUT_CARDS_STATE,
+      assignPath: assignedCardPath(id),
+      sessionId: id,
+    }).catch(() => null);
+    if (claimed) {
+      sessionConfig.checkoutCardId = claimed.id;
+      sessionConfig.checkoutCardMasked = `****${String(claimed.number).slice(-4)}`;
+      console.log(
+        `[card] ${id} 分配信用卡 ****${String(claimed.number).slice(-4)}（加密檔；唔重複直至用完／排除）`
+      );
+    } else {
+      console.warn(`[card] ${id} 無可用信用卡（請喺 Dashboard 貼上 卡號:mm/yy:cvv 並 Save）`);
+    }
+  }
   const configPath = path.join(RUNTIME_DIR, `config-${id}.json`);
   await fs.writeFile(configPath, JSON.stringify(sessionConfig, null, 2), "utf8");
   await fs.writeFile(RUNTIME_CONFIG, JSON.stringify({ ...cleanConfig }, null, 2), "utf8");
@@ -1013,6 +1055,9 @@ async function spawnOneBrowser(
       CHECKOUT_SESSION_ID: id,
       CHECKOUT_WINDOW_INDEX: String(index),
       CHECKOUT_WINDOW_TOTAL: String(windowTotal),
+      CHECKOUT_CARD_KEY_PATH: ADD_ORDER_KEY,
+      CHECKOUT_CARD_ASSIGN_PATH: assignedCardPath(id),
+      CHECKOUT_CARD_STATE_PATH: CHECKOUT_CARDS_STATE,
     }),
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -1053,6 +1098,30 @@ async function spawnOneBrowser(
           `session=${session.id} exit=${code} phase=${phase || "—"}`
         ).catch(() => {});
       }
+    }
+    // 信用卡結果：成功 → used；拒單／失敗 → excluded；其他 → release 返池
+    if (session.config?.checkoutCardId) {
+      const paid = await isPaidBrowserSession(session.id);
+      const st = await readSessionStatus(session.id);
+      const phase = String(st?.phase || "");
+      const rejected =
+        Boolean(st?.cardRejected) ||
+        /card_rejected|payment_declined|shop_404/i.test(phase);
+      const outcome = paid
+        ? "success"
+        : rejected || code !== 0 || /error|fail/i.test(phase)
+          ? "rejected"
+          : "release";
+      await finalizeCheckoutCard({
+        statePath: CHECKOUT_CARDS_STATE,
+        assignPath: assignedCardPath(session.id),
+        sessionId: session.id,
+        outcome,
+      }).catch(() => {});
+      pushSessionLog(
+        session,
+        `[card] finalize ${String(session.config.checkoutCardMasked || session.config.checkoutCardId)} → ${outcome}`
+      );
     }
     broadcast({ type: "status", state: await snapshot() });
   });
@@ -1803,6 +1872,41 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     return sendJson(res, 200, await getLiveCardLimits(ROOT, await collectOrders()));
   }
 
+  /** Checkout 信用卡池：加密存檔；只回 masked／統計 */
+  if (pathname === "/api/checkout-cards" && req.method === "GET") {
+    const cards = await loadCardVault(CHECKOUT_CARDS_ENC, ADD_ORDER_KEY);
+    const state = await loadCardVaultState(CHECKOUT_CARDS_STATE);
+    return sendJson(res, 200, {
+      ok: true,
+      summary: summarizeVault(cards, state),
+      rows: maskedRows(cards, state),
+    });
+  }
+
+  if (pathname === "/api/checkout-cards" && req.method === "POST") {
+    let body: { text?: string; replace?: boolean } = {};
+    try {
+      body = JSON.parse(await readBody(req)) as typeof body;
+    } catch {
+      return sendJson(res, 400, { ok: false, error: "invalid JSON" });
+    }
+    const result = await upsertCardsFromText({
+      encPath: CHECKOUT_CARDS_ENC,
+      keyPath: ADD_ORDER_KEY,
+      statePath: CHECKOUT_CARDS_STATE,
+      text: String(body.text || ""),
+      replace: Boolean(body.replace),
+    });
+    if (!result.ok) return sendJson(res, 400, result);
+    const cards = await loadCardVault(CHECKOUT_CARDS_ENC, ADD_ORDER_KEY);
+    const state = await loadCardVaultState(CHECKOUT_CARDS_STATE);
+    return sendJson(res, 200, {
+      ...result,
+      summary: summarizeVault(cards, state),
+      rows: maskedRows(cards, state),
+    });
+  }
+
   /** Live card limits → 複製 email:password:order（密碼由本機加密檔讀出） */
   if (pathname === "/api/live-card-limits/copy-info" && req.method === "POST") {
     let body: { rows?: Array<{ email?: string; orderNumber?: string }> } = {};
@@ -2145,6 +2249,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     // 換 key 前保留送貨地址／Gmail 複製密碼於記憶體，換完再加密寫返
     let shippingPlain = "";
     let gmailCopyPwd = "";
+    let checkoutCardsPlain = "";
     try {
       shippingPlain = await decryptFromFile(SHIPPING_ENC, ADD_ORDER_KEY);
     } catch {
@@ -2159,6 +2264,11 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     } catch {
       gmailCopyPwd = "";
     }
+    try {
+      checkoutCardsPlain = await decryptFromFile(CHECKOUT_CARDS_ENC, ADD_ORDER_KEY);
+    } catch {
+      checkoutCardsPlain = "";
+    }
     await rotateKey(ADD_ORDER_KEY);
     if (shippingPlain) {
       await encryptToFile(SHIPPING_ENC, ADD_ORDER_KEY, shippingPlain).catch(() => {});
@@ -2167,6 +2277,9 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
     }
     if (gmailCopyPwd) {
       await encryptToFile(GMAIL_COPY_PASSWORD_ENC, ADD_ORDER_KEY, gmailCopyPwd).catch(() => {});
+    }
+    if (checkoutCardsPlain) {
+      await encryptToFile(CHECKOUT_CARDS_ENC, ADD_ORDER_KEY, checkoutCardsPlain).catch(() => {});
     }
     // Finished status 內 shippingEnc 要用新 key 重加密
     for (const id of [...addOrderTasks.keys()]) {

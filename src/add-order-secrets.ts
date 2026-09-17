@@ -52,6 +52,7 @@ export function redactSecrets(line: string): string {
   out = out.replace(/11b\s*,?\s*tai\s*fat\s*building/gi, "[building]");
   out = out.replace(/sai\s*ying\s*pun/gi, "[district]");
   out = out.replace(/\byY6594083\b/g, "***");
+  out = out.replace(/\b(?:\d[ -]*?){13,19}\b/g, "[card]");
   return out;
 }
 
