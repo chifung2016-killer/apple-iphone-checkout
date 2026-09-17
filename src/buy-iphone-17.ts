@@ -2412,9 +2412,9 @@ function isShop404Url(url: string): boolean {
   return /\/shop\/404\b/i.test(url);
 }
 
-/** Soft 404 文案（URL 仍可能係 Fulfillment-init） */
+/** Soft 404 文案（URL 仍可能係 Fulfillment-init 或 apple.com/search?src=pnf） */
 const PAGE_NOT_FOUND_TEXT_RE =
-  /The page you[\u2019']?re looking for can[\u2019']?t be found|找不到你要找的頁面|找不到你要尋找的頁面|找不到此頁面|頁面不存在/i;
+  /The page you[\u2019']?re looking for can[\u2019']?t be found|找不到你想去的網頁|找不到你要找的頁面|找不到你要尋找的頁面|找不到此頁面|頁面不存在/i;
 
 async function pageShowsNotFound(page: Page): Promise<boolean> {
   if (isShop404Url(page.url())) return true;
@@ -2429,7 +2429,7 @@ async function pageShowsNotFound(page: Page): Promise<boolean> {
     .catch(() => false);
 }
 
-/** Opened browsers：標 page error + red blink（stuck） */
+/** Opened browsers：標 page error；「找不到你想去的網頁」等 → 自動返 Fulfillment-init */
 async function markPageErrorIfNotFound(
   page: Page,
   context = ""
@@ -2437,20 +2437,67 @@ async function markPageErrorIfNotFound(
   if (!(await pageShowsNotFound(page))) return false;
   const url = page.url();
   const prefix = context ? `[${context}] ` : "";
+
+  // 已喺 Fulfillment 就唔使跳走（可能係短暫 soft 404 文案誤判）
+  // search pnf／其它錯頁 → 一律返 Fulfillment-init
+  if (isAppleSiteSearchUrl(url) || !/_s=Fulfillment/i.test(url) || /apple\.com\/search/i.test(url)) {
+    console.warn(
+      `  ${prefix}★ 「找不到你想去的網頁」／page not found → 自動返 Fulfillment-init｜${url}`
+    );
+    const recovered = await recoverToFulfillmentInitFromNotFound(page, context || "page-not-found");
+    if (recovered) return true;
+  }
+
   console.warn(
-    `  ${prefix}★ page error：The page you're looking for can't be found.｜${url}`
+    `  ${prefix}★ page error：找不到你想去的網頁／can't be found｜${url}`
   );
   await writeStatus({
     phase: "page_error",
     stuck: true,
     url,
-    message: "page error: The page you're looking for can't be found.",
+    message: "page error: 找不到你想去的網頁",
     card: {
       url,
-      message: "page error: The page you're looking for can't be found.",
+      message: "page error: 找不到你想去的網頁",
     },
   }).catch(() => {});
   return true;
+}
+
+const recoveringNotFoundPages = new WeakSet<Page>();
+
+/** 見到「找不到你想去的網頁」→ goto 上一頁／預設 secure store Fulfillment-init */
+async function recoverToFulfillmentInitFromNotFound(
+  page: Page,
+  tag = ""
+): Promise<boolean> {
+  if (recoveringNotFoundPages.has(page)) return false;
+  recoveringNotFoundPages.add(page);
+  try {
+    // 優先走 search 專用 recovery（同一個 goto）
+    if (isAppleSiteSearchUrl(page.url())) {
+      const ok = await recoverFromWrongAppleSearchIfNeeded(page, tag);
+      if (ok) return true;
+    }
+    const target = fulfillmentInitUrlFrom(page.url());
+    const prefix = tag ? `${tag} ` : "";
+    console.warn(`  ${prefix}★ 返 Fulfillment-init：${target}`);
+    markCheckoutNav(target, "recover-not-found-zh");
+    await writeStatus({
+      phase: "fulfillment_pickup_wait",
+      stuck: false,
+      message: `找不到你想去的網頁 → 返 Fulfillment-init`,
+      url: target,
+      card: { url: target, message: "recovered: 找不到你想去的網頁" },
+    }).catch(() => {});
+    await withReleaseCheck(
+      page.goto(target, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {})
+    );
+    await settleDom(page, 300);
+    return /_s=Fulfillment/i.test(page.url());
+  } finally {
+    recoveringNotFoundPages.delete(page);
+  }
 }
 
 /** 上一頁時間戳：用嚟量 /shop/404 由邊頁跳過嚟、隔咗幾耐 */
@@ -5754,7 +5801,7 @@ function fulfillmentInitUrlFrom(current: string): string {
     }
     return `${current.split("#")[0]}${current.includes("?") ? "&" : "?"}_s=Fulfillment-init`;
   }
-  // 誤入 www.apple.com／search 時唔好用錯 host → 用上一頁 checkout 或預設 secure6
+  // 誤入 www.apple.com／search 時唔好用錯 host → 用上一頁 checkout（例如 secure9）
   const last = lastNon404NavMark?.url || "";
   if (/\/shop\/checkout/i.test(last) && /store\.apple\.com/i.test(last)) {
     if (/[?&]_s=/i.test(last)) {
@@ -5765,10 +5812,15 @@ function fulfillmentInitUrlFrom(current: string): string {
   return "https://secure6.store.apple.com/hk-zh/shop/checkout?_s=Fulfillment-init";
 }
 
-/** 誤入 Apple.com 全站搜尋（例如 中環?src=pnf） */
-function isWrongAppleSearchPnfUrl(url: string): boolean {
+/** https://www.apple.com/search/中環?src=pnf 或 /us/search/… */
+function isAppleSiteSearchUrl(url: string): boolean {
   if (!/apple\.com/i.test(url)) return false;
-  if (!/\/search\//i.test(url)) return false;
+  return /\/search\//i.test(url);
+}
+
+/** 誤入 Apple.com 全站搜尋（例如 /search/中環?src=pnf） */
+function isWrongAppleSearchPnfUrl(url: string): boolean {
+  if (!isAppleSiteSearchUrl(url)) return false;
   if (/[?&]src=pnf\b/i.test(url)) return true;
   const term = String(CONFIG.pickupSearch || "中環").trim();
   if (!term) return false;
@@ -5779,34 +5831,52 @@ function isWrongAppleSearchPnfUrl(url: string): boolean {
     /* ignore */
   }
   if (url.includes(encodeURIComponent(term))) return true;
-  // 中環 UTF-8
   if (/%E4%B8%AD%E7%92%B0/i.test(url) || url.includes("中環")) return true;
   return false;
 }
 
 const recoveringWrongSearchPages = new WeakSet<Page>();
 
-/** 誤入 /us/search/中環?src=pnf → 自動返 Fulfillment-init */
+/**
+ * 誤入 https://www.apple.com/search/中環?src=pnf
+ * （常有 “The page you’re looking for can’t be found.”）
+ * → 自動返上一頁嘅 Fulfillment-init（例如 secure9）
+ */
 async function recoverFromWrongAppleSearchIfNeeded(
   page: Page,
   tag = ""
 ): Promise<boolean> {
   const url = page.url();
-  if (!isWrongAppleSearchPnfUrl(url)) return false;
+  if (!isAppleSiteSearchUrl(url)) return false;
   if (recoveringWrongSearchPages.has(page)) return false;
+
+  // src=pnf 或 中環搜尋：等 DOM 再確認 can't be found（有就必返；pnf 即使未見文案都返）
+  const isPnf = /[?&]src=pnf\b/i.test(url) || isWrongAppleSearchPnfUrl(url);
+  if (!isPnf) return false;
+
   recoveringWrongSearchPages.add(page);
   try {
+    await page.waitForTimeout(250).catch(() => {});
+    const notFound = await pageShowsNotFound(page).catch(() => false);
+    // 有 can't be found 文案，或明確 src=pnf／中環 search → 返 checkout
+    if (!notFound && !/[?&]src=pnf\b/i.test(url) && !/%E4%B8%AD%E7%92%B0|中環/.test(url)) {
+      return false;
+    }
+
     const target = fulfillmentInitUrlFrom(url);
     const prefix = tag ? `${tag} ` : "";
     console.warn(
-      `  ${prefix}★ 誤入 Apple search（pnf）→ 自動返 Fulfillment-init：${target}`
+      `  ${prefix}★ search pnf${notFound ? "（can't be found）" : ""} → 自動返 Fulfillment-init：${target}`
     );
     markCheckoutNav(target, "recover-wrong-apple-search");
     await writeStatus({
       phase: "fulfillment_pickup_wait",
-      message: `誤入 search pnf → 返 Fulfillment-init`,
+      stuck: false,
+      message: notFound
+        ? `search pnf can't be found → 返 Fulfillment-init`
+        : `誤入 search pnf → 返 Fulfillment-init`,
       url: target,
-      card: { url: target, message: "recovered from apple search pnf" },
+      card: { url: target, message: "recovered from apple.com/search pnf" },
     }).catch(() => {});
     await withReleaseCheck(
       page.goto(target, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {})
@@ -5818,15 +5888,25 @@ async function recoverFromWrongAppleSearchIfNeeded(
   }
 }
 
-/** 監聽誤導航去 apple.com/search?*src=pnf */
+/** 監聽誤導航去 apple.com/search?*src=pnf 或「找不到你想去的網頁」 */
 function attachWrongAppleSearchRecovery(page: Page): void {
   const flagged = page as Page & { __wrongSearchRecovery?: boolean };
   if (flagged.__wrongSearchRecovery) return;
   flagged.__wrongSearchRecovery = true;
+  const maybeRecover = () => {
+    void (async () => {
+      await recoverFromWrongAppleSearchIfNeeded(page, "[nav]").catch(() => {});
+      await page.waitForTimeout(200).catch(() => {});
+      if (await pageShowsNotFound(page)) {
+        await markPageErrorIfNotFound(page, "[nav-not-found]").catch(() => {});
+      }
+    })();
+  };
   page.on("framenavigated", (frame) => {
     if (frame !== page.mainFrame()) return;
-    void recoverFromWrongAppleSearchIfNeeded(page, "[nav]").catch(() => {});
+    maybeRecover();
   });
+  page.on("load", () => maybeRecover());
 }
 
 /** 頁面／HTTP 係咪 503 Service Temporarily Unavailable */
