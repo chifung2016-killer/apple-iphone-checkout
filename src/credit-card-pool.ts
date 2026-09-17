@@ -419,6 +419,8 @@ export type LiveOrderSpendRow = {
   cardLimit: string;
   remainingLimit: number | null;
   remainingLabel: string;
+  /** 完整 proxy URL，例如 http://user:pass@ip:port */
+  proxy: string;
 };
 
 function orderContactEmail(o: Record<string, unknown>): string {
@@ -586,6 +588,7 @@ export async function getLiveCardLimits(
       cardLimit: cardLimitLabel,
       remainingLimit: isApplePay ? null : remainingNum,
       remainingLabel,
+      proxy: String(o.proxy || "").trim() || "—",
     });
   }
 
