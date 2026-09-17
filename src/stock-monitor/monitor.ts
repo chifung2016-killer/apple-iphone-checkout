@@ -632,8 +632,8 @@ async function maybeResumeHeldCheckoutBrowsers(
         await notifyTelegram({
           title: "有貨 — 通知預熱瀏覽器加購",
           message: [
-            "已通知 Fulfillment-init 待命 task：1 秒後 refresh，再跑完整加購",
-            "（只會跟進同色＋同容量）",
+            "已通知 Fulfillment-init 待命 task：1 秒後 refresh 一次，再繼續加購",
+            "（只會跟進同型號＋同色＋同容量）",
             ...available.map(
               (r) =>
                 `${r.sku.name}｜${r.sku.color || "—"}／${r.sku.storage}｜庫存=${r.stockQty ?? "?"}｜×${r.buyQty}`

@@ -5207,7 +5207,35 @@ function normStorageKey(s: string): string {
     .replace(/\s+/g, "");
 }
 
+function normModelKey(s: string): string {
+  return String(s || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
 function stockSkuMatchesCheckout(sku: StockResumeSku): boolean {
+  const wantModel = normModelKey(CONFIG.model);
+  if (wantModel) {
+    const gotModel = normModelKey(String(sku.model || ""));
+    const name = normModelKey(String(sku.name || ""));
+    const modelOk =
+      (gotModel &&
+        (wantModel === gotModel ||
+          wantModel.includes(gotModel) ||
+          gotModel.includes(wantModel))) ||
+      (name && name.includes(wantModel.replace(/\s+/g, "")));
+    // name 可能係 "iPhone 17 256GB …" — 用簡化比對
+    const modelOkLoose =
+      !gotModel &&
+      name &&
+      wantModel
+        .split(" ")
+        .filter(Boolean)
+        .every((tok) => name.includes(tok));
+    if (!modelOk && !modelOkLoose) return false;
+  }
+
   const wantStorage = normStorageKey(CONFIG.storage);
   const gotStorage = normStorageKey(String(sku.storage || ""));
   if (!wantStorage || !gotStorage || wantStorage !== gotStorage) return false;
@@ -5261,7 +5289,7 @@ async function readStockResumePayload(): Promise<StockResumePayload | null> {
 }
 
 /**
- * 等 monitor 有貨，且 color+storage 同本 task 一致。
+ * 等 monitor 有貨，且 型號+顏色+容量 同本 task 一致。
  * timeoutMs 有設：逾時回 null；否則一直等。
  * afterMs：只要更新過呢個時間戳之後嘅通知。
  */
@@ -5288,7 +5316,7 @@ async function waitForMatchingStockResume(opts?: {
       // 舊格式冇 skus：唔當匹配（避免誤觸）
       if (matched) {
         console.log(
-          `  收到有貨通知（匹配 ${CONFIG.color}／${CONFIG.storage}）at=${new Date(payload.atMs).toISOString()}`
+          `  收到有貨通知（匹配 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage}）at=${new Date(payload.atMs).toISOString()}`
         );
         return payload;
       }
@@ -5659,25 +5687,30 @@ async function attemptFullAddCartToPayment(
   return attemptPickupCheckoutToPayment(page, identity, tag, session);
 }
 
+/**
+ * Monitor+buying：停喺 Fulfillment-init 待命。
+ * 監察到同型號＋同色＋同容量有貨 → refresh 一次 Fulfillment-init → 繼續取貨／聯絡／付款。
+ * 若 refresh 後落單失敗，先再試完整加購一次。
+ */
 async function runMonitorHoldBuyLoop(
   page: Page,
   identity: Identity,
   tag: string,
   session?: BrowserSession
 ): Promise<void> {
-  /** 連續幾耐冇「新」嘅同色同容量通知，就當呢波完 */
+  /** 連續幾耐冇「新」嘅匹配通知，就當呢波完 */
   const STOCK_IDLE_MS = 8_000;
   let lastConsumedAt = 0;
 
   console.log(
-    `${tag} Monitor+buying hold：等 ${CONFIG.color}／${CONFIG.storage} 有貨 → refresh Fulfillment-init → 完整加購`
+    `${tag} Monitor+buying hold：等 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage} 有貨 → refresh Fulfillment-init → 繼續加購`
   );
 
   while (true) {
     await ensureFulfillmentInitStandby(page);
     await writeStatus({
       phase: "waiting_for_stock_at_stores",
-      message: `待命 Fulfillment-init：等 ${CONFIG.color}／${CONFIG.storage} 有貨再加購`,
+      message: `待命 Fulfillment-init：等 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage} 有貨再 refresh`,
       stuck: false,
       stuckSince: null,
     });
@@ -5689,27 +5722,55 @@ async function runMonitorHoldBuyLoop(
       afterMs: gateAt,
     });
 
-    // 有貨波：不斷 refresh Fulfillment-init＋完整加購，直到冇新匹配通知
     while (pending) {
       lastConsumedAt = pending.atMs;
+      const matchLabel = `${CONFIG.model}／${CONFIG.color}／${CONFIG.storage}`;
 
       console.log(
-        `  同色同容量有貨 — ${CONFIG.color}／${CONFIG.storage}：等 1 秒 → refresh Fulfillment-init → 完整加購…`
+        `  監察匹配有貨 — ${matchLabel}：等 1 秒 → refresh Fulfillment-init 一次 → 繼續剩餘步驟…`
       );
       await writeStatus({
         phase: "resuming_after_stock",
-        message: `有貨（${CONFIG.color}／${CONFIG.storage}）：refresh 後完整加購`,
+        message: `有貨（${matchLabel}）：refresh Fulfillment-init 後繼續加購`,
       });
       await sleepCheckingRelease(1000);
-      await gotoFulfillmentInit(page);
+
+      // 只 refresh 而家呢個 Fulfillment-init 頁，唔跳去產品頁
+      markCheckoutNav(page.url(), "stockResumeRefresh");
+      await withReleaseCheck(
+        page.reload({ waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {})
+      );
+      await settleAfterNavigation(page);
+
+      // 若 refresh 後被踢離 checkout，先拉返 Fulfillment-init
+      if (!/\/shop\/checkout/i.test(page.url()) || isShop404Url(page.url())) {
+        console.warn("  refresh 後唔喺 checkout — 嘗試返 Fulfillment-init…");
+        await gotoFulfillmentInit(page);
+      } else if (!/_s=Fulfillment-init/i.test(page.url())) {
+        // 可能已經去咗下一步；若仍喺 checkout 就跟住做
+        console.log(`  refresh 後 URL：${page.url()}`);
+      } else {
+        console.log("  已 refresh Fulfillment-init，繼續取貨／聯絡／付款…");
+      }
 
       try {
-        const reachedPay = await attemptFullAddCartToPayment(
+        let reachedPay = await attemptPickupCheckoutToPayment(
           page,
           identity,
           tag,
           session
         );
+        if (!reachedPay) {
+          console.warn(
+            `${tag} refresh 後直接繼續失敗 — 改試完整加購（產品頁→入袋→結帳）…`
+          );
+          reachedPay = await attemptFullAddCartToPayment(
+            page,
+            identity,
+            tag,
+            session
+          );
+        }
         if (reachedPay) {
           console.log(`${tag} 已到付款頁 — 結束 monitor hold loop`);
           return;
@@ -5728,7 +5789,7 @@ async function runMonitorHoldBuyLoop(
       });
       if (!pending) {
         console.log(
-          `  已 ${STOCK_IDLE_MS / 1000}s 冇新嘅 ${CONFIG.color}／${CONFIG.storage} 通知 → 返 Fulfillment-init 待命`
+          `  已 ${STOCK_IDLE_MS / 1000}s 冇新嘅 ${matchLabel} 通知 → 返 Fulfillment-init 待命`
         );
       }
     }
@@ -9349,7 +9410,7 @@ async function fillShippingAndGoToPayment(
     await settleDom(page, 150);
   }
 
-  // Monitor+buying：喺 Fulfillment-init 待命，只響應同色同容量有貨
+  // Monitor+buying：喺 Fulfillment-init 待命，只響應同型號同色同容量有貨 → refresh → 繼續
   if (CONFIG.holdAtPickupStoresForStock) {
     await runMonitorHoldBuyLoop(page, identity, tag, session);
     return;
