@@ -842,15 +842,26 @@ async function stopSession(
     const stPath = path.join(RUNTIME_DIR, `status-${nid}.json`);
     try {
       const prev = JSON.parse(await fs.readFile(stPath, "utf8")) as Record<string, unknown>;
+      const prevPhase = String(prev.phase || "");
+      // waiting payment 已 steps_complete：Stop 後仍留喺 waiting payment，唔改去 Opened
+      const keepWaitingPayment = /steps_complete|waiting_for_payment/i.test(prevPhase);
       await fs.writeFile(
         stPath,
         JSON.stringify(
           {
             ...prev,
-            phase: "stop_requested",
+            phase: keepWaitingPayment
+              ? /steps_complete/i.test(prevPhase)
+                ? "steps_complete"
+                : "waiting_for_payment"
+              : "stop_requested",
             message: opts?.silent
-              ? "Dashboard Stop all（保持原本視窗位置）"
-              : "Dashboard 要求 Stop（take over）",
+              ? keepWaitingPayment
+                ? "Stop all：自動化已停（仍喺 waiting payment）"
+                : "Dashboard Stop all（保持原本視窗位置）"
+              : keepWaitingPayment
+                ? "自動化已停（仍喺 waiting payment；Open browser 人手操作）"
+                : "Dashboard 要求 Stop（take over）",
             windowHidden: opts?.silent ? false : prev.windowHidden,
             windowState: opts?.silent ? "normal" : prev.windowState,
             updatedAt: new Date().toISOString(),
@@ -875,7 +886,16 @@ async function stopSession(
       for (let i = 0; i < 80; i++) {
         await new Promise((r) => setTimeout(r, 250));
         const st = await readSessionStatus(nid);
-        if (st?.phase === "manual_control" || !session.running) {
+        const phase = String(st?.phase || "");
+        const releaseGone = !(await fs
+          .access(path.join(RUNTIME_DIR, `release-${nid}.flag`))
+          .then(() => true)
+          .catch(() => false));
+        if (
+          st?.phase === "manual_control" ||
+          !session.running ||
+          (/steps_complete|waiting_for_payment/i.test(phase) && releaseGone)
+        ) {
           broadcast({ type: "status", state: await snapshot() });
           break;
         }

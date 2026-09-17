@@ -554,9 +554,12 @@ async function writeStatus(patch: Record<string, unknown>): Promise<void> {
     } else if (
       /steps_complete/i.test(String(prev.phase || "")) &&
       (!patch.phase ||
-        /waiting_user|idle|waiting_for_payment/i.test(String(patch.phase || "")))
+        /waiting_user|idle|waiting_for_payment|manual_control|stop_requested/i.test(
+          String(patch.phase || "")
+        ))
     ) {
-      // steps_complete 之後 window sync／waiting_for_payment 唔好降級
+      // steps_complete 之後 window sync／Stop／waiting_for_payment 唔好降級
+      // （Stop 後仍留喺 waiting payment tab，唔搬去 Opened browsers）
       next.phase = "steps_complete";
     }
 
@@ -9251,7 +9254,12 @@ async function holdSessionsHiddenUntilClose(
         if (/關閉/.test(err.message) || (await flagExists(DASHBOARD_CLOSE_FLAG))) {
           throw err;
         }
-        // Stop take-over：waiting for payment 仍然唔關瀏覽器
+        // Stop take-over：仍留喺 waiting payment（唔改 manual_control／唔搬去 Opened）
+        phase = "steps_complete";
+        await writeStatus({
+          phase: "steps_complete",
+          message: "自動化已停（仍喺 waiting payment；Open browser 人手操作）",
+        }).catch(() => {});
         await new Promise((r) => setTimeout(r, 800));
         continue;
       }

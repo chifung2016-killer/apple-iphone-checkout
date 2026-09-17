@@ -981,9 +981,11 @@
       );
     }
 
-    /** 綠閃／全部步驟做完 → waiting payment */
+    /** 綠閃／全部步驟做完 → waiting payment（含 Stop 後仍 steps_complete） */
     function isWaitingPaymentBrowser(b) {
-      return !isPaidBrowser(b) && /steps_complete/i.test(String(b?.phase || ""));
+      if (isPaidBrowser(b)) return false;
+      const phase = String(b?.phase || "");
+      return /steps_complete/i.test(phase);
     }
 
     function browserSortKey(b) {
