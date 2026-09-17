@@ -73,7 +73,7 @@ type CheckResult = {
 export type RestockHistoryEvent = {
   at: string;
   atHk: string;
-  event: "restock" | "qty_up" | "sold_out";
+  event: "restock" | "qty_up" | "sold_out" | "store_stock";
   name: string;
   model: string;
   color: string;
@@ -82,6 +82,13 @@ export type RestockHistoryEvent = {
   buyQty: number;
   prevStockQty?: number | null;
   detail?: string;
+  storeStocks?: Array<{
+    code: string;
+    name: string;
+    qty: number | null;
+    available: boolean;
+    label: string;
+  }>;
 };
 
 type SkuRuntime = {

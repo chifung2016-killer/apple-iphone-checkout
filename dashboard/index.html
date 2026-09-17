@@ -519,6 +519,7 @@
           <div class="field">
             <label>Product</label>
             <div class="preset-row" id="presetRow">
+              <button type="button" class="btn-ghost" data-preset="iphone17_256_burgundy">iPhone 17 · 256GB · 布根地紅</button>
               <button type="button" class="btn-ghost" data-preset="iphone18promax_burgundy">iPhone 18 Pro Max · 256GB · 布根地紅</button>
               <button type="button" class="btn-ghost" data-preset="iphone18promax_glacier">iPhone 18 Pro Max · 256GB · 冰川色</button>
               <button type="button" class="btn-ghost" data-preset="iphone18promax_silver">iPhone 18 Pro Max · 256GB · 銀色</button>
@@ -619,7 +620,7 @@
           <div class="restock-history" style="margin-top:12px">
             <div class="restock-history-head">
               <h3 style="margin:0 0 6px;font-size:0.95rem">Live 補貨紀錄</h3>
-              <p class="hint" style="margin:0">實時列出補貨時間、型號、顏色、容量、數量（最新喺上）。</p>
+              <p class="hint" style="margin:0">實時列出補貨時間、型號、顏色、容量、數量；門市庫存格式如 <b>IFC (2) · TST (0) · CWB (有貨)</b>（最新喺上）。</p>
             </div>
             <div class="card-limits-wrap restock-wrap" style="max-height:260px;margin-top:8px">
               <table class="card-limits" id="restockHistoryTable">
@@ -750,6 +751,9 @@
     const URL_PM_256_BURGUNDY =
       "https://www.apple.com/hk-zh/shop/buy-iphone/iphone-18-pro/6.9-%E5%90%8B%E9%A1%AF%E7%A4%BA%E5%99%A8-256gb-%E5%B8%83%E6%A0%B9%E5%9C%B0%E7%B4%85%E8%89%B2";
     const URL_PM_512_BURGUNDY = URL_PM_256_BURGUNDY.replace("256gb", "512gb");
+    /** iPhone 17 256GB — 產品頁（會 autoclick 布根地紅／對應顏色掣） */
+    const URL_IPHONE17_256 =
+      "https://www.apple.com/hk-zh/shop/buy-iphone/iphone-17/6.3-%E5%90%8B%E9%A1%AF%E7%A4%BA%E5%99%A8-256gb-%E8%96%B0%E8%A1%A3%E8%8D%89%E7%B4%AB%E8%89%B2";
 
     const SALE_START_IPHONE18 = "2026-09-12T20:00:00+08:00";
 
@@ -765,6 +769,14 @@
     }
 
     const PRODUCT_PRESETS = {
+      iphone17_256_burgundy: {
+        buyUrl: URL_IPHONE17_256,
+        model: "iPhone 17",
+        color: "布根地紅色",
+        storage: "256GB",
+        label: "iPhone 17 · 256GB · 布根地紅",
+        saleStartIso: SALE_START_IPHONE18,
+      },
       iphone18promax_burgundy: {
         buyUrl: URL_PM_256_BURGUNDY,
         model: "iPhone 18 Pro Max",
@@ -1754,6 +1766,7 @@
       if (t === "restock") return "補貨上架";
       if (t === "qty_up") return "數量增加";
       if (t === "sold_out") return "售罄";
+      if (t === "store_stock") return "門市庫存";
       return t || "—";
     }
 
@@ -1768,14 +1781,24 @@
       }
       body.innerHTML = list
         .map((e) => {
-          const qty =
-            e.event === "qty_up" && e.prevStockQty != null
-              ? `${e.prevStockQty} → ${e.stockQty ?? "?"}`
-              : e.stockQty != null
-                ? String(e.stockQty)
-                : "—";
+          let qty = "—";
+          if (e.event === "store_stock") {
+            if (Array.isArray(e.storeStocks) && e.storeStocks.length) {
+              qty = e.storeStocks
+                .map((s) => s.label || `${s.code} (${s.qty ?? (s.available ? "有貨" : "0")})`)
+                .join(" · ");
+            } else if (e.detail) {
+              qty = String(e.detail);
+            }
+          } else if (e.event === "qty_up" && e.prevStockQty != null) {
+            qty = `${e.prevStockQty} → ${e.stockQty ?? "?"}`;
+          } else if (e.stockQty != null) {
+            qty = String(e.stockQty);
+          } else if (e.detail) {
+            qty = String(e.detail);
+          }
           const cls =
-            e.event === "restock" || e.event === "qty_up"
+            e.event === "restock" || e.event === "qty_up" || e.event === "store_stock"
               ? "touched"
               : e.event === "sold_out"
                 ? "low"
@@ -1786,7 +1809,7 @@
             <td>${esc(e.model || e.name || "—")}</td>
             <td>${esc(e.color || "—")}</td>
             <td>${esc(e.storage || "—")}</td>
-            <td class="num">${esc(qty)}</td>
+            <td class="num" style="white-space:normal;text-align:left;font-variant-numeric:tabular-nums">${esc(qty)}</td>
           </tr>`;
         })
         .join("");
