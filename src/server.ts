@@ -54,7 +54,7 @@ const ORDERS_FILE = path.join(ROOT, "order-summary.json");
 const CONTINUE_ALL_FLAG = path.join(ROOT, "dashboard-continue.flag");
 const PROXY_BLACKLIST_FILE = path.join(RUNTIME_DIR, "proxy-blacklist.json");
 /** 每個 Proxy / IP 最多同時／累計分配畀幾多個 browser */
-const PROXY_BROWSERS_PER_IP = 5;
+const PROXY_BROWSERS_PER_IP = 3;
 const GMAIL_ACCOUNTS_ENC = path.join(RUNTIME_DIR, "gmail-accounts.enc");
 const GMAIL_ACCOUNTS_LEGACY = path.join(RUNTIME_DIR, "gmail-accounts-saved.txt");
 const ADD_ORDER_KEY = path.join(RUNTIME_DIR, ".add-order-key");
@@ -825,7 +825,7 @@ async function pickProxyForNewTask(poolRaw: unknown): Promise<string> {
     usage.set(key, (usage.get(key) || 0) + 1);
   }
 
-  // 跟用戶填寫順序：一條用滿 5 個 browser 先用下一條
+  // 跟用戶填寫順序：一條用滿 3 個 browser 先用下一條
   for (const p of pool) {
     const key = normalizeProxyKey(p);
     if (!key || banned.has(key)) continue;
@@ -1064,7 +1064,7 @@ async function spawnOneBrowser(
     ...cleanConfig,
     browserCount: 1,
   } as Record<string, unknown> & { browserCount: number };
-  // 多個 proxy：每條最多分配畀 5 個 browser，用滿先換下一條（唔隨機重複）
+  // 多個 proxy：每條最多分配畀 3 個 browser，用滿先換下一條（唔隨機重複）
   const assignedProxy = await pickProxyForNewTask(cleanConfig.proxy);
   sessionConfig.proxy = assignedProxy;
   if (assignedProxy) {
