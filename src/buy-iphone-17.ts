@@ -5421,10 +5421,13 @@ async function softRefreshFulfillmentNow(page: Page): Promise<void> {
   await settleAfterNavigation(page);
 }
 
-async function clickContinueToPickupDetails(page: Page): Promise<boolean> {
-  // 已入 PickupContact 就即刻停，唔好再撳「繼續前往取貨詳情」
+/**
+ * 只撳一次「繼續前往取貨詳情」，等 loading。
+ * @returns true = 已去下一頁（PickupContact 或離開 Fulfillment）
+ */
+async function clickContinueToPickupDetailsOnce(page: Page): Promise<boolean> {
   if (isPickupContactPage(page.url())) {
-    console.log("  已喺 PickupContact，停止撳「繼續前往取貨詳情」");
+    console.log("  已喺 PickupContact，唔使再撳「繼續前往取貨詳情」");
     return true;
   }
 
@@ -5433,9 +5436,12 @@ async function clickContinueToPickupDetails(page: Page): Promise<boolean> {
     !isShop404Url(url) &&
     !isPickupContactPage(url);
 
-  console.log(
-    "  「繼續前往取貨詳情」：撳掣 → 等 loading 停 → 若仍喺 Fulfillment-init 就 refresh 重試，直到下一頁…"
-  );
+  if (usesPickupGuestStoreContinueRules()) {
+    // 門市撳完應已捲底；保險再捲一次確保掣入視窗
+    await scrollPageToBottom(page);
+  } else {
+    await scrollPageToBottom(page);
+  }
 
   const locators = [
     page.getByRole("button", { name: /繼續前往取貨詳情/ }),
@@ -5444,125 +5450,158 @@ async function clickContinueToPickupDetails(page: Page): Promise<boolean> {
     page.locator('button:has-text("繼續前往取貨詳情"), a:has-text("繼續前往取貨詳情")'),
   ];
 
-  const overallDeadline = Date.now() + 180_000;
-  let round = 0;
+  let target: Locator | null = null;
+  for (const loc of locators) {
+    const el = loc.first();
+    if (await visible(el, 1200)) {
+      target = el;
+      break;
+    }
+    if ((await el.count().catch(() => 0)) > 0) {
+      target = el;
+      break;
+    }
+  }
 
-  while (Date.now() < overallDeadline) {
+  if (!target) {
+    console.warn("  揾唔到「繼續前往取貨詳情」掣");
+    return false;
+  }
+
+  markCheckoutNav(page.url(), "fulfillment-before-continue");
+  await target.scrollIntoViewIfNeeded().catch(() => {});
+  await humanClick(target, { force: true }).catch(async () => {
+    await target!.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
+  });
+  console.log("  已撳「繼續前往取貨詳情」— 等 loading…");
+
+  await waitForCheckoutLoadingSettled(page, {
+    timeoutMs: 25_000,
+    stayOn: stayOnFulfillment,
+  });
+
+  if (isPickupContactPage(page.url())) {
+    console.log("  ✓ 已進入 PickupContact");
+    return true;
+  }
+  if (isShop404Url(page.url())) {
+    await recoverFromShop404IfNeeded(page, "[continue-pickup]");
+    return false;
+  }
+  if (!stayOnFulfillment(page.url())) {
+    console.log(`  ✓ 已離開 Fulfillment → ${page.url()}`);
+    return true;
+  }
+  console.warn("  loading 完仍喺 Fulfillment-init，未能去下一頁");
+  return false;
+}
+
+/**
+ * @deprecated 外層用 runPickupStoreContinueSet；保留別名相容
+ */
+async function clickContinueToPickupDetails(page: Page): Promise<boolean> {
+  return clickContinueToPickupDetailsOnce(page);
+}
+
+/**
+ * 一套步驟：撳任一門市 → 撳「繼續前往取貨詳情」。
+ * 若未能去下一頁 → refresh Fulfillment-init → 重複同一套（取貨＋中環＋門市＋繼續）。
+ */
+async function runPickupStoreContinueSet(page: Page): Promise<boolean> {
+  const MAX_SETS = 12;
+  console.log(
+    `  門市＋「繼續前往取貨詳情」成套重試（最多 ${MAX_SETS} 次；失敗就 refresh）…`
+  );
+
+  for (let set = 1; set <= MAX_SETS; set++) {
     await throwIfReleased();
 
     if (isPickupContactPage(page.url())) {
-      console.log("  已進入 PickupContact，停止撳「繼續前往取貨詳情」");
-      return true;
-    }
-    if (isShop404Url(page.url())) {
-      await recoverFromShop404IfNeeded(page, "[continue-pickup]");
-      return false;
-    }
-    if (!stayOnFulfillment(page.url()) && round > 0) {
-      console.log(`  已離開 Fulfillment → ${page.url()}`);
+      console.log("  已喺 PickupContact");
+      if (usesFastPickupContactFill()) {
+        await fillPickupContactGuestAndContinue(page, "[PickupContact]");
+      }
       return true;
     }
 
-    round += 1;
-    markCheckoutNav(page.url(), "fulfillment-before-continue");
+    console.log(`  —— set ${set}/${MAX_SETS}：門市 → 繼續前往取貨詳情 ——`);
+    await writeStatus({
+      phase: "pickup_store_continue_set",
+      message: `門市＋繼續 set ${set}/${MAX_SETS}`,
+      url: page.url(),
+    }).catch(() => {});
 
-    if (usesPickupGuestStoreContinueRules()) {
-      // 取貨：唔喺呢度捲頁（門市撳完已捲一次）；refresh 後可能要再捲
-      if (round > 1) await scrollPageToBottom(page);
-    } else {
-      await scrollPageToBottom(page);
-    }
-
-    let target: Locator | null = null;
-    for (const loc of locators) {
-      const el = loc.first();
-      if (await visible(el, 800)) {
-        target = el;
-        break;
-      }
-      if ((await el.count().catch(() => 0)) > 0) {
-        target = el;
-        break;
-      }
-    }
-
-    if (!target) {
-      console.warn(`  「繼續前往取貨詳情」第 ${round} 輪：揾唔到掣 → refresh 重試`);
-      await softRefreshFulfillmentNow(page);
+    // 確保喺 Fulfillment-init
+    if (!/_s=Fulfillment/i.test(page.url()) || isShop404Url(page.url())) {
       if (isShop404Url(page.url())) {
-        await recoverFromShop404IfNeeded(page, "[continue-pickup-no-btn]");
-        return false;
+        await recoverFromShop404IfNeeded(page, "[store-continue-set]").catch(() => {});
       }
-      // refresh 後要重新搜門市＋揀店先有掣
-      if (!(await fillPickupSearchAndWaitHeading(page))) {
-        await sleepCheckingRelease(800);
-        continue;
-      }
-      if (!(await clickAnyNearbyStore(page))) {
-        await sleepCheckingRelease(800);
-        continue;
-      }
+      await gotoFulfillmentInit(page);
+    }
+
+    const detailsOk = await waitForFulfillmentInitDetailsReady(page).catch(() => false);
+    if (!detailsOk && (await isFulfillment503(page))) {
+      console.warn("  set：Fulfillment 503 → 6s 後 refresh…");
+      await sleepCheckingRelease(6_000);
+      await softRefreshFulfillmentNow(page);
       continue;
     }
 
-    await target.scrollIntoViewIfNeeded().catch(() => {});
-    await humanClick(target, { force: true }).catch(async () => {
-      await target!.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
-    });
-    console.log(`  已撳「繼續前往取貨詳情」（第 ${round} 輪）— 等 loading…`);
+    await clickPickupOption(page).catch(() => {});
+    await sleepCheckingRelease(usesFastPickupContactFill() ? 120 : 300);
 
-    await waitForCheckoutLoadingSettled(page, {
-      timeoutMs: 25_000,
-      stayOn: stayOnFulfillment,
-    });
+    if (!(await fillPickupSearchAndWaitHeading(page))) {
+      console.warn(`  set ${set}：搜尋中環失敗 → refresh 再試`);
+      await softRefreshFulfillmentNow(page);
+      continue;
+    }
+
+    if (set === 1) {
+      await recordStoreStocksToRestockHistory(page).catch(() => {});
+    }
+
+    const storeClicked = await clickAnyNearbyStore(page);
+    if (!storeClicked) {
+      console.warn(`  set ${set}：撳唔到門市掣 → refresh 再試`);
+      await softRefreshFulfillmentNow(page);
+      continue;
+    }
 
     if (isPickupContactPage(page.url())) {
-      console.log("  loading 完後已進入 PickupContact");
-      return true;
-    }
-    if (isShop404Url(page.url())) {
-      await recoverFromShop404IfNeeded(page, "[continue-pickup-after-loading]");
-      return false;
-    }
-    if (!stayOnFulfillment(page.url())) {
-      console.log(`  loading 完後已離開 Fulfillment → ${page.url()}`);
+      console.log("  撳門市後已到 PickupContact");
+      if (usesFastPickupContactFill()) {
+        await fillPickupContactGuestAndContinue(page, "[PickupContact]");
+      }
       return true;
     }
 
-    // loading 已停但仍喺 Fulfillment-init → refresh 再成個流程重試
+    const advanced = await clickContinueToPickupDetailsOnce(page);
+    if (advanced || isPickupContactPage(page.url())) {
+      if (usesFastPickupContactFill() && isPickupContactPage(page.url())) {
+        await fillPickupContactGuestAndContinue(page, "[PickupContact]");
+      }
+      return true;
+    }
+
+    // 未能去下一頁 → refresh，再做同一套
     console.log(
-      "  loading 已停但仍喺 Fulfillment-init → refresh 頁面，重複揀店＋繼續…"
+      `  set ${set}：未能去下一頁 → refresh Fulfillment-init，重複門市＋繼續…`
     );
     await writeStatus({
       phase: "fulfillment_continue_refresh",
       url: page.url(),
-      message: `繼續前往取貨詳情 loading 停咗仍未去下一頁 → refresh（第 ${round} 輪）`,
+      message: `set ${set}：繼續失敗 → refresh 後重做同一套`,
     }).catch(() => {});
-
     await softRefreshFulfillmentNow(page);
-    if (isShop404Url(page.url())) {
-      await recoverFromShop404IfNeeded(page, "[continue-pickup-refresh]");
-      return false;
-    }
-    if (isPickupContactPage(page.url())) return true;
-
-    if (!(await fillPickupSearchAndWaitHeading(page))) {
-      await sleepCheckingRelease(800);
-      continue;
-    }
-    if (!(await clickAnyNearbyStore(page))) {
-      await sleepCheckingRelease(800);
-      continue;
-    }
   }
 
   if (isPickupContactPage(page.url())) {
-    console.log("  已喺 PickupContact（超時後確認），當成功。");
+    if (usesFastPickupContactFill()) {
+      await fillPickupContactGuestAndContinue(page, "[PickupContact]");
+    }
     return true;
   }
-  console.warn(
-    "  「繼續前往取貨詳情」多次 refresh 仍未去下一頁（之後外層會再試）。"
-  );
+  console.warn(`  ${MAX_SETS} 套門市＋繼續仍未能去下一頁`);
   return false;
 }
 
@@ -6074,89 +6113,8 @@ async function fillPickupSearchAndWaitHeading(page: Page): Promise<boolean> {
 async function choosePickupStore(page: Page): Promise<boolean> {
   console.log(`  搜尋取貨地點：${CONFIG.pickupSearch}`);
   await sleepCheckingRelease(usesFastPickupContactFill() ? 150 : 800);
-
-  if (!(await fillPickupSearchAndWaitHeading(page))) return false;
-  await recordStoreStocksToRestockHistory(page).catch(() => {});
-
-  // 最多試 6 間（唔重複）；某一間「繼續」失敗就換下一間
-  for (let storeTry = 1; storeTry <= 6; storeTry++) {
-    if (isPickupContactPage(page.url())) {
-      console.log("  已喺 PickupContact，即刻一次過 autofill");
-      if (usesFastPickupContactFill()) {
-        await fillPickupContactGuestAndContinue(page, "[PickupContact]");
-      }
-      return true;
-    }
-
-    const storeClicked = await clickAnyNearbyStore(page);
-    if (!storeClicked) {
-      console.warn(`  門市嘗試 ${storeTry}/6：冇剩餘未試過嘅掣`);
-      return false;
-    }
-
-    if (isPickupContactPage(page.url())) {
-      console.log("  撳門市後已到 PickupContact，即刻一次過 autofill");
-      if (usesFastPickupContactFill()) {
-        await fillPickupContactGuestAndContinue(page, "[PickupContact]");
-      }
-      return true;
-    }
-
-    const toDetails = await clickContinueToPickupDetails(page);
-    if (isPickupContactPage(page.url())) {
-      console.log("  已到達 PickupContact，即刻一次過 autofill");
-      if (usesFastPickupContactFill()) {
-        await fillPickupContactGuestAndContinue(page, "[PickupContact]");
-      }
-      return true;
-    }
-    if (!toDetails) {
-      console.warn(
-        `  門市嘗試 ${storeTry}/6：「繼續前往取貨詳情」失敗，換另一間未試過嘅門市…`
-      );
-      if (!/_s=Fulfillment/i.test(page.url())) return false;
-      continue;
-    }
-
-    await withReleaseCheck(
-      page
-        .waitForURL(
-          (url) =>
-            isPickupContactPage(url.toString()) ||
-            !/_s=Fulfillment/i.test(url.toString()),
-          { timeout: 15000 }
-        )
-        .catch(() => {})
-    );
-    if (isPickupContactPage(page.url())) {
-      await settleDom(page, 50);
-      console.log("  已到達 PickupContact，即刻一次過 autofill");
-      if (usesFastPickupContactFill()) {
-        await fillPickupContactGuestAndContinue(page, "[PickupContact]");
-      }
-      return true;
-    }
-    await settleDom(page, 100);
-
-    if (isPickupContactPage(page.url())) {
-      console.log("  已到達 PickupContact，即刻一次過 autofill");
-      if (usesFastPickupContactFill()) {
-        await fillPickupContactGuestAndContinue(page, "[PickupContact]");
-      }
-      return true;
-    }
-
-    console.warn(`  未到達 PickupContact 頁。而家 URL：${page.url()}`);
-    if (/_s=Fulfillment/i.test(page.url())) {
-      console.warn(`  門市嘗試 ${storeTry}/6：仍喺 Fulfillment，換另一間…`);
-      continue;
-    }
-    // 已離開 Fulfillment 但唔係標準 PickupContact URL，仍交俾後續填表
-    return true;
-  }
-
-  console.warn("  6 個門市掣都試過仍未能繼續。");
-  return false;
+  // 成套：門市掣 →「繼續前往取貨詳情」；失敗就 refresh 再做同一套
+  return runPickupStoreContinueSet(page);
 }
 
 /** Monitor+buying：Fulfillment-init 待命 → 同色同容量有貨就 refresh 再落單；冇新通知就返待命 */
