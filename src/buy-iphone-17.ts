@@ -2416,6 +2416,16 @@ function isShop404Url(url: string): boolean {
 const PAGE_NOT_FOUND_TEXT_RE =
   /The page you[\u2019']?re looking for can[\u2019']?t be found|找不到你想去的網頁|找不到你要找的頁面|找不到你要尋找的頁面|找不到此頁面|頁面不存在/i;
 
+/** can't be found 時優先返產品購買頁（再由腳本重新入 checkout） */
+const FALLBACK_BUY_URL_ON_NOT_FOUND =
+  "https://www.apple.com/hk-zh/shop/buy-iphone/iphone-18-pro/6.9-%E5%90%8B%E9%A1%AF%E7%A4%BA%E5%99%A8-512gb-%E5%86%B0%E5%B7%9D%E8%89%B2";
+
+function buyUrlForNotFoundRecovery(): string {
+  const cfg = String(CONFIG.buyUrl || "").trim();
+  if (/\/shop\/buy-iphone\//i.test(cfg)) return cfg;
+  return FALLBACK_BUY_URL_ON_NOT_FOUND;
+}
+
 async function pageShowsNotFound(page: Page): Promise<boolean> {
   if (isShop404Url(page.url())) return true;
   return page
@@ -2429,7 +2439,7 @@ async function pageShowsNotFound(page: Page): Promise<boolean> {
     .catch(() => false);
 }
 
-/** Opened browsers：標 page error；「找不到你想去的網頁」等 → 自動返 Fulfillment-init */
+/** Opened browsers：標 page error；can't be found → 先返 buy-iphone 產品頁 */
 async function markPageErrorIfNotFound(
   page: Page,
   context = ""
@@ -2438,13 +2448,17 @@ async function markPageErrorIfNotFound(
   const url = page.url();
   const prefix = context ? `[${context}] ` : "";
 
-  // 已喺 Fulfillment 就唔使跳走（可能係短暫 soft 404 文案誤判）
-  // search pnf／其它錯頁 → 一律返 Fulfillment-init
-  if (isAppleSiteSearchUrl(url) || !/_s=Fulfillment/i.test(url) || /apple\.com\/search/i.test(url)) {
+  // 已喺正確產品頁就唔重複跳
+  if (/\/shop\/buy-iphone\//i.test(url) && !isAppleSiteSearchUrl(url)) {
+    console.warn(`  ${prefix}★ page not found 但仍喺 buy-iphone｜${url}`);
+  } else {
     console.warn(
-      `  ${prefix}★ 「找不到你想去的網頁」／page not found → 自動返 Fulfillment-init｜${url}`
+      `  ${prefix}★ “The page you're looking for can't be found.”／找不到網頁 → 先返產品購買頁｜${url}`
     );
-    const recovered = await recoverToFulfillmentInitFromNotFound(page, context || "page-not-found");
+    const recovered = await recoverToBuyPageFromNotFound(
+      page,
+      context || "page-not-found"
+    );
     if (recovered) return true;
   }
 
@@ -2455,10 +2469,10 @@ async function markPageErrorIfNotFound(
     phase: "page_error",
     stuck: true,
     url,
-    message: "page error: 找不到你想去的網頁",
+    message: "page error: The page you're looking for can't be found.",
     card: {
       url,
-      message: "page error: 找不到你想去的網頁",
+      message: "page error: The page you're looking for can't be found.",
     },
   }).catch(() => {});
   return true;
@@ -2466,38 +2480,41 @@ async function markPageErrorIfNotFound(
 
 const recoveringNotFoundPages = new WeakSet<Page>();
 
-/** 見到「找不到你想去的網頁」→ goto 上一頁／預設 secure store Fulfillment-init */
-async function recoverToFulfillmentInitFromNotFound(
+/** “can't be found” → 先去產品購買頁（CONFIG.buyUrl／冰川藍 fallback） */
+async function recoverToBuyPageFromNotFound(
   page: Page,
   tag = ""
 ): Promise<boolean> {
   if (recoveringNotFoundPages.has(page)) return false;
   recoveringNotFoundPages.add(page);
   try {
-    // 優先走 search 專用 recovery（同一個 goto）
-    if (isAppleSiteSearchUrl(page.url())) {
-      const ok = await recoverFromWrongAppleSearchIfNeeded(page, tag);
-      if (ok) return true;
-    }
-    const target = fulfillmentInitUrlFrom(page.url());
+    const target = buyUrlForNotFoundRecovery();
     const prefix = tag ? `${tag} ` : "";
-    console.warn(`  ${prefix}★ 返 Fulfillment-init：${target}`);
-    markCheckoutNav(target, "recover-not-found-zh");
+    console.warn(`  ${prefix}★ 返產品購買頁（先）：${target}`);
+    markCheckoutNav(target, "recover-not-found-to-buy");
     await writeStatus({
-      phase: "fulfillment_pickup_wait",
+      phase: "recover_to_buy",
       stuck: false,
-      message: `找不到你想去的網頁 → 返 Fulfillment-init`,
+      message: `can't be found → 先返產品購買頁`,
       url: target,
-      card: { url: target, message: "recovered: 找不到你想去的網頁" },
+      card: { url: target, message: "recovered: can't be found → buy page" },
     }).catch(() => {});
     await withReleaseCheck(
       page.goto(target, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {})
     );
-    await settleDom(page, 300);
-    return /_s=Fulfillment/i.test(page.url());
+    await settleDom(page, 400);
+    return /\/shop\/buy-iphone\//i.test(page.url());
   } finally {
     recoveringNotFoundPages.delete(page);
   }
+}
+
+/** @deprecated 改用 recoverToBuyPageFromNotFound；保留別名以免漏改 */
+async function recoverToFulfillmentInitFromNotFound(
+  page: Page,
+  tag = ""
+): Promise<boolean> {
+  return recoverToBuyPageFromNotFound(page, tag);
 }
 
 /** 上一頁時間戳：用嚟量 /shop/404 由邊頁跳過嚟、隔咗幾耐 */
@@ -5840,7 +5857,7 @@ const recoveringWrongSearchPages = new WeakSet<Page>();
 /**
  * 誤入 https://www.apple.com/search/中環?src=pnf
  * （常有 “The page you’re looking for can’t be found.”）
- * → 自動返上一頁嘅 Fulfillment-init（例如 secure9）
+ * → 先返產品購買頁
  */
 async function recoverFromWrongAppleSearchIfNeeded(
   page: Page,
@@ -5850,7 +5867,6 @@ async function recoverFromWrongAppleSearchIfNeeded(
   if (!isAppleSiteSearchUrl(url)) return false;
   if (recoveringWrongSearchPages.has(page)) return false;
 
-  // src=pnf 或 中環搜尋：等 DOM 再確認 can't be found（有就必返；pnf 即使未見文案都返）
   const isPnf = /[?&]src=pnf\b/i.test(url) || isWrongAppleSearchPnfUrl(url);
   if (!isPnf) return false;
 
@@ -5858,31 +5874,30 @@ async function recoverFromWrongAppleSearchIfNeeded(
   try {
     await page.waitForTimeout(250).catch(() => {});
     const notFound = await pageShowsNotFound(page).catch(() => false);
-    // 有 can't be found 文案，或明確 src=pnf／中環 search → 返 checkout
     if (!notFound && !/[?&]src=pnf\b/i.test(url) && !/%E4%B8%AD%E7%92%B0|中環/.test(url)) {
       return false;
     }
 
-    const target = fulfillmentInitUrlFrom(url);
+    const target = buyUrlForNotFoundRecovery();
     const prefix = tag ? `${tag} ` : "";
     console.warn(
-      `  ${prefix}★ search pnf${notFound ? "（can't be found）" : ""} → 自動返 Fulfillment-init：${target}`
+      `  ${prefix}★ search pnf${notFound ? "（can't be found）" : ""} → 先返產品購買頁：${target}`
     );
-    markCheckoutNav(target, "recover-wrong-apple-search");
+    markCheckoutNav(target, "recover-wrong-apple-search-to-buy");
     await writeStatus({
-      phase: "fulfillment_pickup_wait",
+      phase: "recover_to_buy",
       stuck: false,
       message: notFound
-        ? `search pnf can't be found → 返 Fulfillment-init`
-        : `誤入 search pnf → 返 Fulfillment-init`,
+        ? `search pnf can't be found → 先返產品購買頁`
+        : `誤入 search pnf → 先返產品購買頁`,
       url: target,
-      card: { url: target, message: "recovered from apple.com/search pnf" },
+      card: { url: target, message: "recovered from search pnf → buy page" },
     }).catch(() => {});
     await withReleaseCheck(
       page.goto(target, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {})
     );
-    await settleDom(page, 300);
-    return /_s=Fulfillment/i.test(page.url());
+    await settleDom(page, 400);
+    return /\/shop\/buy-iphone\//i.test(page.url());
   } finally {
     recoveringWrongSearchPages.delete(page);
   }
