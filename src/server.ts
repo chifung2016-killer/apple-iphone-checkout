@@ -38,6 +38,7 @@ import {
   loadCardVault,
   loadCardVaultState,
   maskedRows,
+  removeCardsByIds,
   summarizeVault,
   upsertCardsFromText,
 } from "./checkout-card-vault.js";
@@ -1896,6 +1897,29 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
       statePath: CHECKOUT_CARDS_STATE,
       text: String(body.text || ""),
       replace: Boolean(body.replace),
+    });
+    if (!result.ok) return sendJson(res, 400, result);
+    const cards = await loadCardVault(CHECKOUT_CARDS_ENC, ADD_ORDER_KEY);
+    const state = await loadCardVaultState(CHECKOUT_CARDS_STATE);
+    return sendJson(res, 200, {
+      ...result,
+      summary: summarizeVault(cards, state),
+      rows: maskedRows(cards, state),
+    });
+  }
+
+  if (pathname === "/api/checkout-cards/remove" && req.method === "POST") {
+    let body: { ids?: string[] } = {};
+    try {
+      body = JSON.parse(await readBody(req)) as typeof body;
+    } catch {
+      return sendJson(res, 400, { ok: false, error: "invalid JSON" });
+    }
+    const result = await removeCardsByIds({
+      encPath: CHECKOUT_CARDS_ENC,
+      keyPath: ADD_ORDER_KEY,
+      statePath: CHECKOUT_CARDS_STATE,
+      ids: Array.isArray(body.ids) ? body.ids : [],
     });
     if (!result.ok) return sendJson(res, 400, result);
     const cards = await loadCardVault(CHECKOUT_CARDS_ENC, ADD_ORDER_KEY);

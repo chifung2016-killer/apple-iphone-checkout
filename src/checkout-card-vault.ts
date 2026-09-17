@@ -315,3 +315,33 @@ export async function excludeCheckoutCardById(
   state.usedIds = state.usedIds.filter((id) => id !== cardId);
   await saveCardVaultState(statePath, state);
 }
+
+/** 由池中刪除選中嘅卡（連 state 一齊清） */
+export async function removeCardsByIds(opts: {
+  encPath: string;
+  keyPath: string;
+  statePath: string;
+  ids: string[];
+}): Promise<{ ok: true; removed: number; total: number } | { ok: false; error: string }> {
+  const idSet = new Set(
+    (Array.isArray(opts.ids) ? opts.ids : []).map((x) => String(x || "").trim()).filter(Boolean)
+  );
+  if (!idSet.size) {
+    return { ok: false, error: "未選取任何信用卡" };
+  }
+  const cards = await loadCardVault(opts.encPath, opts.keyPath);
+  const next = cards.filter((c) => !idSet.has(c.id));
+  const removed = cards.length - next.length;
+  if (!removed) {
+    return { ok: false, error: "揀中嘅卡唔喺池入面" };
+  }
+  await saveCardVault(opts.encPath, opts.keyPath, next);
+  const st = await loadCardVaultState(opts.statePath);
+  st.excludedIds = st.excludedIds.filter((id) => !idSet.has(id));
+  st.usedIds = st.usedIds.filter((id) => !idSet.has(id));
+  for (const [sid, cid] of Object.entries(st.inUse)) {
+    if (idSet.has(cid)) delete st.inUse[sid];
+  }
+  await saveCardVaultState(opts.statePath, st);
+  return { ok: true, removed, total: next.length };
+}

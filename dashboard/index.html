@@ -103,6 +103,29 @@
       color: #ffe6c2; border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--line));
     }
     .btn-sm { padding: 7px 12px; font-size: 0.8rem; }
+    .card-vault-list {
+      margin-top: 8px;
+      max-height: 180px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 6px 8px;
+      background: rgba(0,0,0,0.03);
+      font-size: 0.82rem;
+      color: var(--muted);
+    }
+    .card-vault-list .empty { padding: 4px 0; }
+    .card-vault-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 2px;
+      cursor: pointer;
+      border-radius: 4px;
+    }
+    .card-vault-row:hover { background: rgba(0,0,0,0.05); }
+    .card-vault-row input { margin: 0; }
+    .card-vault-row .status { opacity: 0.75; }
     .log {
       height: 220px; overflow: auto; background: #0b100e; border: 1px solid var(--line);
       border-radius: 12px; padding: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -557,12 +580,14 @@
             <div class="actions" style="margin-top:8px">
               <button type="button" class="btn-primary btn-sm" id="btnSaveCheckoutCards">Save cards</button>
               <button type="button" class="btn-ghost btn-sm" id="btnRefreshCheckoutCards">Refresh status</button>
+              <button type="button" class="btn-ghost btn-sm" id="btnSelectAllCheckoutCards">Select all</button>
+              <button type="button" class="btn-danger btn-sm" id="btnRemoveCheckoutCards" title="刪除已選信用卡（永久移出加密池）">Remove selected</button>
             </div>
             <p class="hint" style="margin:6px 0 0">
               信用卡訪客模式（pickup／delivery）會<strong>隨機用不重複</strong>嘅卡去 Billing autofill，之後自動撳「檢查你的訂單」。拒單／失敗會排除該卡。Apple Pay 模式唔用。
               <span id="checkoutCardsMeta">—</span>
             </p>
-            <div id="checkoutCardsList" class="hint" style="margin-top:6px; white-space:pre-wrap"></div>
+            <div id="checkoutCardsList" class="card-vault-list" aria-label="Saved credit cards"></div>
           </div>
           <div class="field">
             <label for="productPollIntervalMs">Refresh interval (ms)</label>
@@ -2076,13 +2101,26 @@
         }
         if (list) {
           const rows = Array.isArray(data.rows) ? data.rows : [];
-          list.textContent = rows.length
-            ? rows.map((r) => `${r.masked}  [${r.status}]`).join("\n")
-            : "尚未儲存信用卡。";
+          if (!rows.length) {
+            list.innerHTML = '<div class="empty">尚未儲存信用卡。</div>';
+          } else {
+            list.innerHTML = rows
+              .map(
+                (r) =>
+                  `<label class="card-vault-row"><input type="checkbox" class="card-vault-check" value="${esc(r.id)}" /><span>${esc(r.masked)}</span><span class="status">[${esc(r.status)}]</span></label>`
+              )
+              .join("");
+          }
         }
       } catch {
         if (meta) meta.textContent = "（讀取失敗）";
       }
+    }
+
+    function selectedCheckoutCardIds() {
+      return [...document.querySelectorAll("#checkoutCardsList .card-vault-check:checked")].map(
+        (el) => String(el.value || "")
+      );
     }
 
     $("btnSaveCheckoutCards")?.addEventListener("click", async () => {
@@ -2124,6 +2162,49 @@
 
     $("btnRefreshCheckoutCards")?.addEventListener("click", () => {
       void refreshCheckoutCardsUi();
+    });
+
+    $("btnSelectAllCheckoutCards")?.addEventListener("click", () => {
+      const boxes = [...document.querySelectorAll("#checkoutCardsList .card-vault-check")];
+      if (!boxes.length) return;
+      const allOn = boxes.every((el) => el.checked);
+      for (const el of boxes) el.checked = !allOn;
+    });
+
+    $("btnRemoveCheckoutCards")?.addEventListener("click", async () => {
+      const ids = selectedCheckoutCardIds();
+      if (!ids.length) {
+        alert("請先勾選要刪除嘅信用卡。");
+        return;
+      }
+      if (!confirm(`確定刪除已選 ${ids.length} 張信用卡？（永久移出加密池）`)) return;
+      const btn = $("btnRemoveCheckoutCards");
+      const prev = btn?.textContent || "Remove selected";
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "Removing…";
+      }
+      try {
+        const res = await fetch("/api/checkout-cards/remove", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ids }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.ok) {
+          alert(data.error || `Remove failed (${res.status})`);
+          return;
+        }
+        await refreshCheckoutCardsUi();
+        if (btn) btn.textContent = `Removed ${data.removed || ids.length}`;
+        setTimeout(() => {
+          if (btn) btn.textContent = prev;
+        }, 1400);
+      } catch (err) {
+        alert(err instanceof Error ? err.message : String(err));
+      } finally {
+        if (btn) btn.disabled = false;
+      }
     });
 
     refresh();
