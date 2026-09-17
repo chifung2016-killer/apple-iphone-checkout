@@ -1015,7 +1015,7 @@ async function spawnOneBrowser(
         `[card] ${id} 分配信用卡 ****${String(claimed.number).slice(-4)}（加密檔；唔重複直至用完／排除）`
       );
     } else {
-      console.warn(`[card] ${id} 無可用信用卡（請喺 Dashboard 貼上 卡號:mm/yy:cvv 並 Save）`);
+      console.warn(`[card] ${id} 無可用信用卡（請喺 Dashboard 貼上 卡號,mm/yy,cvv 並 Save）`);
     }
   }
   const configPath = path.join(RUNTIME_DIR, `config-${id}.json`);

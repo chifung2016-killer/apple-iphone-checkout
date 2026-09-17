@@ -1,6 +1,6 @@
 /**
  * Checkout Dashboard 信用卡池：AES-256-GCM 加密存檔。
- * 格式每行：卡號:mm/yy:cvv
+ * 格式每行：卡號,mm/yy,cvv
  * 隨機分配、唔重複；拒單／失敗會 exclude。
  */
 import crypto from "node:crypto";
@@ -50,11 +50,17 @@ export function maskCardNumber(number: string): string {
 export function parseCardLine(line: string): VaultCard | null {
   const raw = String(line || "").trim();
   if (!raw || raw.startsWith("#")) return null;
-  const parts = raw.split(":");
+  // 支援 卡號,mm/yy,cvv（主要）；舊格式 卡號:mm/yy:cvv 仍可讀
+  const parts = raw.includes(",")
+    ? raw.split(",").map((p) => p.trim())
+    : raw.split(":").map((p) => p.trim());
   if (parts.length < 3) return null;
   const number = digitsOnly(parts[0] || "");
   const exp = String(parts[1] || "").trim();
-  const cvv = String(parts.slice(2).join(":") || "").replace(/\s+/g, "");
+  const cvv = String(parts.slice(2).join(raw.includes(",") ? "," : ":") || "").replace(
+    /\s+/g,
+    ""
+  );
   if (number.length < 13 || number.length > 19) return null;
   if (!/^\d{1,2}\/\d{2}$/.test(exp)) return null;
   if (!/^\d{3,4}$/.test(cvv)) return null;
@@ -161,7 +167,7 @@ export async function upsertCardsFromText(opts: {
 }): Promise<{ ok: true; total: number; added: number; parsed: number } | { ok: false; error: string }> {
   const parsed = parseCardLines(opts.text);
   if (!parsed.length) {
-    return { ok: false, error: "格式唔啱。每行：卡號:mm/yy:cvv" };
+    return { ok: false, error: "格式唔啱。每行：卡號,mm/yy,cvv" };
   }
   const existing = opts.replace ? [] : await loadCardVault(opts.encPath, opts.keyPath);
   const map = new Map(existing.map((c) => [c.id, c]));
@@ -213,7 +219,7 @@ export function maskedRows(cards: VaultCard[], state: CardVaultState): MaskedCar
     else if (inUseIds.has(c.id)) status = "in_use";
     return {
       id: c.id,
-      masked: `${maskCardNumber(c.number)}:${c.exp}:***`,
+      masked: `${maskCardNumber(c.number)},${c.exp},***`,
       status,
     };
   });

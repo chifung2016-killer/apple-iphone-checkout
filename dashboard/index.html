@@ -550,7 +550,7 @@
             <textarea
               id="checkoutCards"
               name="checkoutCards"
-              placeholder="每行一張：卡號:mm/yy:cvv&#10;例如：&#10;4111111111111111:12/28:123&#10;5427136001956206:09/27:456"
+              placeholder="每行一張：卡號,mm/yy,cvv&#10;例如：&#10;4111111111111111,12/28,123&#10;5427136001956206,09/27,456"
               autocomplete="off"
               spellcheck="false"
             ></textarea>
@@ -2089,7 +2089,7 @@
       const ta = $("checkoutCards");
       const text = String(ta?.value || "").trim();
       if (!text) {
-        alert("請貼上至少一行：卡號:mm/yy:cvv");
+        alert("請貼上至少一行：卡號,mm/yy,cvv");
         return;
       }
       const btn = $("btnSaveCheckoutCards");
