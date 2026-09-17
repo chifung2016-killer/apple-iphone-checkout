@@ -8573,19 +8573,8 @@ async function maximizeBrowserLikeNormalChrome(
     await applyFullWindowViewportAndZoom(session, cdp, windowId);
 
     await session.page.bringToFront().catch(() => {});
-    if (process.platform === "win32") {
-      const proc = (
-        session.browser as unknown as { process?: () => { pid?: number } | null }
-      ).process?.();
-      const pid = proc?.pid;
-      if (pid) {
-        const ps = `Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class W{[DllImport("user32.dll")]public static extern bool SetForegroundWindow(IntPtr h);[DllImport("user32.dll")]public static extern bool ShowWindowAsync(IntPtr h,int n);}' -ErrorAction SilentlyContinue; $p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if($p -and $p.MainWindowHandle -ne 0){[void][W]::ShowWindowAsync($p.MainWindowHandle,3);[void][W]::SetForegroundWindow($p.MainWindowHandle)}`;
-        spawn("powershell", ["-NoProfile", "-Command", ps], {
-          stdio: "ignore",
-          windowsHide: true,
-        });
-      }
-    }
+    winBringBrowserToFront(session.browser);
+    setTimeout(() => winBringBrowserToFront(session.browser), 350);
 
     await new Promise((r) => setTimeout(r, 200));
     await scrollPageToBottomRight(session.page);
@@ -9553,6 +9542,65 @@ async function runStep(
   return false;
 }
 
+/**
+ * Windows：喺 Chromium process tree 搵有 MainWindow 嘅視窗，還原／最大化／置頂。
+ * （根 process 多數 MainWindowHandle=0，一定要掃 child）
+ */
+function winBringBrowserToFront(
+  browser: BrowserSession["browser"]
+): void {
+  if (process.platform !== "win32") return;
+  const proc = (
+    browser as unknown as { process?: () => { pid?: number } | null }
+  ).process?.();
+  const pid = proc?.pid;
+  if (!pid) return;
+  const ps = `
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class W {
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h, int n);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr extra);
+}
+'@ -ErrorAction SilentlyContinue
+$root = ${pid}
+$all = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+$queue = [System.Collections.Generic.Queue[int]]::new()
+$queue.Enqueue([int]$root)
+$seen = @{}
+$handles = @()
+while ($queue.Count -gt 0) {
+  $id = $queue.Dequeue()
+  if ($seen.ContainsKey($id)) { continue }
+  $seen[$id] = $true
+  $p = Get-Process -Id $id -ErrorAction SilentlyContinue
+  if ($p -and $p.MainWindowHandle -ne [IntPtr]::Zero) {
+    $handles += $p.MainWindowHandle
+  }
+  foreach ($c in @($all | Where-Object { $_.ParentProcessId -eq $id })) {
+    $queue.Enqueue([int]$c.ProcessId)
+  }
+}
+# Alt key 技巧：允許非前景 process 搶 SetForegroundWindow
+[W]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+[W]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+foreach ($h in $handles) {
+  if ([W]::IsIconic($h)) { [void][W]::ShowWindowAsync($h, 9) } # SW_RESTORE
+  [void][W]::ShowWindowAsync($h, 3) # SW_MAXIMIZE
+  [void][W]::BringWindowToTop($h)
+  [void][W]::SetForegroundWindow($h)
+}
+`.trim();
+  spawn("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], {
+    stdio: "ignore",
+    windowsHide: true,
+  });
+}
+
 async function setBrowserWindowState(
   session: BrowserSession,
   windowState: "minimized" | "normal"
@@ -9588,20 +9636,9 @@ async function setBrowserWindowState(
           /* ignore */
         }
       }).catch(() => {});
-      // Windows：用 PowerShell 將 Chromium 視窗置頂／最大化
-      if (process.platform === "win32") {
-        const proc = (
-          session.browser as unknown as { process?: () => { pid?: number } | null }
-        ).process?.();
-        const pid = proc?.pid;
-        if (pid) {
-          const ps = `Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class W{[DllImport("user32.dll")]public static extern bool SetForegroundWindow(IntPtr h);[DllImport("user32.dll")]public static extern bool ShowWindowAsync(IntPtr h,int n);}' -ErrorAction SilentlyContinue; $p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if($p -and $p.MainWindowHandle -ne 0){[void][W]::ShowWindowAsync($p.MainWindowHandle,3);[void][W]::SetForegroundWindow($p.MainWindowHandle)}`;
-          spawn("powershell", ["-NoProfile", "-Command", ps], {
-            stdio: "ignore",
-            windowsHide: true,
-          });
-        }
-      }
+      winBringBrowserToFront(session.browser);
+      // 再試一次：CDP 改完 bounds 後 OS 置頂有時要遲少少
+      setTimeout(() => winBringBrowserToFront(session.browser), 350);
       await scrollPageToBottomRight(session.page).catch(() => {});
     } else {
       await cdp.send("Browser.setWindowBounds", {
@@ -9613,6 +9650,9 @@ async function setBrowserWindowState(
     await writeStatus({
       windowState: windowState === "normal" ? "maximized" : "minimized",
       windowHidden: windowState === "minimized",
+      ...(windowState === "normal"
+        ? { keepOpen: true, message: "Open browser — brought to front" }
+        : {}),
     });
   } catch (err) {
     console.warn(

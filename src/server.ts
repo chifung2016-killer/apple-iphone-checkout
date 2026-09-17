@@ -2008,7 +2008,8 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
       new Date().toISOString(),
       "utf8"
     );
-    // 即刻標示未 hidden，等 script 還原視窗
+    await fs.unlink(path.join(RUNTIME_DIR, `hide-${id}.flag`)).catch(() => {});
+    // 即刻標示未 hidden，等 script 還原視窗並置頂
     const stPath = path.join(RUNTIME_DIR, `status-${id}.json`);
     try {
       const prev = JSON.parse(await fs.readFile(stPath, "utf8")) as Record<string, unknown>;
@@ -2018,7 +2019,9 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
           {
             ...prev,
             windowHidden: false,
-            windowState: "normal",
+            windowState: "maximized",
+            keepOpen: true,
+            message: "Open browser requested — bringing to front",
             updatedAt: new Date().toISOString(),
           },
           null,
