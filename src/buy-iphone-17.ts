@@ -10212,6 +10212,48 @@ foreach ($h in $handles) {
   });
 }
 
+/** Windows：強制 minimize（CDP 有時唔夠穩；新開 task 預設藏埋） */
+function winMinimizeBrowserWindow(
+  browser: BrowserSession["browser"]
+): void {
+  if (process.platform !== "win32") return;
+  const proc = (
+    browser as unknown as { process?: () => { pid?: number } | null }
+  ).process?.();
+  const pid = proc?.pid;
+  if (!pid) return;
+  const ps = `
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class W {
+  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h, int n);
+}
+'@ -ErrorAction SilentlyContinue
+$root = ${pid}
+$all = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+$queue = [System.Collections.Generic.Queue[int]]::new()
+$queue.Enqueue([int]$root)
+$seen = @{}
+while ($queue.Count -gt 0) {
+  $id = $queue.Dequeue()
+  if ($seen.ContainsKey($id)) { continue }
+  $seen[$id] = $true
+  $p = Get-Process -Id $id -ErrorAction SilentlyContinue
+  if ($p -and $p.MainWindowHandle -ne [IntPtr]::Zero) {
+    [void][W]::ShowWindowAsync($p.MainWindowHandle, 6) # SW_MINIMIZE
+  }
+  foreach ($c in @($all | Where-Object { $_.ParentProcessId -eq $id })) {
+    $queue.Enqueue([int]$c.ProcessId)
+  }
+}
+`.trim();
+  spawn("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], {
+    stdio: "ignore",
+    windowsHide: true,
+  });
+}
+
 async function setBrowserWindowState(
   session: BrowserSession,
   windowState: "minimized" | "normal"
@@ -10256,6 +10298,8 @@ async function setBrowserWindowState(
         windowId,
         bounds: { windowState: "minimized" },
       });
+      winMinimizeBrowserWindow(session.browser);
+      session.billingWindowRevealed = false;
     }
     await cdp.detach().catch(() => {});
     await writeStatus({
@@ -10263,7 +10307,7 @@ async function setBrowserWindowState(
       windowHidden: windowState === "minimized",
       ...(windowState === "normal"
         ? { keepOpen: true, message: "Open browser — brought to front" }
-        : {}),
+        : { keepOpen: false, message: "Hide — browser minimized" }),
     });
   } catch (err) {
     console.warn(
@@ -10587,7 +10631,7 @@ async function openSession(index: number, identity: Identity): Promise<BrowserSe
     console.log(`${tag} 使用 proxy：${proxy.server}${proxy.username ? "（有帳密）" : ""}`);
   }
 
-  // 先開細視窗讀螢幕可用面積，再按總數鋪位
+  // 預設隱藏：--start-minimized + CDP/Win32 minimize；要睇先喺 Dashboard 撳 Open browser
   const browser = await chromium.launch({
     headless: false,
     slowMo: 60,
@@ -10595,7 +10639,7 @@ async function openSession(index: number, identity: Identity): Promise<BrowserSe
     args: [
       "--disable-blink-features=AutomationControlled",
       "--window-size=800,600",
-      `--window-position=${40 + index * 20},${40 + index * 20}`,
+      "--start-minimized",
     ],
   });
   const context = await browser.newContext({
@@ -10621,7 +10665,7 @@ async function openSession(index: number, identity: Identity): Promise<BrowserSe
     screen.h
   );
   console.log(
-    `${tag} 視窗位置：x=${x}, y=${y}, ${width}x${height}（共 ${totalWindows} 個，螢幕 ${screen.w}x${screen.h}）`
+    `${tag} 視窗位置（隱藏中）：x=${x}, y=${y}, ${width}x${height}（共 ${totalWindows} 個，螢幕 ${screen.w}x${screen.h}）`
   );
 
   await page.setViewportSize({
@@ -10636,6 +10680,7 @@ async function openSession(index: number, identity: Identity): Promise<BrowserSe
     const cdp = await context.newCDPSession(page);
     const got = await cdp.send("Browser.getWindowForTarget");
     windowId = got.windowId;
+    // 記低鋪位，但仍維持 minimized（Open browser 先還原）
     await cdp.send("Browser.setWindowBounds", {
       windowId,
       bounds: {
@@ -10649,6 +10694,7 @@ async function openSession(index: number, identity: Identity): Promise<BrowserSe
       `${tag} 無法用 CDP 設定視窗：${err instanceof Error ? err.message : String(err)}`
     );
   }
+  winMinimizeBrowserWindow(browser);
 
   return { tag, identity, browser, page, windowId, windowBounds };
 }

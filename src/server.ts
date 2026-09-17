@@ -2390,7 +2390,30 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
       new Date().toISOString(),
       "utf8"
     );
-    return sendJson(res, 200, { ok: true });
+    await fs.unlink(path.join(RUNTIME_DIR, `show-${id}.flag`)).catch(() => {});
+    const stPath = path.join(RUNTIME_DIR, `status-${id}.json`);
+    try {
+      const prev = JSON.parse(await fs.readFile(stPath, "utf8")) as Record<string, unknown>;
+      await fs.writeFile(
+        stPath,
+        JSON.stringify(
+          {
+            ...prev,
+            windowHidden: true,
+            windowState: "minimized",
+            keepOpen: false,
+            message: "Hide requested — minimizing",
+            updatedAt: new Date().toISOString(),
+          },
+          null,
+          2
+        ),
+        "utf8"
+      );
+    } catch {
+      /* ignore */
+    }
+    return sendJson(res, 200, { ok: true, state: await snapshot() });
   }
 
   if (pathname === "/api/continue" && req.method === "POST") {

@@ -1094,8 +1094,8 @@
           browsersTab === "finished"
             ? "已付款成功嘅 task。資料唔齊可撳 Reload 重新由訂單摘要載入。"
             : browsersTab === "waiting"
-              ? "步驟已全部完成、等付款嘅 task（綠閃）。付款成功會即時移去 Finished。"
-              : "進行中嘅 task（新開嘅會排喺最底）。步驟做完會即時移去 waiting payment。";
+              ? "步驟已全部完成、等付款嘅 task（綠閃）。視窗預設隱藏；撳 Open browser 先睇，Hide 再藏。"
+              : "進行中嘅 task（新開會自動隱藏，唔彈到桌面）。要用時撳 Open browser；Hide 再藏。步驟做完會移去 waiting payment。";
       }
       renderBrowsers(lastBrowsersSnap);
     }
@@ -2027,7 +2027,10 @@
       }
       if (act === "hide") {
         if (id) openedHighlightIds.delete(String(id));
-        await fetch(`/api/browsers/${encodeURIComponent(id)}/hide`, { method: "POST" });
+        const res = await fetch(`/api/browsers/${encodeURIComponent(id)}/hide`, { method: "POST" });
+        const data = await res.json().catch(() => ({}));
+        if (data.state) applySnapshot(data.state);
+        else renderBrowsers(lastBrowsersSnap);
         setTimeout(refresh, 400);
       }
       if (act === "stop") {
