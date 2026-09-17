@@ -8026,7 +8026,7 @@ async function markAssignedCardRejected(card: VaultCard | null, reason: string):
     cardRejected: true,
     message: `信用卡被拒／失敗 ****${card.number.slice(-4)}：${reason}`,
   }).catch(() => {});
-  console.warn(`  已排除信用卡 ****${card.number.slice(-4)}｜${reason}`);
+  console.warn(`  信用卡拒單／失敗 ****${card.number.slice(-4)}｜${reason}（卡仍可再分配）`);
 }
 
 async function autofillCardThenCheckOrder(

@@ -1126,7 +1126,7 @@ async function spawnOneBrowser(
   if (assignedProxy) {
     console.log(`[proxy] ${id} 分配：${assignedProxy}`);
   }
-  // 信用卡訪客模式：隨機分配加密卡（唔重複）；Apple Pay 唔分配
+  // 信用卡訪客模式：隨機分配加密卡（用過／拒單可再用）；Apple Pay 唔分配
   if (usesCreditCardAutofill(sessionConfig.fulfillmentPreference)) {
     const claimed = await claimCheckoutCard({
       encPath: CHECKOUT_CARDS_ENC,
@@ -1144,7 +1144,7 @@ async function spawnOneBrowser(
       console.log(
         `[card] ${id} 分配信用卡 ****${String(claimed.number).slice(-4)}` +
           (claimed.limit != null ? ` limit=${Math.round(claimed.limit)}` : "") +
-          `（加密檔；唔重複直至用完／排除）`
+          `（加密檔；用過／拒單可再分配）`
       );
     } else {
       console.warn(`[card] ${id} 無可用信用卡（請喺 Dashboard 貼上 卡號,mm/yy,cvv,limit 並 Save）`);
@@ -1247,7 +1247,7 @@ async function spawnOneBrowser(
         ).catch(() => {});
       }
     }
-    // 信用卡結果：成功 → used；拒單／失敗 → excluded；其他 → release 返池
+    // 信用卡結果：成功／拒單／結束都釋放返池（可再用）
     if (session.config?.checkoutCardId) {
       const paid = await isPaidBrowserSession(session.id);
       const st = await readSessionStatus(session.id);

@@ -1,7 +1,7 @@
 /**
  * Checkout Dashboard 信用卡池：AES-256-GCM 加密存檔。
  * 格式每行：卡號,mm/yy,cvv,limit
- * 隨機分配、唔重複；拒單／失敗會 exclude。
+ * 隨機分配；用過／拒單嘅卡可以再入池重用（只避開而家 in_use）。
  * limit 會用嚟計 Live card limits 剩餘額度（成功落單後扣減）。
  */
 import crypto from "node:crypto";
@@ -213,32 +213,25 @@ export async function upsertCardsFromText(opts: {
 }
 
 export function summarizeVault(cards: VaultCard[], state: CardVaultState) {
-  const excluded = new Set(state.excludedIds);
-  const used = new Set(state.usedIds);
   const inUseIds = new Set(Object.values(state.inUse));
   let available = 0;
   for (const c of cards) {
-    if (excluded.has(c.id) || used.has(c.id) || inUseIds.has(c.id)) continue;
+    if (inUseIds.has(c.id)) continue;
     available += 1;
   }
   return {
     total: cards.length,
     available,
-    used: used.size,
-    excluded: excluded.size,
+    used: 0,
+    excluded: 0,
     inUse: inUseIds.size,
   };
 }
 
 export function maskedRows(cards: VaultCard[], state: CardVaultState): MaskedCardRow[] {
-  const excluded = new Set(state.excludedIds);
-  const used = new Set(state.usedIds);
   const inUseIds = new Set(Object.values(state.inUse));
   return cards.map((c) => {
-    let status: MaskedCardRow["status"] = "available";
-    if (excluded.has(c.id)) status = "excluded";
-    else if (used.has(c.id)) status = "used";
-    else if (inUseIds.has(c.id)) status = "in_use";
+    const status: MaskedCardRow["status"] = inUseIds.has(c.id) ? "in_use" : "available";
     const lim =
       c.limit != null && Number.isFinite(c.limit) ? String(Math.round(c.limit)) : "";
     return {
@@ -253,15 +246,11 @@ export function maskedRows(cards: VaultCard[], state: CardVaultState): MaskedCar
 }
 
 function availableCards(cards: VaultCard[], state: CardVaultState): VaultCard[] {
-  const excluded = new Set(state.excludedIds);
-  const used = new Set(state.usedIds);
   const inUseIds = new Set(Object.values(state.inUse));
-  return cards.filter(
-    (c) => !excluded.has(c.id) && !used.has(c.id) && !inUseIds.has(c.id)
-  );
+  return cards.filter((c) => !inUseIds.has(c.id));
 }
 
-/** 為 session 隨機 claim 一張未用卡；寫 assigned enc 畀 worker */
+/** 為 session 隨機 claim 一張卡；用過／拒單都可再 claim（只避開而家 in_use） */
 export async function claimCheckoutCard(opts: {
   encPath: string;
   keyPath: string;
@@ -271,6 +260,9 @@ export async function claimCheckoutCard(opts: {
 }): Promise<VaultCard | null> {
   const cards = await loadCardVault(opts.encPath, opts.keyPath);
   const state = await loadCardVaultState(opts.statePath);
+  // 舊 used／excluded 唔再封鎖；清走方便 UI 顯示 available
+  state.usedIds = [];
+  state.excludedIds = [];
   // 釋放呢個 session 舊 claim
   if (state.inUse[opts.sessionId]) {
     delete state.inUse[opts.sessionId];
@@ -339,30 +331,27 @@ export async function finalizeCheckoutCard(opts: {
   outcome: "success" | "rejected" | "release";
 }): Promise<void> {
   const state = await loadCardVaultState(opts.statePath);
-  const cardId = state.inUse[opts.sessionId];
-  if (cardId) {
+  // 用過／拒單都釋放返池，可再分配
+  if (state.inUse[opts.sessionId]) {
     delete state.inUse[opts.sessionId];
-    if (opts.outcome === "success") {
-      if (!state.usedIds.includes(cardId)) state.usedIds.push(cardId);
-    } else if (opts.outcome === "rejected") {
-      if (!state.excludedIds.includes(cardId)) state.excludedIds.push(cardId);
-      state.usedIds = state.usedIds.filter((id) => id !== cardId);
-    }
   }
+  state.usedIds = [];
+  state.excludedIds = [];
   await saveCardVaultState(opts.statePath, state);
   await fs.unlink(opts.assignPath).catch(() => {});
 }
 
+/** 拒單時只釋放 in_use，唔再永久排除（可再用） */
 export async function excludeCheckoutCardById(
   statePath: string,
   cardId: string
 ): Promise<void> {
   if (!cardId) return;
   const state = await loadCardVaultState(statePath);
-  if (!state.excludedIds.includes(cardId)) state.excludedIds.push(cardId);
   for (const [sid, cid] of Object.entries(state.inUse)) {
     if (cid === cardId) delete state.inUse[sid];
   }
+  state.excludedIds = state.excludedIds.filter((id) => id !== cardId);
   state.usedIds = state.usedIds.filter((id) => id !== cardId);
   await saveCardVaultState(statePath, state);
 }

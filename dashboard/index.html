@@ -592,7 +592,7 @@
               <button type="button" class="btn-danger btn-sm" id="btnRemoveCheckoutCards" title="刪除已選信用卡（永久移出加密池）">Remove selected</button>
             </div>
             <p class="hint" style="margin:6px 0 0">
-              格式：<code>卡號,mm/yy,cvv,limit</code>。信用卡訪客模式會隨機用不重複嘅卡 autofill →「檢查你的訂單」→「立即提交訂單」。成功落單會用 <strong>limit − 已付金額</strong> 即時更新 Live card limits。Apple Pay 模式唔用。
+              格式：<code>卡號,mm/yy,cvv,limit</code>。信用卡訪客模式會隨機用池內卡 autofill →「檢查你的訂單」→「立即提交訂單」。用過／拒單嘅卡可以再分配。成功落單會用 <strong>limit − 已付金額</strong> 即時更新 Live card limits。Apple Pay 模式唔用。
               <span id="checkoutCardsMeta">—</span>
             </p>
             <div id="checkoutCardsList" class="card-vault-list" aria-label="Saved credit cards"></div>
@@ -2312,7 +2312,7 @@
         }
         const s = data.summary || {};
         if (meta) {
-          meta.textContent = `｜池内 ${s.total ?? 0} 張｜可用 ${s.available ?? 0}｜使用中 ${s.inUse ?? 0}｜已用 ${s.used ?? 0}｜已排除 ${s.excluded ?? 0}`;
+          meta.textContent = `｜池内 ${s.total ?? 0} 張｜可用 ${s.available ?? 0}｜使用中 ${s.inUse ?? 0}`;
         }
         if (list) {
           const rows = Array.isArray(data.rows) ? data.rows : [];
