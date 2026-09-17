@@ -65,6 +65,119 @@ const PROXY_BLACKLIST_FILE = path.join(RUNTIME_DIR, "proxy-blacklist.json");
 const PROXY_BROWSERS_PER_IP = 3;
 const RESTOCK_HISTORY_FILE = path.join(RUNTIME_DIR, "restock-history.jsonl");
 
+function pidAlive(pid: number | null | undefined): boolean {
+  if (!pid || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 唔關窗；寫 hide flag + status，等 worker 自己 minimize */
+async function keepBrowserHiddenAfterScriptUpdate(
+  id: string,
+  st: Record<string, unknown>
+): Promise<void> {
+  const nid = normalizeBrowserId(id);
+  await fs
+    .writeFile(
+      path.join(RUNTIME_DIR, `hide-${nid}.flag`),
+      new Date().toISOString(),
+      "utf8"
+    )
+    .catch(() => {});
+  await fs.unlink(path.join(RUNTIME_DIR, `show-${nid}.flag`)).catch(() => {});
+  const stPath = path.join(RUNTIME_DIR, `status-${nid}.json`);
+  try {
+    const next = {
+      ...st,
+      windowHidden: true,
+      windowState: "minimized",
+      keepOpen: false,
+      message:
+        String(st.message || "").trim() ||
+        "script/server updated — browser kept open & hidden",
+      updatedAt: new Date().toISOString(),
+    };
+    await fs.writeFile(stPath, JSON.stringify(next, null, 2), "utf8");
+  } catch {
+    /* ignore */
+  }
+}
+
+/** server／tsx watch 重啟後：還原仲開住嘅 checkout browser（唔殺、保持 Hide） */
+async function recoverCheckoutSessionsFromDisk(): Promise<void> {
+  await ensureRuntimeDir();
+  for (const id of await listPersistedSessionIds()) {
+    if (await isDismissedBrowser(id) && !(await isPaidBrowserSession(id))) {
+      continue;
+    }
+    const st = await readSessionStatus(id);
+    if (!st) continue;
+    const phase = String(st.phase || "");
+    if (/^closed$/i.test(phase)) continue;
+
+    const pidRaw = st.pid;
+    const pid =
+      typeof pidRaw === "number"
+        ? pidRaw
+        : Number(pidRaw) > 0
+          ? Number(pidRaw)
+          : null;
+    const alive = pidAlive(pid);
+
+    const cfgPath = path.join(RUNTIME_DIR, `config-${id}.json`);
+    const cfg =
+      ((await readJson(cfgPath)) as Record<string, unknown> | null) || {
+        ...lastFormConfig,
+      };
+
+    const existing = sessions.get(id);
+    const wasMissing = !existing;
+    if (existing) {
+      if (alive) {
+        existing.running = true;
+        existing.pid = pid;
+        existing.exitCode = null;
+        if (!existing.child) existing.child = null;
+      } else if (existing.running && existing.pid && !pidAlive(existing.pid)) {
+        existing.running = false;
+        existing.pid = null;
+        existing.child = null;
+      }
+    } else if (
+      alive ||
+      /waiting_for_payment|steps_complete|manual_control|fulfillment|checkout|starting|adding|guest|contact|stop_requested|page_error|recover/i.test(
+        phase
+      ) ||
+      (await isPaidBrowserSession(id))
+    ) {
+      sessions.set(id, {
+        id,
+        index: browserIndexFromId(id),
+        pid: alive ? pid : null,
+        running: alive,
+        exitCode: alive ? null : 0,
+        startedAt: String(st.updatedAt || new Date().toISOString()),
+        config: cfg,
+        logs: [
+          alive
+            ? `[dashboard] recovered ${id} after script/server update · still running pid=${pid} · kept hidden`
+            : `[dashboard] recovered ${id} card · ${phase || "idle"}`,
+        ],
+        child: null,
+      });
+    }
+
+    // 只喺呢次 server 生命週期第一次認回 session 時 Hide（唔好每 3 秒 poll 都強制藏）
+    if (alive && wasMissing) {
+      await keepBrowserHiddenAfterScriptUpdate(id, st).catch(() => {});
+    }
+  }
+}
+
 async function writeSessionLaunchRecord(
   sessionId: string,
   config: Record<string, unknown>
@@ -1179,6 +1292,7 @@ async function spawnOneBrowser(
 
   const tsxCli = path.join(ROOT, "node_modules", "tsx", "dist", "cli.mjs");
   const script = path.join(ROOT, "src", "buy-iphone-17.ts");
+  // detached：tsx watch／server 重啟時唔好連 browser 一齊殺
   const proc = spawn(process.execPath, [tsxCli, script], {
     cwd: ROOT,
     env: envForCheckoutChild({
@@ -1192,9 +1306,13 @@ async function spawnOneBrowser(
       CHECKOUT_CARD_STATE_PATH: CHECKOUT_CARDS_STATE,
     }),
     stdio: ["ignore", "pipe", "pipe"],
+    detached: true,
+    windowsHide: true,
   });
   session.child = proc;
   session.pid = proc.pid ?? null;
+  // 唔綁死 parent lifetime（script update 重啟 server 時 browser 繼續跑）
+  proc.unref();
   await writeInitialOpenedBrowserStatus(id, sessionConfig, session.pid);
   await writeSessionLaunchRecord(id, sessionConfig);
   pushSessionLog(
@@ -1681,6 +1799,7 @@ async function readRestockHistory(limit = 100): Promise<unknown[]> {
 }
 
 async function snapshot() {
+  await recoverCheckoutSessionsFromDisk().catch(() => {});
   const browsers: Array<Record<string, unknown>> = [];
   const seen = new Set<string>();
   const shownOrderNumbers = new Set<string>();
@@ -1961,15 +2080,24 @@ async function snapshot() {
     ) {
       continue;
     }
+    const pidRaw = st?.pid;
+    const pid =
+      typeof pidRaw === "number"
+        ? pidRaw
+        : Number(pidRaw) > 0
+          ? Number(pidRaw)
+          : null;
+    const alive = pidAlive(pid);
     await pushBrowser({
       id,
       index: browserIndexFromId(id),
-      pid: null,
-      running: false,
-      exitCode: 0,
+      pid: alive ? pid : null,
+      running: alive,
+      exitCode: alive ? null : 0,
       startedAt: String(st?.updatedAt || new Date().toISOString()),
       config: cfg,
       logs: [],
+      child: null,
     });
   }
 
@@ -2813,14 +2941,22 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, "127.0.0.1", () => {
   startLiveReloadWatcher();
-  void refreshNextIndexFromDisk().then(() => {
-    console.log(
-      `Checkout dashboard → http://127.0.0.1:${PORT} (next browser id b${nextIndex + 1}) [live-reload build=${DASHBOARD_BUILD_ID}]`
-    );
-  });
+  void recoverCheckoutSessionsFromDisk()
+    .catch(() => {})
+    .then(() => refreshNextIndexFromDisk())
+    .then(() => {
+      console.log(
+        `Checkout dashboard → http://127.0.0.1:${PORT} (next browser id b${nextIndex + 1}) [live-reload build=${DASHBOARD_BUILD_ID}]`
+      );
+    });
 });
 
-process.on("SIGINT", async () => {
-  await stopAll();
+// tsx watch／script 更新：唔好 stopAll／關 browser；只退 server，browser 保持 Hide 繼續跑
+function exitLeavingBrowsers(signal: string) {
+  console.log(
+    `[dashboard] ${signal} — leaving Opened / waiting-payment browsers running (hidden)`
+  );
   process.exit(0);
-});
+}
+process.on("SIGINT", () => exitLeavingBrowsers("SIGINT"));
+process.on("SIGTERM", () => exitLeavingBrowsers("SIGTERM"));
