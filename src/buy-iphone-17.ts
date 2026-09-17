@@ -5061,6 +5061,7 @@ function formatHkNowForLog(): string {
 
 /** 攔截 fulfillment／pickup JSON，盡量攞每間店精確庫存 */
 function attachFulfillmentStoreStockTap(page: Page): void {
+  attachWrongAppleSearchRecovery(page);
   const flagged = page as Page & { __storeStockTap?: boolean };
   if (flagged.__storeStockTap) return;
   flagged.__storeStockTap = true;
@@ -5424,10 +5425,12 @@ async function hardRefreshFulfillmentInit(
   } else {
     await gotoFulfillmentInit(page);
     await markPageErrorIfNotFound(page, label).catch(() => false);
+    await recoverFromWrongAppleSearchIfNeeded(page, label).catch(() => false);
     return;
   }
   await settleDom(page, 250);
   await markPageErrorIfNotFound(page, label).catch(() => false);
+  await recoverFromWrongAppleSearchIfNeeded(page, label).catch(() => false);
 }
 
 async function softRefreshFulfillmentNow(page: Page): Promise<void> {
@@ -5485,6 +5488,9 @@ async function clickContinueToPickupDetails(page: Page): Promise<boolean> {
     if (isShop404Url(page.url())) {
       await recoverFromShop404IfNeeded(page, "[continue-pickup]");
       return false;
+    }
+    if (await recoverFromWrongAppleSearchIfNeeded(page, "[continue-pickup]")) {
+      continue;
     }
     if (!stayOnFulfillment(page.url()) && round > 0) {
       console.log(`  已離開 Fulfillment → ${page.url()}`);
@@ -5742,15 +5748,85 @@ async function waitForMatchingStockResume(opts?: {
 }
 
 function fulfillmentInitUrlFrom(current: string): string {
-  if (/\/shop\/checkout/i.test(current)) {
+  if (/\/shop\/checkout/i.test(current) && /store\.apple\.com/i.test(current)) {
     if (/[?&]_s=/i.test(current)) {
       return current.replace(/([?&]_s=)[^&]*/i, "$1Fulfillment-init");
     }
     return `${current.split("#")[0]}${current.includes("?") ? "&" : "?"}_s=Fulfillment-init`;
   }
-  const host =
-    current.match(/^(https?:\/\/[^/]+)/i)?.[1] || "https://secure6.store.apple.com";
-  return `${host}/hk-zh/shop/checkout?_s=Fulfillment-init`;
+  // 誤入 www.apple.com／search 時唔好用錯 host → 用上一頁 checkout 或預設 secure6
+  const last = lastNon404NavMark?.url || "";
+  if (/\/shop\/checkout/i.test(last) && /store\.apple\.com/i.test(last)) {
+    if (/[?&]_s=/i.test(last)) {
+      return last.replace(/([?&]_s=)[^&]*/i, "$1Fulfillment-init");
+    }
+    return `${last.split("#")[0]}${last.includes("?") ? "&" : "?"}_s=Fulfillment-init`;
+  }
+  return "https://secure6.store.apple.com/hk-zh/shop/checkout?_s=Fulfillment-init";
+}
+
+/** 誤入 Apple.com 全站搜尋（例如 中環?src=pnf） */
+function isWrongAppleSearchPnfUrl(url: string): boolean {
+  if (!/apple\.com/i.test(url)) return false;
+  if (!/\/search\//i.test(url)) return false;
+  if (/[?&]src=pnf\b/i.test(url)) return true;
+  const term = String(CONFIG.pickupSearch || "中環").trim();
+  if (!term) return false;
+  try {
+    const decoded = decodeURIComponent(url);
+    if (decoded.includes(term)) return true;
+  } catch {
+    /* ignore */
+  }
+  if (url.includes(encodeURIComponent(term))) return true;
+  // 中環 UTF-8
+  if (/%E4%B8%AD%E7%92%B0/i.test(url) || url.includes("中環")) return true;
+  return false;
+}
+
+const recoveringWrongSearchPages = new WeakSet<Page>();
+
+/** 誤入 /us/search/中環?src=pnf → 自動返 Fulfillment-init */
+async function recoverFromWrongAppleSearchIfNeeded(
+  page: Page,
+  tag = ""
+): Promise<boolean> {
+  const url = page.url();
+  if (!isWrongAppleSearchPnfUrl(url)) return false;
+  if (recoveringWrongSearchPages.has(page)) return false;
+  recoveringWrongSearchPages.add(page);
+  try {
+    const target = fulfillmentInitUrlFrom(url);
+    const prefix = tag ? `${tag} ` : "";
+    console.warn(
+      `  ${prefix}★ 誤入 Apple search（pnf）→ 自動返 Fulfillment-init：${target}`
+    );
+    markCheckoutNav(target, "recover-wrong-apple-search");
+    await writeStatus({
+      phase: "fulfillment_pickup_wait",
+      message: `誤入 search pnf → 返 Fulfillment-init`,
+      url: target,
+      card: { url: target, message: "recovered from apple search pnf" },
+    }).catch(() => {});
+    await withReleaseCheck(
+      page.goto(target, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => {})
+    );
+    await settleDom(page, 300);
+    return /_s=Fulfillment/i.test(page.url());
+  } finally {
+    recoveringWrongSearchPages.delete(page);
+  }
+}
+
+/** 監聽誤導航去 apple.com/search?*src=pnf */
+function attachWrongAppleSearchRecovery(page: Page): void {
+  const flagged = page as Page & { __wrongSearchRecovery?: boolean };
+  if (flagged.__wrongSearchRecovery) return;
+  flagged.__wrongSearchRecovery = true;
+  page.on("framenavigated", (frame) => {
+    if (frame !== page.mainFrame()) return;
+    void recoverFromWrongAppleSearchIfNeeded(page, "[nav]").catch(() => {});
+  });
 }
 
 /** 頁面／HTTP 係咪 503 Service Temporarily Unavailable */
@@ -6130,8 +6206,16 @@ async function fillPickupSearchAndWaitHeading(
   );
   if (!applied) {
     await search.press("Enter").catch(() => {});
+    await page.waitForTimeout(400).catch(() => {});
+    if (await recoverFromWrongAppleSearchIfNeeded(page, "[pickup-search-enter]")) {
+      return false;
+    }
   } else {
     console.log("  已撳「套用」");
+  }
+
+  if (await recoverFromWrongAppleSearchIfNeeded(page, "[pickup-search]")) {
+    return false;
   }
 
   console.log(
@@ -6611,6 +6695,12 @@ async function ensurePickupClickThenContinueReady(page: Page): Promise<boolean> 
     }
 
     if (await markPageErrorIfNotFound(page, `pickup-cc-guest-#${round}`)) {
+      const waitMore = Math.max(0, REFRESH_MS - (Date.now() - roundStarted));
+      await sleepCheckingRelease(waitMore);
+      continue;
+    }
+
+    if (await recoverFromWrongAppleSearchIfNeeded(page, `pickup-cc-guest-#${round}`)) {
       const waitMore = Math.max(0, REFRESH_MS - (Date.now() - roundStarted));
       await sleepCheckingRelease(waitMore);
       continue;
@@ -11517,6 +11607,7 @@ async function openSession(index: number, identity: Identity): Promise<BrowserSe
   });
   const page = await context.newPage();
   page.setDefaultTimeout(15000);
+  attachWrongAppleSearchRecovery(page);
 
   const screen = await page
     .evaluate(() => ({
