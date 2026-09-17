@@ -5557,7 +5557,8 @@ async function runPickupStoreContinueSet(page: Page): Promise<boolean> {
     }
 
     if (set === 1) {
-      await recordStoreStocksToRestockHistory(page).catch(() => {});
+      // 只讀文字，唔探測撳門市（成套步驟只允許撳門市一次）
+      await recordStoreStocksToRestockHistory(page, { probeQty: false }).catch(() => {});
     }
 
     const storeClicked = await clickAnyNearbyStore(page);
@@ -5575,6 +5576,8 @@ async function runPickupStoreContinueSet(page: Page): Promise<boolean> {
       return true;
     }
 
+    // 門市只撳咗一次 → 即刻撳「繼續前往取貨詳情」
+    console.log("  門市已撳一次 → 即刻撳「繼續前往取貨詳情」");
     const advanced = await clickContinueToPickupDetailsOnce(page);
     if (advanced || isPickupContactPage(page.url())) {
       if (usesFastPickupContactFill() && isPickupContactPage(page.url())) {
@@ -6002,7 +6005,8 @@ async function clickAnyNearbyStore(page: Page): Promise<boolean> {
     return false;
   }
 
-  await recordStoreStocksToRestockHistory(page).catch(() => {});
+  // 只讀文字／aria 入 Live 補貨紀錄，唔好逐粒撳門市探測（避免多次 click）
+  await recordStoreStocksToRestockHistory(page, { probeQty: false }).catch(() => {});
 
   const pool = stores.slice(0, Math.max(6, stores.length));
   type Candidate = {
@@ -6053,19 +6057,15 @@ async function clickAnyNearbyStore(page: Page): Promise<boolean> {
         ? "｜有貨"
         : "｜缺貨";
   console.log(
-    `  撳門市掣${codeTag}：${label}${stockTag}｜今次剩餘未試 ${Math.max(0, unused.length - 1)}/${candidates.length}`
+    `  撳門市掣一次${codeTag}：${label}${stockTag}｜今次剩餘未試 ${Math.max(0, unused.length - 1)}/${candidates.length}`
   );
   await chosen.el.scrollIntoViewIfNeeded().catch(() => {});
-  // 雙重確認：撳兩次，確保選中
+  // 只撳一次門市，之後即刻交俾「繼續前往取貨詳情」
   await humanClick(chosen.el, { force: true }).catch(async () => {
     await chosen.el.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
   });
-  await sleepCheckingRelease(350);
-  await humanClick(chosen.el, { force: true }).catch(async () => {
-    await chosen.el.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
-  });
-  console.log("  已雙重確認撳門市選項。");
-  await sleepCheckingRelease(500);
+  console.log("  已撳門市（一次）。");
+  await sleepCheckingRelease(400);
   // 所有取貨模式：同 pickup credit card訪客 — 撳完門市後只捲去頁底一次
   if (usesPickupGuestStoreContinueRules()) {
     console.log("  取貨模式：捲去頁底一次（之後唔再重複捲）…");
@@ -6144,7 +6144,10 @@ async function ensureFulfillmentInitStandby(page: Page): Promise<void> {
   } else {
     console.log("  待命：已見 6 個門市掣，停低等同色同容量有貨…");
   }
-  await recordStoreStocksToRestockHistory(page, { force: true }).catch(() => {});
+  await recordStoreStocksToRestockHistory(page, {
+    force: true,
+    probeQty: false,
+  }).catch(() => {});
 }
 
 /**
