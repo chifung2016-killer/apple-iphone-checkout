@@ -187,24 +187,24 @@
       color: var(--text);
       cursor: pointer;
       transition: border-color 0.15s, background 0.15s, box-shadow 0.15s;
+      box-sizing: border-box;
     }
     .account-row:hover {
       border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
     }
-    .account-row.is-selected {
+    .account-row.is-selected,
+    .account-row:has(.account-check:checked) {
       border-color: color-mix(in srgb, var(--accent) 70%, var(--line));
       background: color-mix(in srgb, var(--accent) 14%, var(--field));
       box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent);
     }
-    .account-row .check {
-      width: 18px; height: 18px; margin-top: 2px;
-      border-radius: 5px; border: 1.5px solid var(--line);
-      background: transparent; flex-shrink: 0;
-    }
-    .account-row.is-selected .check {
-      background: var(--accent);
-      border-color: transparent;
-      box-shadow: inset 0 0 0 3px var(--field);
+    .account-row .account-check {
+      width: 18px;
+      height: 18px;
+      margin: 2px 0 0;
+      accent-color: var(--accent);
+      flex-shrink: 0;
+      cursor: pointer;
     }
     .account-row .meta { min-width: 0; }
     .account-row .email {
@@ -346,6 +346,29 @@
       $("selectedCount").textContent = String(selectedKeys.size);
     }
 
+    function syncSelectedKeysFromDom() {
+      selectedKeys.clear();
+      for (const el of document.querySelectorAll("#accountList .account-check:checked")) {
+        const key = String(el.value || "").trim();
+        if (key) selectedKeys.add(key);
+      }
+      updateSelectedCount();
+    }
+
+    /** Clear selection：取消「撳列選取帳號」所有已選列 */
+    function clearAccountSelection() {
+      selectedKeys.clear();
+      for (const el of document.querySelectorAll("#accountList .account-check")) {
+        el.checked = false;
+      }
+      for (const row of document.querySelectorAll("#accountList .account-row.is-selected")) {
+        row.classList.remove("is-selected");
+        row.setAttribute("aria-selected", "false");
+      }
+      updateSelectedCount();
+      renderAccountRows();
+    }
+
     function renderAccountRows() {
       const accounts = parseAccounts($("accounts").value);
       const box = $("accountList");
@@ -363,19 +386,20 @@
         .map((a, i) => {
           const key = accountKey(a);
           const selected = selectedKeys.has(key);
-          return `<button type="button" class="account-row ${selected ? "is-selected" : ""}" role="option" aria-selected="${selected}" data-key="${escAttr(key)}" data-idx="${i}">
-            <span class="check" aria-hidden="true"></span>
+          return `<label class="account-row ${selected ? "is-selected" : ""}" role="option" aria-selected="${selected}" data-key="${escAttr(key)}" data-idx="${i}">
+            <input type="checkbox" class="account-check" value="${escAttr(key)}" ${selected ? "checked" : ""} />
             <span class="meta">
               <div class="email">${esc(a.email)}</div>
               <div class="order">${esc(a.orderNumber)}</div>
             </span>
-          </button>`;
+          </label>`;
         })
         .join("");
       updateSelectedCount();
     }
 
     function getSelectedAccounts() {
+      syncSelectedKeysFromDom();
       const accounts = parseAccounts($("accounts").value);
       return accounts.filter((a) => selectedKeys.has(accountKey(a)));
     }
@@ -560,17 +584,19 @@
     $("tabActive").addEventListener("click", () => setTasksTab("active"));
     $("tabFinished").addEventListener("click", () => setTasksTab("finished"));
 
-    $("accountList").addEventListener("click", (e) => {
-      const row = e.target.closest(".account-row");
-      if (!row) return;
-      const idx = Number(row.getAttribute("data-idx"));
-      const accounts = parseAccounts($("accounts").value);
-      const a = accounts[idx];
-      if (!a) return;
-      const key = accountKey(a);
-      if (selectedKeys.has(key)) selectedKeys.delete(key);
-      else selectedKeys.add(key);
-      renderAccountRows();
+    $("accountList").addEventListener("change", (e) => {
+      const check = e.target.closest(".account-check");
+      if (!check) return;
+      const key = String(check.value || "").trim();
+      if (!key) return;
+      if (check.checked) selectedKeys.add(key);
+      else selectedKeys.delete(key);
+      const row = check.closest(".account-row");
+      if (row) {
+        row.classList.toggle("is-selected", check.checked);
+        row.setAttribute("aria-selected", check.checked ? "true" : "false");
+      }
+      updateSelectedCount();
     });
 
     $("btnSelectAll").addEventListener("click", () => {
@@ -580,9 +606,10 @@
       renderAccountRows();
     });
 
-    $("btnSelectNone").addEventListener("click", () => {
-      selectedKeys.clear();
-      renderAccountRows();
+    $("btnSelectNone").addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      clearAccountSelection();
     });
 
     async function readPasteText() {
@@ -769,8 +796,7 @@
       )
         return;
       $("accounts").value = "";
-      selectedKeys.clear();
-      renderAccountRows();
+      clearAccountSelection();
       logsEl.textContent = "";
       setStatus("Cleared", "ok");
       try {
