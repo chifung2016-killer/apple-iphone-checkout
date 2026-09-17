@@ -1087,6 +1087,28 @@
       renderBrowsers(lastBrowsersSnap);
     }
 
+    function formatProxyDisplay(raw) {
+      const s = String(raw || "").trim();
+      if (!s) return "本機 IP";
+      try {
+        const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(s) ? s : `http://${s}`;
+        const u = new URL(withScheme);
+        const host = u.hostname + (u.port ? `:${u.port}` : "");
+        const proto = (u.protocol || "http:").replace(":", "");
+        if (u.username) return `${proto}://${decodeURIComponent(u.username)}:***@${host}`;
+        return `${proto}://${host}`;
+      } catch {
+        return s;
+      }
+    }
+
+    function resolveBrowserProxy(b) {
+      const c = b?.card || {};
+      return (
+        String(c.proxy || b?.config?.proxy || b?.proxy || "").trim() || ""
+      );
+    }
+
     function renderBrowsers(browsers) {
       lastBrowsersSnap = Array.isArray(browsers) ? browsers : [];
       const waiting = sortBrowsersOldestFirst(
@@ -1199,6 +1221,7 @@
         const lastNameShow = c.lastName || "—";
         const firstNameShow = c.firstName || "—";
         const orderNoShow = c.orderNumber || "—";
+        const proxyShow = formatProxyDisplay(resolveBrowserProxy(b));
         const cardClass = [
           "browser-card",
           paid ? "is-paid" : "",
@@ -1233,7 +1256,7 @@
             <span><b>Address</b>${esc(addrShow)}</span>
             <span><b>Building</b>${esc(buildingShow)}</span>
             <span><b>ETA</b>${esc(etaShow)}</span>
-            ${c.proxy ? `<span class="wide"><b>Proxy</b>${esc(c.proxy)}</span>` : ""}
+            <span class="wide"><b>Proxy/IP</b>${esc(proxyShow)}</span>
             ${msgShow ? `<span class="wide"><b>Status</b>${esc(msgShow)}</span>` : ""}
             ${t404Show ? `<span class="wide"><b>404 timing</b>${esc(t404Show)}</span>` : ""}
             ${urlShow && urlShow !== "—" ? `<span class="wide"><b>URL</b>${esc(urlShow)}</span>` : ""}
