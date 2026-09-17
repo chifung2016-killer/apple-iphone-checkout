@@ -648,6 +648,10 @@
           <span>Running: <b id="runningCount">0</b></span>
           <span>Total: <b id="totalBrowsers">0</b></span>
         </div>
+        <p class="hint" id="durableLogsHint" style="margin:0 0 8px">
+          全日詳細 log 會自動存檔：<code>runtime/logs/今日日期/</code>
+          （<code>all.log</code>／<code>monitor.log</code>／<code>checkout-bN.log</code>／<code>events.jsonl</code>），方便當晚翻查修復。
+        </p>
         <div class="log" id="log"></div>
       </section>
     </div>
@@ -1730,6 +1734,11 @@
       // Order summary + Live card limits：以 Finished tab 對齊
       syncOrdersAndCardLimitsFromSnap(snap);
       applyMonitorUI(snap.monitor);
+      if ($("durableLogsHint") && snap.durableLogs?.dir) {
+        $("durableLogsHint").innerHTML =
+          `全日詳細 log 會自動存檔：<code>${esc(snap.durableLogs.dir)}</code>` +
+          `（<code>all.log</code>／<code>monitor.log</code>／<code>checkout-bN.log</code>／<code>events.jsonl</code>），方便當晚翻查修復。`;
+      }
 
       const key = "all";
       const logs = snap.logs || [];

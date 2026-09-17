@@ -30,6 +30,7 @@ import {
   loadAssignedCheckoutCard,
   type VaultCard,
 } from "./checkout-card-vault.js";
+import { appendDayLog } from "./runtime-day-log.js";
 
 // =============================================================================
 // 請喺呢度改你自己嘅選項（Dashboard 會用 runtime-config.json 覆寫）
@@ -326,6 +327,34 @@ const WINDOW_TOTAL = Math.max(
   Number(process.env.CHECKOUT_WINDOW_TOTAL || "0") || 0
 );
 const RUNTIME_DIR = path.join(ROOT, "runtime");
+
+/** console 同時寫入 runtime/logs/今日/checkout-{session}.log（非 Dashboard 子進程先 tee，避免重複） */
+if (process.env.CHECKOUT_DASHBOARD !== "1") {
+  const wrap =
+    (level: "log" | "warn" | "error", orig: (...a: unknown[]) => void) =>
+    (...args: unknown[]) => {
+      orig(...args);
+      const line = args
+        .map((a) => {
+          if (typeof a === "string") return a;
+          try {
+            return JSON.stringify(a);
+          } catch {
+            return String(a);
+          }
+        })
+        .join(" ");
+      void appendDayLog({
+        channel: "checkout",
+        sessionId: SESSION_ID,
+        line: `[${level}] ${line}`,
+      });
+    };
+  console.log = wrap("log", console.log.bind(console));
+  console.warn = wrap("warn", console.warn.bind(console));
+  console.error = wrap("error", console.error.bind(console));
+}
+
 const CHECKOUT_CARD_KEY_PATH =
   process.env.CHECKOUT_CARD_KEY_PATH || path.join(RUNTIME_DIR, ".add-order-key");
 const CHECKOUT_CARD_ASSIGN_PATH =

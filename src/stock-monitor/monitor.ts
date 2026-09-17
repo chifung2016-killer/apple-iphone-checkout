@@ -9,6 +9,32 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { MONITOR_CONFIG, SKUS, type SkuConfig } from "./config.js";
 import { escapeMd, formatHkNow, notifyAll, notifyTelegram, upsertTelegramStockMonitor } from "./notifier.js";
+import { appendDayLog } from "../runtime-day-log.js";
+
+if (process.env.MONITOR_FROM_DASHBOARD !== "1") {
+  const wrap =
+    (level: "log" | "warn" | "error", orig: (...a: unknown[]) => void) =>
+    (...args: unknown[]) => {
+      orig(...args);
+      const line = args
+        .map((a) => {
+          if (typeof a === "string") return a;
+          try {
+            return JSON.stringify(a);
+          } catch {
+            return String(a);
+          }
+        })
+        .join(" ");
+      void appendDayLog({
+        channel: "monitor",
+        line: `[${level}] ${line}`,
+      });
+    };
+  console.log = wrap("log", console.log.bind(console));
+  console.warn = wrap("warn", console.warn.bind(console));
+  console.error = wrap("error", console.error.bind(console));
+}
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const RUNTIME_DIR = path.join(ROOT, "runtime");
@@ -110,6 +136,21 @@ async function appendRestockHistory(
   try {
     await fs.mkdir(RUNTIME_DIR, { recursive: true });
     await fs.appendFile(RESTOCK_HISTORY_FILE, `${JSON.stringify(row)}\n`, "utf8");
+    void appendDayLog({
+      channel: "monitor",
+      line: `[restock] ${row.event}｜${row.model}／${row.color}／${row.storage}｜qty=${row.stockQty ?? "?"}｜${row.name}`,
+      meta: {
+        kind: "restock",
+        event: row.event,
+        model: row.model,
+        color: row.color,
+        storage: row.storage,
+        stockQty: row.stockQty,
+        buyQty: row.buyQty,
+        prevStockQty: row.prevStockQty ?? null,
+        name: row.name,
+      },
+    });
     // 截斷過長紀錄
     const raw = await fs.readFile(RESTOCK_HISTORY_FILE, "utf8").catch(() => "");
     const lines = raw.split(/\r?\n/).filter((l) => l.trim());
@@ -747,6 +788,11 @@ async function publishCycleStatus(results: CheckResult[]): Promise<void> {
 async function main(): Promise<void> {
   const skus = effectiveSkus();
   console.log("Apple HK iPhone 庫存監察啟動");
+  void appendDayLog({
+    channel: "monitor",
+    line: `[monitor] process start SKUs=${skus.map((s) => s.name).join(",") || "（無）"} autoCheckout=${MONITOR_CONFIG.autoCheckout.enabled}`,
+    meta: { kind: "monitor_process_start", autoCheckout: MONITOR_CONFIG.autoCheckout.enabled },
+  });
   console.log(
     `SKU 數=${skus.length}｜間隔=${MONITOR_CONFIG.checkIntervalMs / 1000}s（有貨→${MONITOR_CONFIG.fastCheckIntervalMs / 1000}s，空倉 ${MONITOR_CONFIG.fastModeIdleMs / 1000}s 後退回）｜平行=${MONITOR_CONFIG.runInParallel}`
   );

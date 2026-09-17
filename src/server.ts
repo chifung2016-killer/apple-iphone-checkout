@@ -45,6 +45,14 @@ import {
   summarizeVault,
   upsertCardsFromText,
 } from "./checkout-card-vault.js";
+import {
+  appendDayLog,
+  dayLogsAbsoluteDir,
+  dayLogsRelativeDir,
+  ensureDayLogDir,
+  hkDayStamp,
+  hkTimeStamp,
+} from "./runtime-day-log.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PUBLIC = path.join(ROOT, "dashboard");
@@ -56,6 +64,48 @@ const PROXY_BLACKLIST_FILE = path.join(RUNTIME_DIR, "proxy-blacklist.json");
 /** 每個 Proxy / IP 最多同時／累計分配畀幾多個 browser */
 const PROXY_BROWSERS_PER_IP = 3;
 const RESTOCK_HISTORY_FILE = path.join(RUNTIME_DIR, "restock-history.jsonl");
+
+async function writeSessionLaunchRecord(
+  sessionId: string,
+  config: Record<string, unknown>
+): Promise<void> {
+  try {
+    const day = hkDayStamp();
+    const dir = await ensureDayLogDir(day);
+    const safe = { ...config };
+    await fs.writeFile(
+      path.join(dir, `checkout-${sessionId}-config.json`),
+      JSON.stringify(
+        {
+          savedAt: new Date().toISOString(),
+          savedAtHk: `${day} ${hkTimeStamp()}`,
+          sessionId,
+          config: safe,
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+    await appendDayLog({
+      channel: "checkout",
+      sessionId,
+      line: `[dashboard] launch config saved｜proxy=${String(config.proxy || "本機 IP")}｜model=${String(config.model || "")} ${String(config.color || "")} ${String(config.storage || "")} ×${String(config.quantity || "")}｜${String(config.fulfillmentPreference || "")}${config.holdAtPickupStoresForStock ? "｜hold@stock" : ""}`,
+      meta: {
+        kind: "launch",
+        proxy: config.proxy || "",
+        model: config.model,
+        color: config.color,
+        storage: config.storage,
+        quantity: config.quantity,
+        fulfillmentPreference: config.fulfillmentPreference,
+        holdAtPickupStoresForStock: Boolean(config.holdAtPickupStoresForStock),
+      },
+    });
+  } catch {
+    /* ignore */
+  }
+}
 const GMAIL_ACCOUNTS_ENC = path.join(RUNTIME_DIR, "gmail-accounts.enc");
 const GMAIL_ACCOUNTS_LEGACY = path.join(RUNTIME_DIR, "gmail-accounts-saved.txt");
 const ADD_ORDER_KEY = path.join(RUNTIME_DIR, ".add-order-key");
@@ -585,6 +635,11 @@ function pushSessionLog(session: BrowserSession, line: string) {
   session.logs.push(tagged);
   if (session.logs.length > 400) session.logs.splice(0, session.logs.length - 400);
   broadcast({ type: "log", sessionId: session.id, line: tagged, at: new Date().toISOString() });
+  void appendDayLog({
+    channel: "checkout",
+    sessionId: session.id,
+    line: tagged,
+  });
 }
 
 function killProc(proc: ChildProcess) {
@@ -1141,6 +1196,7 @@ async function spawnOneBrowser(
   session.child = proc;
   session.pid = proc.pid ?? null;
   await writeInitialOpenedBrowserStatus(id, sessionConfig, session.pid);
+  await writeSessionLaunchRecord(id, sessionConfig);
   pushSessionLog(
     session,
     `[dashboard] 已啟動 pid=${session.pid} windowIndex=${index}/${windowTotal}`
@@ -1162,10 +1218,25 @@ async function spawnOneBrowser(
     pushSessionLog(session, `[dashboard] 進程結束 exit=${code}`);
     // 用咗 proxy 但未成功付款／落單 → 加入黑名單，之後唔再分配
     const usedProxy = String(session.config?.proxy || "").trim();
+    const paid = await isPaidBrowserSession(session.id);
+    const st = await readSessionStatus(session.id);
+    const phase = String(st?.phase || "");
+    void appendDayLog({
+      channel: "checkout",
+      sessionId: session.id,
+      line: `[dashboard] session summary exit=${code} paid=${paid} phase=${phase} proxy=${usedProxy || "本機 IP"}`,
+      meta: {
+        kind: "exit",
+        exitCode: code,
+        paid,
+        phase,
+        proxy: usedProxy,
+        orderNumber:
+          ((st?.card as { orderNumber?: string } | undefined)?.orderNumber as string) ||
+          null,
+      },
+    });
     if (usedProxy) {
-      const paid = await isPaidBrowserSession(session.id);
-      const st = await readSessionStatus(session.id);
-      const phase = String(st?.phase || "");
       const failed =
         !paid &&
         (code !== 0 || /error|fail/i.test(phase));
@@ -1276,6 +1347,10 @@ async function pushMonitorLog(line: string) {
   monitorState.logs.push(tagged);
   if (monitorState.logs.length > 300) monitorState.logs.splice(0, monitorState.logs.length - 300);
   broadcast({ type: "monitor_log", line: tagged, at: new Date().toISOString() });
+  void appendDayLog({
+    channel: "monitor",
+    line: tagged,
+  });
 }
 
 async function stopStockMonitor() {
@@ -1341,6 +1416,18 @@ async function startStockMonitor(opts?: {
   await pushMonitorLog(
     `已啟動 ${autoBuy ? "monitor+buying" : "monitor"} pid=${monitorState.pid} quantity=${quantity} fulfillment=${fulfillment}`
   );
+  void appendDayLog({
+    channel: "monitor",
+    line: `[monitor] start autoBuy=${autoBuy} quantity=${quantity} fulfillment=${fulfillment} pickup=${pickupSearch}`,
+    meta: {
+      kind: "monitor_start",
+      autoBuy,
+      quantity,
+      fulfillment,
+      pickupSearch,
+      pid: monitorState.pid,
+    },
+  });
 
   proc.stdout?.setEncoding("utf8");
   proc.stderr?.setEncoding("utf8");
@@ -1943,6 +2030,11 @@ async function snapshot() {
       logs: monitorState.logs.slice(-40),
       status: monitorStatus,
       restockHistory: await readRestockHistory(120),
+    },
+    durableLogs: {
+      day: hkDayStamp(),
+      dir: dayLogsRelativeDir(),
+      absoluteDir: dayLogsAbsoluteDir(),
     },
   };
 }
