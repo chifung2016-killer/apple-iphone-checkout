@@ -19,11 +19,23 @@ const SKU_MAP_PATH = path.join(ROOT, "config", "sku_map.json");
 const RUNTIME_DIR = path.join(ROOT, "runtime");
 const COLLECTION_PATH = path.join(RUNTIME_DIR, "promax-pickup-stock.jsonl");
 const LATEST_PATH = path.join(RUNTIME_DIR, "promax-pickup-latest.json");
+const RESTOCK_HISTORY_FILE = path.join(RUNTIME_DIR, "restock-history.jsonl");
+const RESTOCK_HISTORY_MAX = 800;
 
 const FULFILLMENT_URL =
   "https://www.apple.com/hk/shop/fulfillment-messages";
 const PRODUCT_REFERER =
   "https://www.apple.com/hk/shop/buy-iphone/iphone-18-pro";
+
+/** Live 補貨紀錄門市代碼 */
+const STORE_CODES: Record<string, string> = {
+  causeway_bay: "CWB",
+  ifc: "IFC",
+  festival_walk: "FW",
+  apm: "APM",
+  new_town_plaza: "NTP",
+  canton_road: "TST",
+};
 
 /** 香港 6 間 Apple Store（監控目標；回應用 fuzzy match） */
 export const HK_APPLE_STORES = [
@@ -118,7 +130,43 @@ type MonitorState = {
   lastAttemptAt: string | null;
   lastError: string | null;
   latest: PromaxPickupStatus | null;
+  /** `${sku}|${store_id}` → was available */
+  prevAvailable: Map<string, boolean>;
 };
+
+export type RestockHistoryEvent = {
+  at: string;
+  atHk: string;
+  event: "restock" | "qty_up" | "sold_out" | "store_stock";
+  name: string;
+  model: string;
+  color: string;
+  storage: string;
+  stockQty: number | null;
+  buyQty: number;
+  prevStockQty?: number | null;
+  detail?: string;
+  storeStocks?: Array<{
+    code: string;
+    name: string;
+    qty: number | null;
+    available: boolean;
+    label: string;
+  }>;
+};
+
+type PromaxHooks = {
+  onPollComplete?: (
+    status: PromaxPickupStatus,
+    newRestockEvents: RestockHistoryEvent[]
+  ) => void | Promise<void>;
+};
+
+let hooks: PromaxHooks = {};
+
+export function setPromaxPickupHooks(next: PromaxHooks): void {
+  hooks = next;
+}
 
 const BASE_POLL_MIN_MS = 90_000;
 const BASE_POLL_MAX_MS = 120_000;
@@ -136,6 +184,7 @@ const state: MonitorState = {
   lastAttemptAt: null,
   lastError: null,
   latest: null,
+  prevAvailable: new Map(),
 };
 
 function sleep(ms: number): Promise<void> {
@@ -290,6 +339,126 @@ async function appendCollection(rows: PromaxStockRow[]): Promise<void> {
   }
 }
 
+function isAvailableDisplay(display: string | null | undefined): boolean {
+  return /^available$/i.test(String(display || "").trim());
+}
+
+function formatHkNow(d = new Date()): string {
+  return new Intl.DateTimeFormat("zh-HK", {
+    timeZone: "Asia/Hong_Kong",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(d);
+}
+
+async function appendRestockEvents(events: RestockHistoryEvent[]): Promise<void> {
+  if (!events.length) return;
+  await ensureRuntime();
+  const chunk = events.map((e) => JSON.stringify(e)).join("\n") + "\n";
+  await fs.appendFile(RESTOCK_HISTORY_FILE, chunk, "utf8");
+  try {
+    const raw = await fs.readFile(RESTOCK_HISTORY_FILE, "utf8");
+    const lines = raw.split(/\r?\n/).filter((l) => l.trim());
+    if (lines.length > RESTOCK_HISTORY_MAX) {
+      await fs.writeFile(
+        RESTOCK_HISTORY_FILE,
+        `${lines.slice(-RESTOCK_HISTORY_MAX).join("\n")}\n`,
+        "utf8"
+      );
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 比較上輪 → 有貨變化就寫 Live 補貨紀錄 */
+function detectRestockEvents(
+  matrix: MatrixEntry[],
+  atIso: string
+): RestockHistoryEvent[] {
+  const events: RestockHistoryEvent[] = [];
+  const atHk = formatHkNow(new Date(atIso));
+
+  for (const entry of matrix) {
+    const storeStocks = entry.stores.map((cell) => {
+      const available = isAvailableDisplay(cell.pickup_display);
+      const code = STORE_CODES[cell.store_id] || cell.store_id.toUpperCase();
+      return {
+        code,
+        name: cell.store_name,
+        qty: available ? 1 : 0,
+        available,
+        label: `${code} (${available ? "有" : "0"})`,
+      };
+    });
+
+    const availableCount = storeStocks.filter((s) => s.available).length;
+    let flippedToAvailable = false;
+    let flippedToUnavailable = false;
+    let anyKnown = false;
+
+    for (const cell of entry.stores) {
+      if (cell.pickup_display == null) continue;
+      anyKnown = true;
+      const key = `${entry.sku}|${cell.store_id}`;
+      const now = isAvailableDisplay(cell.pickup_display);
+      const prev = state.prevAvailable.get(key);
+      if (prev === undefined) {
+        state.prevAvailable.set(key, now);
+        if (now) flippedToAvailable = true;
+        continue;
+      }
+      if (!prev && now) flippedToAvailable = true;
+      if (prev && !now) flippedToUnavailable = true;
+      state.prevAvailable.set(key, now);
+    }
+
+    if (!anyKnown) continue;
+
+    const base = {
+      at: atIso,
+      atHk,
+      name: `iPhone 18 Pro Max ${entry.storage} ${entry.color}`,
+      model: "iPhone 18 Pro Max",
+      color: entry.color,
+      storage: entry.storage,
+      buyQty: 1,
+      storeStocks,
+    };
+
+    if (flippedToAvailable) {
+      events.push({
+        ...base,
+        event: "restock",
+        stockQty: availableCount,
+        detail: storeStocks
+          .filter((s) => s.available)
+          .map((s) => s.label)
+          .join(" · "),
+      });
+      events.push({
+        ...base,
+        event: "store_stock",
+        stockQty: availableCount,
+        detail: storeStocks.map((s) => s.label).join(" · "),
+      });
+    } else if (flippedToUnavailable && availableCount === 0) {
+      events.push({
+        ...base,
+        event: "sold_out",
+        stockQty: 0,
+        detail: "六間門市皆 unavailable",
+      });
+    }
+  }
+  return events;
+}
+
 function emptyStoreCells(): StoreCell[] {
   return HK_APPLE_STORES.map((s) => ({
     store_id: s.id,
@@ -382,11 +551,14 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
   }
 
   const matchedCells = collectionRows.length;
+  let newRestockEvents: RestockHistoryEvent[] = [];
   if (matchedCells > 0) {
     state.consecutiveFailures = 0;
     state.lastSuccessAt = ts;
     state.lastError = null;
     await appendCollection(collectionRows);
+    newRestockEvents = detectRestockEvents(matrix, ts);
+    await appendRestockEvents(newRestockEvents);
   } else {
     state.consecutiveFailures += 1;
     if (blocked > 0 && !state.lastError) {
@@ -405,8 +577,16 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
   await fs.writeFile(LATEST_PATH, JSON.stringify(status, null, 2), "utf8");
   console.log(
     `[promax-pickup] poll done rows=${matchedCells} failures=${state.consecutiveFailures}` +
+      (newRestockEvents.length ? ` restockEvents=${newRestockEvents.length}` : "") +
       (state.lastError ? ` err=${state.lastError}` : "")
   );
+  try {
+    await hooks.onPollComplete?.(status, newRestockEvents);
+  } catch (err) {
+    console.warn(
+      `[promax-pickup] onPollComplete hook failed：${err instanceof Error ? err.message : String(err)}`
+    );
+  }
   return status;
 }
 

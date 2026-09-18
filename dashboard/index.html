@@ -610,24 +610,22 @@
             <input id="productPollIntervalMs" name="productPollIntervalMs" type="number" min="1000" step="500" value="5000" />
           </div>
           <div class="actions">
-            <button type="button" class="btn-primary" id="btnMonitorToggle">Start monitor</button>
-            <button type="button" class="btn-ghost" id="btnMonitorBuy">Start monitor+buying</button>
             <button type="submit" class="btn-primary" id="btnStart">Launch browsers</button>
             <button type="button" class="btn-ghost" id="btnAdd">Add 1 browser</button>
           </div>
           <p class="hint" id="monitorHint" style="margin-top:10px">
-            <b>Start monitor</b>：Telegram 即時監察 iPhone 庫存／可買數量（撳一次變 Stop monitor）。
-            <b>Start monitor+buying</b>：預熱停喺 Fulfillment-init。監察到<strong>同型號＋同色＋同容量</strong>有貨 → <strong>每 5 秒 refresh Fulfillment-init</strong>；頁面詳細載入後撳<strong>我會前來取貨</strong>→ 輸入<strong>中環</strong>→ 繼續其餘步驟。若 <strong>503</strong> 則隔 <strong>6 秒</strong>再 refresh。失敗先改完整加購。冇新通知就返待命。
+            <b>iPhone 18 Pro Max 門市庫存</b>會喺開 Dashboard 後自動背景監控（256GB／512GB × 全部顏色 × 香港 6 間 Apple Store）。
+            <strong>唔使開瀏覽器</strong>；約每 90–120 秒輪詢一次。偵測到門市由無貨→有貨會寫入下方 Live 補貨紀錄。
           </p>
           <div class="meta" id="monitorMeta" style="margin-top:8px">
-            <span>Monitor: <b id="monitorState">off</b></span>
-            <span>合計可買: <b id="monitorStockTotal">—</b></span>
+            <span>Auto monitor: <b id="monitorState">—</b></span>
+            <span>有貨 SKU: <b id="monitorStockTotal">—</b></span>
             <span id="monitorSkuLine"></span>
           </div>
           <div class="restock-history" style="margin-top:12px">
             <div class="restock-history-head">
               <h3 style="margin:0 0 6px;font-size:0.95rem">Live 補貨紀錄</h3>
-              <p class="hint" style="margin:0">實時列出補貨時間、型號、顏色、容量、數量；門市庫存格式 <b>IFC (2) · TST (0) · CWB (1)</b>（最新喺上）。</p>
+              <p class="hint" style="margin:0">自動監控寫入：補貨時間、型號、顏色、容量；門市格式 <b>IFC (有) · TST (0) · CWB (有)</b>（最新喺上）。</p>
             </div>
             <div class="card-limits-wrap restock-wrap" style="max-height:260px;margin-top:8px">
               <table class="card-limits" id="restockHistoryTable">
@@ -642,7 +640,7 @@
                   </tr>
                 </thead>
                 <tbody id="restockHistoryBody">
-                  <tr><td colspan="6" class="empty">未有補貨紀錄。Start monitor 後有貨會即時顯示。</td></tr>
+                  <tr><td colspan="6" class="empty">未有補貨紀錄。Dashboard 開住會自動監控；有貨變化會即時顯示。</td></tr>
                 </tbody>
               </table>
             </div>
@@ -1849,7 +1847,7 @@
       const list = Array.isArray(events) ? events : [];
       if (!list.length) {
         body.innerHTML =
-          '<tr><td colspan="6" class="empty">未有補貨紀錄。Start monitor 後有貨會即時顯示。</td></tr>';
+          '<tr><td colspan="6" class="empty">未有補貨紀錄。Dashboard 開住會自動監控；有貨變化會即時顯示。</td></tr>';
         return;
       }
       body.innerHTML = list
@@ -1900,39 +1898,25 @@
     function applyMonitorUI(mon) {
       if (!$("monitorState")) return;
       const running = Boolean(mon?.running);
-      $("monitorState").textContent = running
-        ? `ON${mon?.autoBuy ? " +buying" : ""} (pid ${mon?.pid ?? "—"})`
-        : "off";
       const st = mon?.status;
+      const err = st?.lastError || mon?.promax?.last_error;
+      $("monitorState").textContent = running
+        ? err
+          ? `ON（輪詢中／${String(err).slice(0, 42)}）`
+          : "ON（自動）"
+        : "off";
       const total = st?.totalAvailableStock;
       $("monitorStockTotal").textContent =
         total == null ? "—" : String(total);
       const skus = st?.skus || [];
       $("monitorSkuLine").textContent = skus.length
         ? skus
-            .map(
-              (s) =>
-                `${s.model || s.name} ${s.color || ""} ${s.storage || ""}: ${s.label}｜庫存=${s.stockQty ?? "?"}｜落單=${s.buyQty}`
-            )
-            .join(" · ")
+            .filter((s) => /有門市/.test(String(s.label || "")))
+            .map((s) => `${s.color || ""} ${s.storage || ""}`)
+            .join(" · ") || "（暫未偵測到有貨門市）"
         : "";
 
       renderRestockHistory(mon?.restockHistory);
-
-      const toggle = $("btnMonitorToggle");
-      if (toggle) {
-        toggle.textContent = running ? "Stop monitor" : "Start monitor";
-        toggle.className = running ? "btn-danger" : "btn-primary";
-      }
-      if ($("btnMonitorBuy")) $("btnMonitorBuy").disabled = running;
-
-      const mlogs = mon?.logs || [];
-      const mkey = "monitor";
-      const mprev = knownLogLenByKey.get(mkey) || 0;
-      if (mlogs.length >= mprev) {
-        appendLogs(mlogs.slice(mprev));
-        knownLogLenByKey.set(mkey, mlogs.length);
-      }
     }
 
     async function refresh() {
@@ -1977,80 +1961,6 @@
       if (!data.ok) alert(data.error || "Add failed");
       setBrowsersTab("opened");
       applySnapshot(data.state);
-    });
-
-    async function startMonitorFromUi(autoBuy) {
-      const fd = new FormData(form);
-      let quantity = Number(fd.get("quantity") || 2);
-      let fulfillmentPreference = String(fd.get("fulfillmentPreference") || "pickup");
-      let pickupSearch = String(fd.get("pickupSearch") || "中環");
-      try {
-        const cfg = formConfig();
-        quantity = cfg.quantity;
-        fulfillmentPreference = cfg.fulfillmentPreference;
-        pickupSearch = cfg.pickupSearch;
-      } catch {
-        /* monitor 可不揀產品；用表單／預設 */
-        if (!quantity || quantity < 1) quantity = 2;
-        if (!fulfillmentPreference) fulfillmentPreference = "pickup";
-      }
-      const res = await fetch("/api/monitor/start", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          quantity,
-          fulfillmentPreference,
-          pickupSearch,
-          autoBuy: Boolean(autoBuy),
-        }),
-      });
-      const data = await res.json();
-      if (!data.ok) alert(data.error || "Monitor start failed");
-      else applySnapshot(data.state);
-    }
-
-    $("btnMonitorToggle").addEventListener("click", async () => {
-      const running = ($("btnMonitorToggle").textContent || "").includes("Stop");
-      if (running) {
-        const res = await fetch("/api/monitor/stop", { method: "POST" });
-        const data = await res.json();
-        if (!data.ok) alert(data.error || "Monitor stop failed");
-        else applySnapshot(data.state);
-        return;
-      }
-      await startMonitorFromUi(false);
-    });
-
-    $("btnMonitorBuy").addEventListener("click", async () => {
-      let cfg;
-      try {
-        cfg = formConfig();
-      } catch (err) {
-        alert(
-          (err && err.message) ||
-            "請先揀產品並填好 Quantity／Launch count（monitor+buying 會開預熱 task）"
-        );
-        return;
-      }
-      await startMonitorFromUi(true);
-      const holdCfg = {
-        ...cfg,
-        fulfillmentPreference: "pickup",
-        holdAtPickupStoresForStock: true,
-        browserCount: 1,
-        count: 1,
-      };
-      const res = await fetch("/api/browsers/add", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(holdCfg),
-      });
-      const data = await res.json();
-      if (!data.ok) alert(data.error || "開預熱門市 task 失敗");
-      else {
-        setBrowsersTab("opened");
-        applySnapshot(data.state);
-      }
     });
 
     $("btnStop").addEventListener("click", async () => {

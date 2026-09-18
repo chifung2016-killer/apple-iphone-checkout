@@ -24,6 +24,7 @@ import {
 import {
   getPromaxPickupStatus,
   runPromaxPickupPollOnce,
+  setPromaxPickupHooks,
   startPromaxPickupMonitor,
   stopPromaxPickupMonitor,
 } from "./promax-pickup-monitor.js";
@@ -307,24 +308,6 @@ let nextIndex = 0;
 const sessions = new Map<string, BrowserSession>();
 const sseClients = new Set<http.ServerResponse>();
 let lastFormConfig: Record<string, unknown> = defaultConfig();
-
-type MonitorState = {
-  running: boolean;
-  pid: number | null;
-  startedAt: string | null;
-  autoBuy: boolean;
-  logs: string[];
-  child: ChildProcess | null;
-};
-
-const monitorState: MonitorState = {
-  running: false,
-  pid: null,
-  startedAt: null,
-  autoBuy: false,
-  logs: [],
-  child: null,
-};
 
 type AddOrderTask = {
   id: string;
@@ -1673,115 +1656,6 @@ async function writeInitialOpenedBrowserStatus(
   ).catch(() => {});
 }
 
-async function pushMonitorLog(line: string) {
-  const text = line.replace(/\r/g, "");
-  if (!text.trim()) return;
-  const tagged = text.startsWith("[monitor]") ? text : `[monitor] ${text}`;
-  monitorState.logs.push(tagged);
-  if (monitorState.logs.length > 300) monitorState.logs.splice(0, monitorState.logs.length - 300);
-  broadcast({ type: "monitor_log", line: tagged, at: new Date().toISOString() });
-  void appendDayLog({
-    channel: "monitor",
-    line: tagged,
-  });
-}
-
-async function stopStockMonitor() {
-  const child = monitorState.child;
-  const pid = monitorState.pid ?? child?.pid ?? null;
-  if (child) {
-    killProc(child);
-    monitorState.child = null;
-  } else if (pid) {
-    spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", shell: true });
-  }
-  monitorState.running = false;
-  monitorState.pid = null;
-  monitorState.startedAt = null;
-  monitorState.autoBuy = false;
-  await pushMonitorLog("監察已停止");
-  broadcast({ type: "status", state: await snapshot() });
-}
-
-async function startStockMonitor(opts?: {
-  quantity?: number;
-  fulfillmentPreference?: string;
-  pickupSearch?: string;
-  autoBuy?: boolean;
-}) {
-  if (monitorState.running && monitorState.child) {
-    throw new Error("庫存監察已在運行；請先 Stop monitor");
-  }
-  await ensureRuntimeDir();
-  await fs.unlink(path.join(RUNTIME_DIR, "stop-all.flag")).catch(() => {});
-  await fs.unlink(path.join(RUNTIME_DIR, "stock-resume-all.flag")).catch(() => {});
-
-  const tsxCli = path.join(ROOT, "node_modules", "tsx", "dist", "cli.mjs");
-  const script = path.join(ROOT, "src", "stock-monitor", "monitor.ts");
-  const quantity = Math.max(1, Number(opts?.quantity) || Number(lastFormConfig.quantity) || 2);
-  const fulfillment =
-    opts?.fulfillmentPreference ||
-    String(lastFormConfig.fulfillmentPreference || "pickup");
-  const pickupSearch =
-    opts?.pickupSearch || String(lastFormConfig.pickupSearch || "中環");
-  const autoBuy = Boolean(opts?.autoBuy);
-
-  const proc = spawn(process.execPath, [tsxCli, script], {
-    cwd: ROOT,
-    env: envForCheckoutChild({
-      MONITOR_AUTO_CHECKOUT: autoBuy ? "1" : "0",
-      MONITOR_FROM_DASHBOARD: "1",
-      MONITOR_QUANTITY: String(quantity),
-      MONITOR_FULFILLMENT: fulfillment,
-      MONITOR_PICKUP_SEARCH: pickupSearch,
-      DASHBOARD_PORT: String(PORT),
-    }),
-    stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: false,
-  });
-
-  monitorState.child = proc;
-  monitorState.pid = proc.pid ?? null;
-  monitorState.running = true;
-  monitorState.startedAt = new Date().toISOString();
-  monitorState.autoBuy = autoBuy;
-  monitorState.logs = [];
-  await pushMonitorLog(
-    `已啟動 ${autoBuy ? "monitor+buying" : "monitor"} pid=${monitorState.pid} quantity=${quantity} fulfillment=${fulfillment}`
-  );
-  void appendDayLog({
-    channel: "monitor",
-    line: `[monitor] start autoBuy=${autoBuy} quantity=${quantity} fulfillment=${fulfillment} pickup=${pickupSearch}`,
-    meta: {
-      kind: "monitor_start",
-      autoBuy,
-      quantity,
-      fulfillment,
-      pickupSearch,
-      pid: monitorState.pid,
-    },
-  });
-
-  proc.stdout?.setEncoding("utf8");
-  proc.stderr?.setEncoding("utf8");
-  proc.stdout?.on("data", (chunk: string | Buffer) => {
-    for (const line of String(chunk).split("\n")) void pushMonitorLog(line);
-  });
-  proc.stderr?.on("data", (chunk: string | Buffer) => {
-    for (const line of String(chunk).split("\n")) void pushMonitorLog(line);
-  });
-  proc.on("exit", async (code) => {
-    monitorState.running = false;
-    monitorState.pid = null;
-    monitorState.child = null;
-    monitorState.autoBuy = false;
-    await pushMonitorLog(`監察進程結束 exit=${code}`);
-    broadcast({ type: "status", state: await snapshot() });
-  });
-
-  broadcast({ type: "status", state: await snapshot() });
-}
-
 async function launchBrowsers(config: Record<string, unknown>, count: number) {
   const n = Math.max(1, Math.min(20, Number(count) || 1));
   lastFormConfig = { ...config, browserCount: n };
@@ -2353,8 +2227,11 @@ async function snapshot() {
 
   const runningCount = browsers.filter((b) => b.running).length;
   const allLogs = browsers.flatMap((b) => (b.logs as string[]) || []).slice(-300);
-  const monitorStatus = await readJson(path.join(RUNTIME_DIR, "monitor-status.json"));
   const orders = allOrders;
+  const promax = getPromaxPickupStatus();
+  const availableSkuCount = (promax.matrix || []).filter((m) =>
+    (m.stores || []).some((s) => /^available$/i.test(String(s.pickup_display || "")))
+  ).length;
 
   return {
     running: runningCount > 0,
@@ -2366,13 +2243,36 @@ async function snapshot() {
     orders,
     cardLimits: await getLiveCardLimits(ROOT, orders, await loadVaultLimitsMap()),
     monitor: {
-      running: monitorState.running,
-      pid: monitorState.pid,
-      startedAt: monitorState.startedAt,
-      autoBuy: monitorState.autoBuy,
-      logs: monitorState.logs.slice(-40),
-      status: monitorStatus,
+      running: promax.running,
+      pid: null,
+      startedAt: promax.last_success_at || promax.last_attempt_at,
+      autoBuy: false,
+      logs: [],
+      status: {
+        mode: "promax-pickup",
+        product: promax.product,
+        lastSuccessAt: promax.last_success_at,
+        lastError: promax.last_error,
+        consecutiveFailures: promax.consecutive_failures,
+        totalAvailableStock: availableSkuCount,
+        skus: (promax.matrix || []).map((m) => ({
+          model: "iPhone 18 Pro Max",
+          color: m.color,
+          storage: m.storage,
+          name: `${m.storage} ${m.color}`,
+          label: (m.stores || []).some((s) =>
+            /^available$/i.test(String(s.pickup_display || ""))
+          )
+            ? "有門市可取"
+            : "未偵測到有貨",
+          stockQty: (m.stores || []).filter((s) =>
+            /^available$/i.test(String(s.pickup_display || ""))
+          ).length,
+          buyQty: 1,
+        })),
+      },
       restockHistory: await readRestockHistory(120),
+      promax,
     },
     durableLogs: {
       day: hkDayStamp(),
@@ -2665,37 +2565,6 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
         error: err instanceof Error ? err.message : String(err),
       });
     }
-  }
-
-  if (pathname === "/api/monitor/start" && req.method === "POST") {
-    try {
-      const raw = await readBody(req).catch(() => "");
-      const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
-      if (body.quantity != null) lastFormConfig.quantity = Number(body.quantity);
-      if (body.fulfillmentPreference) {
-        lastFormConfig.fulfillmentPreference = body.fulfillmentPreference;
-      }
-      if (body.pickupSearch) lastFormConfig.pickupSearch = body.pickupSearch;
-      await startStockMonitor({
-        quantity: Number(body.quantity ?? lastFormConfig.quantity ?? 2),
-        fulfillmentPreference: String(
-          body.fulfillmentPreference ?? lastFormConfig.fulfillmentPreference ?? "pickup"
-        ),
-        pickupSearch: String(body.pickupSearch ?? lastFormConfig.pickupSearch ?? "中環"),
-        autoBuy: body.autoBuy === true || body.autoBuy === "1" || body.autoBuy === 1,
-      });
-      return sendJson(res, 200, { ok: true, state: await snapshot() });
-    } catch (err) {
-      return sendJson(res, 400, {
-        ok: false,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-
-  if (pathname === "/api/monitor/stop" && req.method === "POST") {
-    await stopStockMonitor();
-    return sendJson(res, 200, { ok: true, state: await snapshot() });
   }
 
   if (pathname === "/api/monitor/restock-history" && req.method === "GET") {
@@ -3257,7 +3126,14 @@ server.listen(PORT, "127.0.0.1", () => {
     }
     await recoverCheckoutSessionsFromDisk().catch(() => {});
     await refreshNextIndexFromDisk();
-    // 獨立 Pro Max 門市庫存監控（失敗唔影響 dashboard）
+    // 獨立 Pro Max 門市庫存監控（失敗唔影響 dashboard）；有貨變化 → Live 補貨紀錄
+    setPromaxPickupHooks({
+      onPollComplete: async (_status, events) => {
+        if (events.length) {
+          broadcast({ type: "status", state: await snapshot() });
+        }
+      },
+    });
     startPromaxPickupMonitor({ runImmediately: true }).catch((err) => {
       console.warn(
         `[promax-pickup] auto-start failed：${err instanceof Error ? err.message : String(err)}`
