@@ -2200,6 +2200,46 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
   if (pathname === "/api/config" && req.method === "GET") {
     return sendJson(res, 200, lastFormConfig);
   }
+
+  /** Proxy 池：Save 後 Launch／Add 先用；空＝本機 IP */
+  if (pathname === "/api/proxy-pool" && req.method === "GET") {
+    const proxy = String(lastFormConfig.proxy || "");
+    const count = parseProxyPool(proxy).length;
+    return sendJson(res, 200, {
+      ok: true,
+      proxy,
+      count,
+      mode: count > 0 ? "proxy" : "local",
+    });
+  }
+
+  if (pathname === "/api/proxy-pool" && req.method === "POST") {
+    let body: { proxy?: string } = {};
+    try {
+      body = JSON.parse(await readBody(req)) as typeof body;
+    } catch {
+      return sendJson(res, 400, { ok: false, error: "invalid JSON" });
+    }
+    const proxy = String(body.proxy ?? "").replace(/^\s+|\s+$/g, "");
+    lastFormConfig = { ...lastFormConfig, proxy };
+    await ensureRuntimeDir();
+    await fs
+      .writeFile(path.join(RUNTIME_DIR, "proxy-pool.txt"), proxy, "utf8")
+      .catch(() => {});
+    const count = parseProxyPool(proxy).length;
+    console.log(
+      count > 0
+        ? `[proxy] pool saved：${count} 條`
+        : `[proxy] pool cleared → 本機 IP`
+    );
+    broadcast({ type: "status", state: await snapshot() });
+    return sendJson(res, 200, {
+      ok: true,
+      proxy,
+      count,
+      mode: count > 0 ? "proxy" : "local",
+    });
+  }
   if (pathname === "/api/orders" && req.method === "GET") {
     return sendJson(res, 200, await collectOrders());
   }
@@ -2941,14 +2981,25 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, "127.0.0.1", () => {
   startLiveReloadWatcher();
-  void recoverCheckoutSessionsFromDisk()
-    .catch(() => {})
-    .then(() => refreshNextIndexFromDisk())
-    .then(() => {
-      console.log(
-        `Checkout dashboard → http://127.0.0.1:${PORT} (next browser id b${nextIndex + 1}) [live-reload build=${DASHBOARD_BUILD_ID}]`
+  void (async () => {
+    try {
+      const savedProxy = await fs.readFile(
+        path.join(RUNTIME_DIR, "proxy-pool.txt"),
+        "utf8"
       );
-    });
+      lastFormConfig = {
+        ...lastFormConfig,
+        proxy: String(savedProxy || "").replace(/^\s+|\s+$/g, ""),
+      };
+    } catch {
+      /* no saved pool */
+    }
+    await recoverCheckoutSessionsFromDisk().catch(() => {});
+    await refreshNextIndexFromDisk();
+    console.log(
+      `Checkout dashboard → http://127.0.0.1:${PORT} (next browser id b${nextIndex + 1}) [live-reload build=${DASHBOARD_BUILD_ID}]`
+    );
+  })();
 });
 
 // tsx watch／script 更新：唔好 stopAll／關 browser；只退 server，browser 保持 Hide 繼續跑

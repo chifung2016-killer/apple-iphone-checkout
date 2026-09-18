@@ -574,7 +574,14 @@
               autocomplete="off"
               spellcheck="false"
             ></textarea>
-            <p class="hint" style="margin:6px 0 0">可填多個 proxy：<strong>每一條最多畀 3 個 browser 共用</strong>（用滿先換下一條，唔會超額重複）。若該 task 未能成功結帳，呢個 proxy 會入黑名單，之後唔再使用。留空就用本機 IP。</p>
+            <div class="actions" style="margin-top:8px">
+              <button type="button" class="btn-primary btn-sm" id="btnSaveProxy">Save</button>
+            </div>
+            <p class="hint" style="margin:6px 0 0">
+              貼上 proxy 後撳 <strong>Save</strong> 先會用嚟開 browser；清空再 Save 就用<strong>本機 IP</strong>。
+              可填多個：<strong>每一條最多畀 3 個 browser 共用</strong>（用滿先換下一條）。失敗結帳會入黑名單。
+              <span id="proxySaveMeta">—</span>
+            </p>
           </div>
           <div class="field">
             <label for="checkoutCards">Credit cards（AES 加密存本機）</label>
@@ -897,27 +904,72 @@
     }
 
     const PROXY_LS_KEY = "apple-checkout:proxy-pool";
+    /** 撳過 Save 先生效；Launch／Add 用呢個，唔用未 Save 嘅 textarea */
+    let savedProxyPool = "";
+
+    function normalizeProxyText(raw) {
+      return String(raw ?? "").replace(/^\s+|\s+$/g, "");
+    }
+
+    function countProxyLines(text) {
+      return normalizeProxyText(text)
+        .split(/[\n\r,;]+/)
+        .map((x) => x.trim())
+        .filter(Boolean).length;
+    }
+
+    function updateProxySaveMeta(okMsg) {
+      const meta = $("proxySaveMeta");
+      if (!meta) return;
+      const n = countProxyLines(savedProxyPool);
+      const mode = n > 0 ? `已 Save：${n} 條 proxy` : "已 Save：本機 IP";
+      meta.textContent = okMsg ? `｜${okMsg}` : `｜${mode}`;
+    }
+
     function persistProxyField() {
-      const el = $("proxy");
-      if (!el) return;
       try {
-        // 允許存空字串＝之後用本機 IP
-        localStorage.setItem(PROXY_LS_KEY, String(el.value ?? ""));
+        localStorage.setItem(PROXY_LS_KEY, savedProxyPool);
       } catch {
         /* ignore */
       }
     }
+
     function restoreProxyField() {
       const el = $("proxy");
       if (!el) return;
       try {
-        // null = 從未存過；"" = 用家刻意清空（本機 IP）
         const saved = localStorage.getItem(PROXY_LS_KEY);
-        if (saved === null) return;
-        el.value = saved;
+        if (saved === null) {
+          savedProxyPool = "";
+          updateProxySaveMeta();
+          return;
+        }
+        savedProxyPool = normalizeProxyText(saved);
+        el.value = savedProxyPool;
+        updateProxySaveMeta();
       } catch {
         /* ignore */
       }
+    }
+
+    async function saveProxyPoolFromUi() {
+      const el = $("proxy");
+      const text = normalizeProxyText(el?.value ?? "");
+      savedProxyPool = text;
+      if (el) el.value = text;
+      persistProxyField();
+      const res = await fetch("/api/proxy-pool", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ proxy: text }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.ok === false) {
+        throw new Error(data.error || `Save failed (${res.status})`);
+      }
+      const n = Number(data.count ?? countProxyLines(text));
+      updateProxySaveMeta(n > 0 ? `已 Save：${n} 條 proxy` : "已 Save：本機 IP");
+      return data;
     }
 
     function formConfig() {
@@ -946,11 +998,11 @@
         pickupSearch: String(fd.get("pickupSearch") || "中環"),
         saleStartIso: String(fd.get("saleStartIso") || preset.saleStartIso || SALE_START_IPHONE18),
         productPollIntervalMs: Number(fd.get("productPollIntervalMs") || 5000),
-        proxy: String(fd.get("proxy") || "").trim(),
+        // 只用撳過 Save 嘅 proxy；清空 Save＝本機 IP
+        proxy: savedProxyPool,
         skipTradeIn: true,
         addAppleCare: false,
       };
-      persistProxyField();
       return cfg;
     }
 
@@ -2424,10 +2476,55 @@
       }
     });
 
-    $("proxy")?.addEventListener("input", () => persistProxyField());
-    $("proxy")?.addEventListener("change", () => persistProxyField());
+    $("btnSaveProxy")?.addEventListener("click", async () => {
+      const btn = $("btnSaveProxy");
+      const prev = btn?.textContent || "Save";
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "Saving…";
+      }
+      try {
+        const data = await saveProxyPoolFromUi();
+        const n = Number(data.count ?? 0);
+        if (btn) btn.textContent = n > 0 ? `Saved (${n})` : "Saved · 本機 IP";
+        setTimeout(() => {
+          if (btn) btn.textContent = prev;
+        }, 1400);
+      } catch (err) {
+        alert(err instanceof Error ? err.message : String(err));
+        if (btn) btn.textContent = prev;
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    });
+
+    // 輸入時唔自動 Save；只提示未 Save
+    $("proxy")?.addEventListener("input", () => {
+      const meta = $("proxySaveMeta");
+      const live = normalizeProxyText($("proxy")?.value ?? "");
+      if (live === savedProxyPool) {
+        updateProxySaveMeta();
+        return;
+      }
+      if (meta) meta.textContent = "｜有未 Save 變更 — 撳 Save 先生效";
+    });
 
     restoreProxyField();
+    // 同 server 已 Save 嘅 pool 對齊（本機 localStorage 優先；無就用 server）
+    void (async () => {
+      try {
+        if (localStorage.getItem(PROXY_LS_KEY) !== null) return;
+        const res = await fetch("/api/proxy-pool");
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.ok) return;
+        savedProxyPool = normalizeProxyText(data.proxy || "");
+        const el = $("proxy");
+        if (el) el.value = savedProxyPool;
+        updateProxySaveMeta();
+      } catch {
+        /* ignore */
+      }
+    })();
     refresh();
     void refreshCheckoutCardsUi();
     setInterval(refresh, 3000);
