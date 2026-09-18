@@ -952,10 +952,14 @@ async function spawnCheckoutWorkerBreakaway(
     const ps1 = [
       `$ErrorActionPreference = 'Stop'`,
       `try {`,
+      `  # PowerShell 會繼承 dashboard 嘅 env；JSON 冇寫嘅 key 唔會自動清，`,
+      `  # 必須顯式刪 Cursor sandbox 嘅 PLAYWRIGHT_BROWSERS_PATH，否則 chromium 指向唔存在嘅路徑`,
+      `  Remove-Item Env:PLAYWRIGHT_BROWSERS_PATH -ErrorAction SilentlyContinue`,
       `  $envMap = Get-Content -LiteralPath ${psSingleQuote(envFile)} -Raw -Encoding UTF8 | ConvertFrom-Json`,
       `  $envMap.PSObject.Properties | ForEach-Object {`,
       `    Set-Item -Path ('Env:' + $_.Name) -Value ([string]$_.Value)`,
       `  }`,
+      `  if (-not $env:PLAYWRIGHT_BROWSERS_PATH) { Remove-Item Env:PLAYWRIGHT_BROWSERS_PATH -ErrorAction SilentlyContinue }`,
       `  $p = Start-Process -FilePath ${psSingleQuote(process.execPath)} \``,
       `    -ArgumentList @(${psSingleQuote(tsxCli)}, ${psSingleQuote(script)}) \``,
       `    -WorkingDirectory ${psSingleQuote(ROOT)} \``,
@@ -972,10 +976,13 @@ async function spawnCheckoutWorkerBreakaway(
     await fs.writeFile(ps1File, ps1, "utf8");
     await new Promise<void>((resolve, reject) => {
       const chunks: Buffer[] = [];
+      // 連 powershell 本身都唔好帶 sandbox browsers path
+      const psEnv = { ...process.env, ...envObj };
+      delete psEnv.PLAYWRIGHT_BROWSERS_PATH;
       const child = spawn(
         "powershell.exe",
         ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1File],
-        { windowsHide: true }
+        { windowsHide: true, env: psEnv }
       );
       child.stderr?.on("data", (d) => chunks.push(Buffer.from(d)));
       child.stdout?.on("data", (d) => chunks.push(Buffer.from(d)));
