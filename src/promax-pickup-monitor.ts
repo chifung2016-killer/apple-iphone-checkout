@@ -22,10 +22,15 @@ const LATEST_PATH = path.join(RUNTIME_DIR, "promax-pickup-latest.json");
 const RESTOCK_HISTORY_FILE = path.join(RUNTIME_DIR, "restock-history.jsonl");
 const RESTOCK_HISTORY_MAX = 800;
 
+const PICKUP_MESSAGE_URL =
+  "https://www.apple.com/hk/shop/retail/pickup-message";
+/** 舊 endpoint 易被 541；保留作 fallback */
 const FULFILLMENT_URL =
   "https://www.apple.com/hk/shop/fulfillment-messages";
 const PRODUCT_REFERER =
   "https://www.apple.com/hk/shop/buy-iphone/iphone-18-pro";
+/** pickup-message 要地區名（「HK」會空；中環可覆蓋六間店） */
+const PICKUP_LOCATION = "中環";
 
 /** Live 補貨紀錄門市代碼 */
 const STORE_CODES: Record<string, string> = {
@@ -258,41 +263,22 @@ function browserHeaders(): Record<string, string> {
   };
 }
 
-export async function fetchFulfillmentStores(
+function parsePickupStores(
+  data: Record<string, unknown>,
   sku: string
-): Promise<
-  {
-    storeName: string;
-    pickupDisplay: string;
-    pickupQuote: string;
-  }[]
-> {
-  const url = new URL(FULFILLMENT_URL);
-  url.searchParams.set("pl", "true");
-  url.searchParams.set("mts.0", "regular");
-  url.searchParams.set("parts.0", sku);
-  url.searchParams.set("location", "HK");
-
-  const res = await fetch(url.toString(), {
-    method: "GET",
-    headers: browserHeaders(),
-    redirect: "follow",
-  });
-
-  if (res.status === 429 || res.status === 403 || res.status === 541) {
-    const err = new Error(`HTTP ${res.status} from fulfillment-messages`);
-    (err as Error & { status: number }).status = res.status;
-    throw err;
-  }
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} from fulfillment-messages`);
-  }
-
-  const data = (await res.json()) as Record<string, unknown>;
+): {
+  storeName: string;
+  pickupDisplay: string;
+  pickupQuote: string;
+}[] {
   const body = (data.body || {}) as Record<string, unknown>;
   const content = (body.content || {}) as Record<string, unknown>;
-  const pickupMessage = (content.pickupMessage || {}) as Record<string, unknown>;
-  const stores = (pickupMessage.stores || []) as Record<string, unknown>[];
+  const pickupMessage = (content.pickupMessage ||
+    body.pickupMessage ||
+    {}) as Record<string, unknown>;
+  const stores = (pickupMessage.stores ||
+    body.stores ||
+    []) as Record<string, unknown>[];
 
   const rows: {
     storeName: string;
@@ -319,6 +305,95 @@ export async function fetchFulfillmentStores(
     });
   }
   return rows;
+}
+
+async function fetchPickupMessageStores(sku: string): Promise<
+  {
+    storeName: string;
+    pickupDisplay: string;
+    pickupQuote: string;
+  }[]
+> {
+  const url = new URL(PICKUP_MESSAGE_URL);
+  url.searchParams.set("pl", "true");
+  url.searchParams.set("parts.0", sku);
+  url.searchParams.set("location", PICKUP_LOCATION);
+
+  const res = await fetch(url.toString(), {
+    method: "GET",
+    headers: browserHeaders(),
+    redirect: "follow",
+  });
+
+  if (res.status === 429 || res.status === 403 || res.status === 541) {
+    const err = new Error(`HTTP ${res.status} from pickup-message`);
+    (err as Error & { status: number }).status = res.status;
+    throw err;
+  }
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} from pickup-message`);
+  }
+
+  const data = (await res.json()) as Record<string, unknown>;
+  return parsePickupStores(data, sku);
+}
+
+async function fetchFulfillmentMessagesStores(sku: string): Promise<
+  {
+    storeName: string;
+    pickupDisplay: string;
+    pickupQuote: string;
+  }[]
+> {
+  const url = new URL(FULFILLMENT_URL);
+  url.searchParams.set("pl", "true");
+  url.searchParams.set("mts.0", "regular");
+  url.searchParams.set("parts.0", sku);
+  url.searchParams.set("location", PICKUP_LOCATION);
+
+  const res = await fetch(url.toString(), {
+    method: "GET",
+    headers: browserHeaders(),
+    redirect: "follow",
+  });
+
+  if (res.status === 429 || res.status === 403 || res.status === 541) {
+    const err = new Error(`HTTP ${res.status} from fulfillment-messages`);
+    (err as Error & { status: number }).status = res.status;
+    throw err;
+  }
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} from fulfillment-messages`);
+  }
+
+  const data = (await res.json()) as Record<string, unknown>;
+  return parsePickupStores(data, sku);
+}
+
+/**
+ * 優先 retail/pickup-message（本機可通）；
+ * fulfillment-messages 常被 541，只作 fallback。
+ */
+export async function fetchFulfillmentStores(
+  sku: string
+): Promise<
+  {
+    storeName: string;
+    pickupDisplay: string;
+    pickupQuote: string;
+  }[]
+> {
+  try {
+    const rows = await fetchPickupMessageStores(sku);
+    if (rows.length) return rows;
+  } catch (err) {
+    console.warn(
+      `[promax-pickup] pickup-message failed for ${sku}: ${
+        err instanceof Error ? err.message : String(err)
+      } — try fulfillment-messages`
+    );
+  }
+  return fetchFulfillmentMessagesStores(sku);
 }
 
 async function appendCollection(rows: PromaxStockRow[]): Promise<void> {
