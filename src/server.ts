@@ -4,7 +4,7 @@
  */
 import http from "node:http";
 import fs from "node:fs/promises";
-import { createReadStream, existsSync, watch as fsWatch } from "node:fs";
+import { createReadStream, existsSync, watch as fsWatch, openSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -171,9 +171,15 @@ async function recoverCheckoutSessionsFromDisk(): Promise<void> {
       });
     }
 
-    // 只喺呢次 server 生命週期第一次認回 session 時 Hide（唔好每 3 秒 poll 都強制藏）
+    // script／server 更新後第一次認回：保持 Hide，並繼續跟 log／pid（Open browser 仍然可用）
     if (alive && wasMissing) {
       await keepBrowserHiddenAfterScriptUpdate(id, st).catch(() => {});
+      const s = sessions.get(id);
+      if (s) {
+        attachSessionLogTail(s, sessionLogPath(id));
+        attachSessionLogTail(s, `${sessionLogPath(id)}.err`);
+        watchSessionPid(s);
+      }
     }
   }
 }
@@ -898,6 +904,216 @@ function envForCheckoutChild(extra: Record<string, string>): NodeJS.ProcessEnv {
   return env;
 }
 
+function sessionLogPath(id: string): string {
+  return path.join(RUNTIME_DIR, `session-${normalizeBrowserId(id)}.log`);
+}
+
+function sessionPidPath(id: string): string {
+  return path.join(RUNTIME_DIR, `pid-${normalizeBrowserId(id)}.txt`);
+}
+
+function psSingleQuote(s: string): string {
+  return `'${String(s).replace(/'/g, "''")}'`;
+}
+
+/**
+ * 完全脫離 dashboard／tsx watch process tree（尤其 Windows job object），
+ * 唔會因為 Dashboard 更新／重啟而被連帶關晒 browser。
+ */
+async function spawnCheckoutWorkerBreakaway(
+  id: string,
+  envExtra: Record<string, string>
+): Promise<{ pid: number | null; child: ChildProcess | null; logFile: string }> {
+  await ensureRuntimeDir();
+  const nid = normalizeBrowserId(id);
+  const tsxCli = path.join(ROOT, "node_modules", "tsx", "dist", "cli.mjs");
+  const script = path.join(ROOT, "src", "buy-iphone-17.ts");
+  const logFile = sessionLogPath(nid);
+  const pidFile = sessionPidPath(nid);
+  const env = envForCheckoutChild(envExtra);
+  await fs.writeFile(logFile, "", "utf8").catch(() => {});
+  await fs.unlink(pidFile).catch(() => {});
+
+  if (process.platform === "win32") {
+    // Start-Process 開新 process（唔喺 tsx watch 嘅 job／tree 入面）
+    const envAssign = Object.entries(env)
+      .filter(([k, v]) => v != null && k && !/[^A-Za-z0-9_]/i.test(k))
+      .map(([k, v]) => `$env:${k}=${psSingleQuote(String(v))}`)
+      .join("; ");
+    const errFile = `${logFile}.err`;
+    const ps = [
+      envAssign,
+      `$p = Start-Process -FilePath ${psSingleQuote(process.execPath)}`,
+      `-ArgumentList @(${psSingleQuote(tsxCli)},${psSingleQuote(script)})`,
+      `-WorkingDirectory ${psSingleQuote(ROOT)}`,
+      `-WindowStyle Hidden -PassThru`,
+      `-RedirectStandardOutput ${psSingleQuote(logFile)}`,
+      `-RedirectStandardError ${psSingleQuote(errFile)}`,
+      `; if ($p) { Set-Content -Path ${psSingleQuote(pidFile)} -Value $p.Id -Encoding ascii }`,
+    ].join(" ");
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn(
+        "powershell.exe",
+        ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+        { stdio: "ignore", windowsHide: true }
+      );
+      child.on("error", reject);
+      child.on("exit", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`Start-Process failed exit=${code}`));
+      });
+    });
+    let pid: number | null = null;
+    for (let i = 0; i < 40; i++) {
+      try {
+        const raw = await fs.readFile(pidFile, "utf8");
+        const n = Number(String(raw).trim());
+        if (Number.isFinite(n) && n > 0) {
+          pid = n;
+          break;
+        }
+      } catch {
+        /* wait */
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return { pid, child: null, logFile };
+  }
+
+  // Unix：detached + 完全 ignore stdio，log 寫檔
+  const outFd = openSync(logFile, "a");
+  const proc = spawn(process.execPath, [tsxCli, script], {
+    cwd: ROOT,
+    env,
+    detached: true,
+    stdio: ["ignore", outFd, outFd],
+  });
+  proc.unref();
+  if (proc.pid) {
+    await fs.writeFile(pidFile, String(proc.pid), "utf8").catch(() => {});
+  }
+  return { pid: proc.pid ?? null, child: proc, logFile };
+}
+
+/** 跟住 session log 檔（breakaway 後冇 stdout pipe） */
+function attachSessionLogTail(session: BrowserSession, logFile: string): void {
+  let offset = 0;
+  const tick = async () => {
+    if (!session.running) return;
+    try {
+      const st = await fs.stat(logFile);
+      if (st.size < offset) offset = 0;
+      if (st.size > offset) {
+        const fh = await fs.open(logFile, "r");
+        try {
+          const len = st.size - offset;
+          const buf = Buffer.alloc(Math.min(len, 256_000));
+          const { bytesRead } = await fh.read(buf, 0, buf.length, offset);
+          offset += bytesRead;
+          const chunk = buf.slice(0, bytesRead).toString("utf8");
+          for (const line of chunk.split(/\r?\n/)) {
+            if (line.trim()) pushSessionLog(session, line);
+          }
+        } finally {
+          await fh.close().catch(() => {});
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    if (session.running) setTimeout(() => void tick(), 800);
+  };
+  void tick();
+}
+
+/** breakaway worker 冇 ChildProcess exit 事件時，用 PID 巡檢查有冇死 */
+function watchSessionPid(session: BrowserSession): void {
+  const tick = async () => {
+    if (!session.running) return;
+    const pid = session.pid;
+    if (!pidAlive(pid)) {
+      // 可能 status 檔已更新 pid；再讀一次
+      const st = await readSessionStatus(session.id);
+      const stPid =
+        typeof st?.pid === "number"
+          ? st.pid
+          : Number(st?.pid) > 0
+            ? Number(st?.pid)
+            : null;
+      if (stPid && pidAlive(stPid)) {
+        session.pid = stPid;
+        setTimeout(() => void tick(), 2000);
+        return;
+      }
+      await onCheckoutWorkerExit(session, session.exitCode ?? null);
+      return;
+    }
+    setTimeout(() => void tick(), 2000);
+  };
+  setTimeout(() => void tick(), 2500);
+}
+
+async function onCheckoutWorkerExit(
+  session: BrowserSession,
+  code: number | null
+): Promise<void> {
+  if (!session.running && session.pid == null) return;
+  session.running = false;
+  session.exitCode = code;
+  session.pid = null;
+  session.child = null;
+  pushSessionLog(session, `[dashboard] 進程結束 exit=${code}`);
+  const usedProxy = String(session.config?.proxy || "").trim();
+  const paid = await isPaidBrowserSession(session.id);
+  const st = await readSessionStatus(session.id);
+  const phase = String(st?.phase || "");
+  void appendDayLog({
+    channel: "checkout",
+    sessionId: session.id,
+    line: `[dashboard] session summary exit=${code} paid=${paid} phase=${phase} proxy=${usedProxy || "本機 IP"}`,
+    meta: {
+      kind: "exit",
+      exitCode: code,
+      paid,
+      phase,
+      proxy: usedProxy,
+      orderNumber:
+        ((st?.card as { orderNumber?: string } | undefined)?.orderNumber as string) ||
+        null,
+    },
+  });
+  if (usedProxy) {
+    const failed = !paid && (code !== 0 || /error|fail/i.test(phase));
+    if (failed) {
+      await blacklistProxy(
+        usedProxy,
+        `session=${session.id} exit=${code} phase=${phase || "—"}`
+      ).catch(() => {});
+    }
+  }
+  if (session.config?.checkoutCardId) {
+    const rejected =
+      Boolean(st?.cardRejected) ||
+      /card_rejected|payment_declined|shop_404/i.test(phase);
+    const outcome = paid
+      ? "success"
+      : rejected || code !== 0 || /error|fail/i.test(phase)
+        ? "rejected"
+        : "release";
+    await finalizeCheckoutCard({
+      statePath: CHECKOUT_CARDS_STATE,
+      assignPath: assignedCardPath(session.id),
+      sessionId: session.id,
+      outcome,
+    }).catch(() => {});
+    pushSessionLog(
+      session,
+      `[card] finalize ${String(session.config.checkoutCardMasked || session.config.checkoutCardId)} → ${outcome}`
+    );
+  }
+  broadcast({ type: "status", state: await snapshot() });
+}
+
 /** 唔好重用舊 id（尤其係已 dismissed），否則新 task 會即刻被隱藏 */
 async function refreshNextIndexFromDisk(): Promise<void> {
   let maxN = 0;
@@ -1290,107 +1506,35 @@ async function spawnOneBrowser(
     index + 1
   );
 
-  const tsxCli = path.join(ROOT, "node_modules", "tsx", "dist", "cli.mjs");
-  const script = path.join(ROOT, "src", "buy-iphone-17.ts");
-  // detached：tsx watch／server 重啟時唔好連 browser 一齊殺
-  const proc = spawn(process.execPath, [tsxCli, script], {
-    cwd: ROOT,
-    env: envForCheckoutChild({
-      CHECKOUT_DASHBOARD: "1",
-      CHECKOUT_CONFIG_PATH: configPath,
-      CHECKOUT_SESSION_ID: id,
-      CHECKOUT_WINDOW_INDEX: String(index),
-      CHECKOUT_WINDOW_TOTAL: String(windowTotal),
-      CHECKOUT_CARD_KEY_PATH: ADD_ORDER_KEY,
-      CHECKOUT_CARD_ASSIGN_PATH: assignedCardPath(id),
-      CHECKOUT_CARD_STATE_PATH: CHECKOUT_CARDS_STATE,
-    }),
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: true,
-    windowsHide: true,
+  // 完全脫離 dashboard process tree：Dashboard／tsx watch 更新唔會連 browser 一齊關
+  const launched = await spawnCheckoutWorkerBreakaway(id, {
+    CHECKOUT_DASHBOARD: "1",
+    CHECKOUT_CONFIG_PATH: configPath,
+    CHECKOUT_SESSION_ID: id,
+    CHECKOUT_WINDOW_INDEX: String(index),
+    CHECKOUT_WINDOW_TOTAL: String(windowTotal),
+    CHECKOUT_CARD_KEY_PATH: ADD_ORDER_KEY,
+    CHECKOUT_CARD_ASSIGN_PATH: assignedCardPath(id),
+    CHECKOUT_CARD_STATE_PATH: CHECKOUT_CARDS_STATE,
   });
-  session.child = proc;
-  session.pid = proc.pid ?? null;
-  // 唔綁死 parent lifetime（script update 重啟 server 時 browser 繼續跑）
-  proc.unref();
+  session.child = launched.child;
+  session.pid = launched.pid;
   await writeInitialOpenedBrowserStatus(id, sessionConfig, session.pid);
   await writeSessionLaunchRecord(id, sessionConfig);
   pushSessionLog(
     session,
-    `[dashboard] 已啟動 pid=${session.pid} windowIndex=${index}/${windowTotal}`
+    `[dashboard] 已啟動 pid=${session.pid} windowIndex=${index}/${windowTotal}（detached；Dashboard 更新唔會關）`
   );
-
-  proc.stdout?.setEncoding("utf8");
-  proc.stderr?.setEncoding("utf8");
-  proc.stdout?.on("data", (chunk: string | Buffer) => {
-    for (const line of String(chunk).split("\n")) pushSessionLog(session, line);
-  });
-  proc.stderr?.on("data", (chunk: string | Buffer) => {
-    for (const line of String(chunk).split("\n")) pushSessionLog(session, line);
-  });
-  proc.on("exit", async (code) => {
-    session.running = false;
-    session.exitCode = code;
-    session.pid = null;
-    session.child = null;
-    pushSessionLog(session, `[dashboard] 進程結束 exit=${code}`);
-    // 用咗 proxy 但未成功付款／落單 → 加入黑名單，之後唔再分配
-    const usedProxy = String(session.config?.proxy || "").trim();
-    const paid = await isPaidBrowserSession(session.id);
-    const st = await readSessionStatus(session.id);
-    const phase = String(st?.phase || "");
-    void appendDayLog({
-      channel: "checkout",
-      sessionId: session.id,
-      line: `[dashboard] session summary exit=${code} paid=${paid} phase=${phase} proxy=${usedProxy || "本機 IP"}`,
-      meta: {
-        kind: "exit",
-        exitCode: code,
-        paid,
-        phase,
-        proxy: usedProxy,
-        orderNumber:
-          ((st?.card as { orderNumber?: string } | undefined)?.orderNumber as string) ||
-          null,
-      },
+  attachSessionLogTail(session, launched.logFile);
+  // 都跟 .err（Windows Start-Process 分開 stderr）
+  attachSessionLogTail(session, `${launched.logFile}.err`);
+  if (launched.child) {
+    launched.child.on("exit", (code) => {
+      void onCheckoutWorkerExit(session, code);
     });
-    if (usedProxy) {
-      const failed =
-        !paid &&
-        (code !== 0 || /error|fail/i.test(phase));
-      if (failed) {
-        await blacklistProxy(
-          usedProxy,
-          `session=${session.id} exit=${code} phase=${phase || "—"}`
-        ).catch(() => {});
-      }
-    }
-    // 信用卡結果：成功／拒單／結束都釋放返池（可再用）
-    if (session.config?.checkoutCardId) {
-      const paid = await isPaidBrowserSession(session.id);
-      const st = await readSessionStatus(session.id);
-      const phase = String(st?.phase || "");
-      const rejected =
-        Boolean(st?.cardRejected) ||
-        /card_rejected|payment_declined|shop_404/i.test(phase);
-      const outcome = paid
-        ? "success"
-        : rejected || code !== 0 || /error|fail/i.test(phase)
-          ? "rejected"
-          : "release";
-      await finalizeCheckoutCard({
-        statePath: CHECKOUT_CARDS_STATE,
-        assignPath: assignedCardPath(session.id),
-        sessionId: session.id,
-        outcome,
-      }).catch(() => {});
-      pushSessionLog(
-        session,
-        `[card] finalize ${String(session.config.checkoutCardMasked || session.config.checkoutCardId)} → ${outcome}`
-      );
-    }
-    broadcast({ type: "status", state: await snapshot() });
-  });
+  } else {
+    watchSessionPid(session);
+  }
 
   return session;
 }
