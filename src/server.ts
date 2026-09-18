@@ -22,6 +22,12 @@ import {
   resolveDeliveryMethodLabel,
 } from "./fulfillment-label.js";
 import {
+  getPromaxPickupStatus,
+  runPromaxPickupPollOnce,
+  startPromaxPickupMonitor,
+  stopPromaxPickupMonitor,
+} from "./promax-pickup-monitor.js";
+import {
   decryptFromBlob,
   decryptFromFile,
   encryptToBlob,
@@ -2403,6 +2409,32 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
   const { pathname } = url;
 
   if (pathname === "/api/health") return sendJson(res, 200, { ok: true });
+
+  /** iPhone 18 Pro Max 香港門市取貨庫存 matrix（獨立模組） */
+  if (pathname === "/api/promax-pickup/status" && req.method === "GET") {
+    return sendJson(res, 200, getPromaxPickupStatus());
+  }
+  if (pathname === "/api/promax-pickup/poll" && req.method === "POST") {
+    try {
+      const status = await runPromaxPickupPollOnce();
+      return sendJson(res, 200, status);
+    } catch (err) {
+      return sendJson(res, 500, {
+        ...getPromaxPickupStatus(),
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  if (pathname === "/api/promax-pickup/start" && req.method === "POST") {
+    await startPromaxPickupMonitor({ runImmediately: true });
+    return sendJson(res, 200, getPromaxPickupStatus());
+  }
+  if (pathname === "/api/promax-pickup/stop" && req.method === "POST") {
+    stopPromaxPickupMonitor();
+    return sendJson(res, 200, getPromaxPickupStatus());
+  }
+
   if (pathname === "/api/snapshot" && req.method === "GET") {
     return sendJson(res, 200, await snapshot());
   }
@@ -3225,6 +3257,12 @@ server.listen(PORT, "127.0.0.1", () => {
     }
     await recoverCheckoutSessionsFromDisk().catch(() => {});
     await refreshNextIndexFromDisk();
+    // 獨立 Pro Max 門市庫存監控（失敗唔影響 dashboard）
+    startPromaxPickupMonitor({ runImmediately: true }).catch((err) => {
+      console.warn(
+        `[promax-pickup] auto-start failed：${err instanceof Error ? err.message : String(err)}`
+      );
+    });
     console.log(
       `Checkout dashboard → http://127.0.0.1:${PORT} (next browser id b${nextIndex + 1}) [live-reload build=${DASHBOARD_BUILD_ID}]`
     );
