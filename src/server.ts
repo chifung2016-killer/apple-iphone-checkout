@@ -1241,6 +1241,27 @@ async function blacklistProxy(proxy: string, reason: string): Promise<void> {
   console.log(`[proxy] 已加入黑名單（之後唔再用）：${proxy}｜${reason}`);
 }
 
+/** 清黑名單，之後 Launch 可以再分配呢啲 IP */
+async function clearProxyBlacklist(): Promise<number> {
+  const banned = await loadProxyBlacklist();
+  const n = banned.size;
+  await ensureRuntimeDir();
+  await fs
+    .writeFile(
+      PROXY_BLACKLIST_FILE,
+      JSON.stringify(
+        { updatedAt: new Date().toISOString(), reason: "manual reset", lastAdded: "", proxies: [] },
+        null,
+        2
+      ),
+      "utf8"
+    )
+    .catch(() => {});
+  if (n > 0) console.log(`[proxy] blacklist reset：已解禁 ${n} 條`);
+  else console.log(`[proxy] blacklist reset：本來就係空`);
+  return n;
+}
+
 /** 每個 Proxy / IP 用滿 PROXY_BROWSERS_PER_IP 個 browser 先換下一個；唔超額重複 */
 async function pickProxyForNewTask(poolRaw: unknown): Promise<string> {
   const pool = parseProxyPool(poolRaw);
@@ -2393,10 +2414,12 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
   if (pathname === "/api/proxy-pool" && req.method === "GET") {
     const proxy = String(lastFormConfig.proxy || "");
     const count = parseProxyPool(proxy).length;
+    const banned = await loadProxyBlacklist();
     return sendJson(res, 200, {
       ok: true,
       proxy,
       count,
+      banned: banned.size,
       mode: count > 0 ? "proxy" : "local",
     });
   }
@@ -2415,6 +2438,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
       .writeFile(path.join(RUNTIME_DIR, "proxy-pool.txt"), proxy, "utf8")
       .catch(() => {});
     const count = parseProxyPool(proxy).length;
+    const banned = await loadProxyBlacklist();
     console.log(
       count > 0
         ? `[proxy] pool saved：${count} 條`
@@ -2425,6 +2449,23 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
       ok: true,
       proxy,
       count,
+      banned: banned.size,
+      mode: count > 0 ? "proxy" : "local",
+    });
+  }
+
+  /** 清 proxy 黑名單，令已 Save 嘅 IP 可以再分配畀新 task */
+  if (pathname === "/api/proxy-pool/reset" && req.method === "POST") {
+    const cleared = await clearProxyBlacklist();
+    const proxy = String(lastFormConfig.proxy || "");
+    const count = parseProxyPool(proxy).length;
+    broadcast({ type: "status", state: await snapshot() });
+    return sendJson(res, 200, {
+      ok: true,
+      cleared,
+      proxy,
+      count,
+      banned: 0,
       mode: count > 0 ? "proxy" : "local",
     });
   }

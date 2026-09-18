@@ -576,10 +576,11 @@
             ></textarea>
             <div class="actions" style="margin-top:8px">
               <button type="button" class="btn-primary btn-sm" id="btnSaveProxy">Save</button>
+              <button type="button" class="btn-ghost btn-sm" id="btnResetProxy" title="清黑名單，之後 Launch 可再分配呢啲 IP">Reset</button>
             </div>
             <p class="hint" style="margin:6px 0 0">
               貼上 proxy 後撳 <strong>Save</strong> 先會用嚟開 browser；清空再 Save 就用<strong>本機 IP</strong>。
-              可填多個：<strong>每一條最多畀 3 個 browser 共用</strong>（用滿先換下一條）。失敗結帳會入黑名單。
+              可填多個：<strong>每一條最多畀 3 個 browser 共用</strong>（用滿先換下一條）。失敗結帳會入黑名單；撳 <strong>Reset</strong> 可再重用。
               <span id="proxySaveMeta">—</span>
             </p>
           </div>
@@ -918,12 +919,30 @@
         .filter(Boolean).length;
     }
 
+    let proxyBannedCount = 0;
+
     function updateProxySaveMeta(okMsg) {
       const meta = $("proxySaveMeta");
       if (!meta) return;
       const n = countProxyLines(savedProxyPool);
       const mode = n > 0 ? `已 Save：${n} 條 proxy` : "已 Save：本機 IP";
-      meta.textContent = okMsg ? `｜${okMsg}` : `｜${mode}`;
+      const ban =
+        proxyBannedCount > 0 ? `｜黑名單 ${proxyBannedCount} 條（可 Reset）` : "";
+      meta.textContent = okMsg ? `｜${okMsg}${ban}` : `｜${mode}${ban}`;
+    }
+
+    async function resetProxyBlacklistFromUi() {
+      const res = await fetch("/api/proxy-pool/reset", { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.ok === false) {
+        throw new Error(data.error || `Reset failed (${res.status})`);
+      }
+      proxyBannedCount = Number(data.banned ?? 0);
+      const cleared = Number(data.cleared ?? 0);
+      updateProxySaveMeta(
+        cleared > 0 ? `已 Reset：解禁 ${cleared} 條` : "已 Reset：黑名單係空"
+      );
+      return data;
     }
 
     function persistProxyField() {
@@ -967,6 +986,7 @@
       if (!res.ok || data.ok === false) {
         throw new Error(data.error || `Save failed (${res.status})`);
       }
+      proxyBannedCount = Number(data.banned ?? proxyBannedCount);
       const n = Number(data.count ?? countProxyLines(text));
       updateProxySaveMeta(n > 0 ? `已 Save：${n} 條 proxy` : "已 Save：本機 IP");
       return data;
@@ -2485,8 +2505,31 @@
       }
       try {
         const data = await saveProxyPoolFromUi();
+        proxyBannedCount = Number(data.banned ?? proxyBannedCount);
         const n = Number(data.count ?? 0);
         if (btn) btn.textContent = n > 0 ? `Saved (${n})` : "Saved · 本機 IP";
+        setTimeout(() => {
+          if (btn) btn.textContent = prev;
+        }, 1400);
+      } catch (err) {
+        alert(err instanceof Error ? err.message : String(err));
+        if (btn) btn.textContent = prev;
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    });
+
+    $("btnResetProxy")?.addEventListener("click", async () => {
+      const btn = $("btnResetProxy");
+      const prev = btn?.textContent || "Reset";
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "Resetting…";
+      }
+      try {
+        const data = await resetProxyBlacklistFromUi();
+        const cleared = Number(data.cleared ?? 0);
+        if (btn) btn.textContent = cleared > 0 ? `Reset (${cleared})` : "Reset · empty";
         setTimeout(() => {
           if (btn) btn.textContent = prev;
         }, 1400);
@@ -2510,16 +2553,19 @@
     });
 
     restoreProxyField();
-    // 同 server 已 Save 嘅 pool 對齊（本機 localStorage 優先；無就用 server）
+    // 同 server 已 Save 嘅 pool／黑名單對齊
     void (async () => {
       try {
-        if (localStorage.getItem(PROXY_LS_KEY) !== null) return;
         const res = await fetch("/api/proxy-pool");
         const data = await res.json().catch(() => ({}));
         if (!res.ok || !data.ok) return;
-        savedProxyPool = normalizeProxyText(data.proxy || "");
-        const el = $("proxy");
-        if (el) el.value = savedProxyPool;
+        proxyBannedCount = Number(data.banned ?? 0);
+        if (localStorage.getItem(PROXY_LS_KEY) === null) {
+          savedProxyPool = normalizeProxyText(data.proxy || "");
+          const el = $("proxy");
+          if (el) el.value = savedProxyPool;
+          persistProxyField();
+        }
         updateProxySaveMeta();
       } catch {
         /* ignore */
