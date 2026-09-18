@@ -15,6 +15,11 @@ import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  hasTelegramCreds,
+  notifyPromaxTelegram,
+  upsertPromaxTelegramStatus,
+} from "./promax-telegram.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SKU_MAP_PATH = path.join(ROOT, "config", "sku_map.json");
@@ -193,6 +198,9 @@ const state: MonitorState = {
   latest: null,
   prevAvailable: new Map(),
 };
+
+/** Telegram live status 上次推送時間（節流） */
+let lastTelegramStatusAt = 0;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -486,8 +494,8 @@ function detectRestockEvents(
       const now = isAvailableDisplay(cell.pickup_display);
       const prev = state.prevAvailable.get(key);
       if (prev === undefined) {
+        // 首輪只建立基線，唔當補貨（避免重啟就狂推 Telegram）
         state.prevAvailable.set(key, now);
-        if (now) flippedToAvailable = true;
         continue;
       }
       if (!prev && now) flippedToAvailable = true;
@@ -657,6 +665,22 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
       (newRestockEvents.length ? ` restockEvents=${newRestockEvents.length}` : "") +
       (state.lastError ? ` err=${state.lastError}` : "")
   );
+  if (newRestockEvents.some((e) => e.event === "restock" || e.event === "sold_out")) {
+    void notifyPromaxTelegram(newRestockEvents).catch((err) => {
+      console.warn(
+        `[promax-pickup] telegram notify failed：${err instanceof Error ? err.message : String(err)}`
+      );
+    });
+  }
+  // live status：有貨變化即更新；否則最多每 5 分鐘一次
+  const shouldUpsertStatus =
+    newRestockEvents.some((e) => e.event === "restock" || e.event === "sold_out") ||
+    !lastTelegramStatusAt ||
+    Date.now() - lastTelegramStatusAt > 5 * 60_000;
+  if (shouldUpsertStatus && (matchedCells > 0 || state.consecutiveFailures === 0)) {
+    lastTelegramStatusAt = Date.now();
+    void upsertPromaxTelegramStatus(status).catch(() => {});
+  }
   try {
     await hooks.onPollComplete?.(status, newRestockEvents);
   } catch (err) {
@@ -716,7 +740,8 @@ export async function startPromaxPickupMonitor(opts?: {
   await ensureRuntime();
   await loadLatestFromDisk();
   console.log(
-    `[promax-pickup] started｜sku_map=${SKU_MAP_PATH}｜stores=${HK_APPLE_STORES.length}`
+    `[promax-pickup] started｜sku_map=${SKU_MAP_PATH}｜stores=${HK_APPLE_STORES.length}` +
+      `｜telegram=${hasTelegramCreds() ? "on" : "off"}`
   );
   if (opts?.runImmediately !== false) {
     try {

@@ -1,3 +1,4 @@
+import "dotenv/config";
 /**
  * Apple checkout control dashboard (multi-browser).
  * Run: npm run dashboard  →  http://127.0.0.1:8787
