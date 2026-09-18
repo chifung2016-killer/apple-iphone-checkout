@@ -1,0 +1,94 @@
+---
+description: iPhone 18 Pro Max HK pickup stock monitor — architecture, endpoints, failure modes
+alwaysApply: true
+---
+
+# Pro Max 門市庫存監控（記住呢啲細節）
+
+獨立模組，**唔係**舊嘅 `stock-monitor`（已刪除）。開 Dashboard 就自動跑，**唔使開瀏覽器**、唔使撳 Start monitor。
+
+## 檔案同責任
+
+| 路徑 | 用途 |
+|------|------|
+| `src/promax-pickup-monitor.ts` | 輪詢、parse、寫 collection、補貨事件、狀態 |
+| `config/sku_map.json` | 真實 Part Number（`scripts/fetch_skus.py` 產生） |
+| `scripts/fetch_skus.py` | 由 Apple 產品頁 `PRODUCT_SELECTION_BOOTSTRAP` 抽 SKU |
+| `src/server.ts` | 啟動 monitor + hooks；`/api/promax-pickup/*`；snapshot 帶 Live 補貨 |
+| `dashboard/index.html` | 顯示 Auto monitor 狀態 + Live 補貨紀錄（已無 Start monitor 掣） |
+| `runtime/promax-pickup-latest.json` | 最新 matrix 快照 |
+| `runtime/promax-pickup-stock.jsonl` | 每次成功輪詢嘅 row collection |
+| `runtime/restock-history.jsonl` | Live 補貨紀錄（有貨變化先寫） |
+
+## 監控範圍
+
+- 產品：**iPhone 18 Pro Max**（唔係 13／17）
+- 容量：只 **256GB、512GB**（唔要 1TB／2TB）
+- 顏色：布根地紅色、冰川色、銀色、黑色（來自 `sku_map.json` 中文 key）
+- 門市（6）：Causeway Bay(CWB)、ifc mall(IFC)、Festival Walk(FW)、apm(APM)、New Town Plaza(NTP)、Canton Road(TST)
+
+## SKU 點嚟
+
+- 官網買機頁係 `…/buy-iphone/iphone-18-pro`（**冇**獨立 `/iphone-18-pro-max`，會 404）
+- Pro Max = `dimensionScreensize: 6_9inch` / `familyType: iphone18promax`
+- 重新拉 SKU：`pip install requests && python scripts/fetch_skus.py`
+- 優先 `hk-zh` 頁 → 顏色 key 用中文
+
+## HTTP 點打（好重要）
+
+**主 endpoint（可行）：**
+```
+GET https://www.apple.com/hk/shop/retail/pickup-message?pl=true&parts.0={SKU}&location=中環
+```
+- `location` 要用地區名（**「中環」**）；用 `HK` 會 **0 stores**
+- 普通 `fetch` + 瀏覽器 UA／Referer／Accept-Language: zh-HK 就得
+- 成功時一次回晒 6 間店；parse：`body.content.pickupMessage.stores[]`
+- 每店：`storeName`、`partsAvailability[SKU].pickupDisplay`、`pickupSearchQuote`
+- `pickupDisplay` 典型：`available` / `unavailable` / `ineligible`
+
+**唔好用做主路徑：**
+```
+GET …/fulfillment-messages?…&location=HK
+```
+- 容易 **HTTP 541**（邊緣擋 bot）→ 監控「開住但無數據」
+- 只保留作 fallback；541/403/429 → exponential backoff
+
+## 輪詢行為
+
+- Dashboard `listen` 後 `startPromaxPickupMonitor({ runImmediately: true })`
+- 間隔：90–120s base + ±20s jitter；連續失敗 ≥2 → backoff（最多約 15 分鐘）
+- SKU 之間 sleep ~400–900ms
+- 成功：`last_success_at` 更新、`consecutive_failures=0`、寫 jsonl
+- 失敗：保留舊 `last_success_at`；API 仍回 matrix（可能全 null）+ `last_error`
+- 前端用 **`last_success_at`** 判斷新唔新鮮，唔好當「有 matrix 就係新數據」
+
+## Live 補貨紀錄
+
+- 只喺**成功輪詢**且偵測到變化時寫入：
+  - 門市 `unavailable`→`available` → `restock` + `store_stock`
+  - 全部變無貨 → `sold_out`
+- 經 `setPromaxPickupHooks({ onPollComplete })` broadcast snapshot 刷新 UI
+- 舊 Playwright 產品頁 monitor / Telegram monitor+buying **已移除**
+
+## API
+
+- `GET /api/promax-pickup/status` — matrix + `last_success_at` / `last_error`
+- `POST /api/promax-pickup/poll` — 即刻輪詢
+- `POST /api/promax-pickup/start` | `stop`
+- Snapshot 內 `monitor.restockHistory` + `monitor.promax`
+
+## 排查 checklist
+
+1. Dashboard 有無跑？`http://127.0.0.1:8787/api/health`
+2. `GET /api/promax-pickup/status` → `running`、`last_success_at`、`last_error`、`rows_in_last_poll`（滿應約 48 = 8 SKU × 6 店）
+3. 若 `HTTP 541`：確認仲喺唔喺用 `fulfillment-messages`+`location=HK`；應走 `pickup-message`+`中環`
+4. 若 `stores=0`：多數係 `location` 錯（唔好用裸 `HK`）
+5. Chromium／Playwright sandbox path：checkout worker 要清 `PLAYWRIGHT_BROWSERS_PATH`；**呢個 pickup monitor 用 fetch，唔依賴 Playwright**
+6. SKU 過時：重跑 `scripts/fetch_skus.py`
+7. `server.ts` 改動要 **重啟** dashboard（live-reload 只推前端，唔重載 Node route）
+
+## 改呢個模組時
+
+- 保持獨立檔案／獨立 route；唔好同 checkout browser spawn 邏輯糾纏
+- 唔好恢復已刪嘅 `src/stock-monitor/` 同 Start monitor 掣
+- 改 endpoint／location 前先用單 SKU smoke test（確認 200 + 6 stores）

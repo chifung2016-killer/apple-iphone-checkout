@@ -2,9 +2,11 @@
  * iPhone 18 Pro Max（香港）門市取貨庫存監控 — 獨立模組
  *
  * - 讀 config/sku_map.json（由 scripts/fetch_skus.py 產生）
- * - 背景輪詢 Apple fulfillment-messages
- * - 結果寫入 runtime/promax-pickup-stock.jsonl（新 collection，唔改現有 schema）
- * - 最新 matrix：runtime/promax-pickup-latest.json
+ * - 主路徑：retail/pickup-message?location=中環（fulfillment-messages 易 541）
+ * - 結果寫入 runtime/promax-pickup-stock.jsonl；最新：promax-pickup-latest.json
+ * - 有貨變化 → runtime/restock-history.jsonl（Live 補貨紀錄）
+ *
+ * 細節／排查：見 .cursor/rules/promax-pickup-monitor.mdc
  *
  * 由 dashboard server 啟動；亦可單獨：
  *   npx tsx -e "import { startPromaxPickupMonitor } from './src/promax-pickup-monitor.ts'; startPromaxPickupMonitor()"
