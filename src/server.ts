@@ -931,36 +931,73 @@ async function spawnCheckoutWorkerBreakaway(
   const logFile = sessionLogPath(nid);
   const pidFile = sessionPidPath(nid);
   const env = envForCheckoutChild(envExtra);
-  await fs.writeFile(logFile, "", "utf8").catch(() => {});
+  const errFile = `${logFile}.err`;
+  // Start-Process -Redirect* 唔可以指向已存在嘅檔；唔好預先 writeFile
+  await fs.unlink(logFile).catch(() => {});
+  await fs.unlink(errFile).catch(() => {});
   await fs.unlink(pidFile).catch(() => {});
 
   if (process.platform === "win32") {
-    // Start-Process 開新 process（唔喺 tsx watch 嘅 job／tree 入面）
-    const envAssign = Object.entries(env)
-      .filter(([k, v]) => v != null && k && !/[^A-Za-z0-9_]/i.test(k))
-      .map(([k, v]) => `$env:${k}=${psSingleQuote(String(v))}`)
-      .join("; ");
-    const errFile = `${logFile}.err`;
-    const ps = [
-      envAssign,
-      `$p = Start-Process -FilePath ${psSingleQuote(process.execPath)}`,
-      `-ArgumentList @(${psSingleQuote(tsxCli)},${psSingleQuote(script)})`,
-      `-WorkingDirectory ${psSingleQuote(ROOT)}`,
-      `-WindowStyle Hidden -PassThru`,
-      `-RedirectStandardOutput ${psSingleQuote(logFile)}`,
-      `-RedirectStandardError ${psSingleQuote(errFile)}`,
-      `; if ($p) { Set-Content -Path ${psSingleQuote(pidFile)} -Value $p.Id -Encoding ascii }`,
-    ].join(" ");
+    // 用 .ps1 + env json，避免 -Command 太長（全份 process.env）同 quote 炸掉
+    const envFile = path.join(RUNTIME_DIR, `launch-env-${nid}.json`);
+    const ps1File = path.join(RUNTIME_DIR, `launch-${nid}.ps1`);
+    const failFile = path.join(RUNTIME_DIR, `launch-fail-${nid}.txt`);
+    const envObj: Record<string, string> = {};
+    for (const [k, v] of Object.entries(env)) {
+      if (v == null || !k || /[^A-Za-z0-9_]/i.test(k)) continue;
+      envObj[k] = String(v);
+    }
+    await fs.writeFile(envFile, JSON.stringify(envObj), "utf8");
+    await fs.unlink(failFile).catch(() => {});
+    const ps1 = [
+      `$ErrorActionPreference = 'Stop'`,
+      `try {`,
+      `  $envMap = Get-Content -LiteralPath ${psSingleQuote(envFile)} -Raw -Encoding UTF8 | ConvertFrom-Json`,
+      `  $envMap.PSObject.Properties | ForEach-Object {`,
+      `    Set-Item -Path ('Env:' + $_.Name) -Value ([string]$_.Value)`,
+      `  }`,
+      `  $p = Start-Process -FilePath ${psSingleQuote(process.execPath)} \``,
+      `    -ArgumentList @(${psSingleQuote(tsxCli)}, ${psSingleQuote(script)}) \``,
+      `    -WorkingDirectory ${psSingleQuote(ROOT)} \``,
+      `    -WindowStyle Hidden -PassThru \``,
+      `    -RedirectStandardOutput ${psSingleQuote(logFile)} \``,
+      `    -RedirectStandardError ${psSingleQuote(errFile)}`,
+      `  if (-not $p) { throw 'Start-Process returned null' }`,
+      `  Set-Content -LiteralPath ${psSingleQuote(pidFile)} -Value $p.Id -Encoding ascii`,
+      `} catch {`,
+      `  $_ | Out-File -LiteralPath ${psSingleQuote(failFile)} -Encoding utf8`,
+      `  exit 1`,
+      `}`,
+    ].join("\r\n");
+    await fs.writeFile(ps1File, ps1, "utf8");
     await new Promise<void>((resolve, reject) => {
+      const chunks: Buffer[] = [];
       const child = spawn(
         "powershell.exe",
-        ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
-        { stdio: "ignore", windowsHide: true }
+        ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1File],
+        { windowsHide: true }
       );
+      child.stderr?.on("data", (d) => chunks.push(Buffer.from(d)));
+      child.stdout?.on("data", (d) => chunks.push(Buffer.from(d)));
       child.on("error", reject);
-      child.on("exit", (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(`Start-Process failed exit=${code}`));
+      child.on("exit", async (code) => {
+        if (code === 0) {
+          resolve();
+          return;
+        }
+        let detail = Buffer.concat(chunks).toString("utf8").trim();
+        try {
+          detail = (await fs.readFile(failFile, "utf8")).trim() || detail;
+        } catch {
+          /* ignore */
+        }
+        reject(
+          new Error(
+            detail
+              ? `Start-Process failed exit=${code}: ${detail.slice(0, 500)}`
+              : `Start-Process failed exit=${code}`
+          )
+        );
       });
     });
     let pid: number | null = null;
