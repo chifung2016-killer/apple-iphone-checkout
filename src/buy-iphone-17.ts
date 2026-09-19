@@ -72,7 +72,7 @@ let CONFIG = {
   /** 開賣前幾多毫秒開始每 5 秒 refresh 搶「繼續」 */
   salePollLeadMs: 5 * 60 * 1000,
   /** refresh／重試「繼續」間隔 */
-  productPollIntervalMs: 5000,
+  productPollIntervalMs: 5 * 60 * 1000,
   /** 取貨搜尋關鍵字 */
   pickupSearch: "中環",
   /** 「你附近的所有零售店」下面優先／可接受嘅門市關鍵字 */
@@ -101,11 +101,19 @@ let CONFIG = {
    */
   proxy: "",
   /**
-   * Monitor+buying：跑到取貨門市列表（中環＋6 掣）後停低，
-   * 等有貨通知先 refresh 再隨機揀店繼續。
+   * Monitor+buying：跑到取貨門市列表後停低。
+   * 每隔 productPollIntervalMs refresh 取貨頁，直到監控到同 SKU 先即刻 refresh 同加車。
    */
   holdAtPickupStoresForStock: false,
 };
+
+/** 產品頁搶「繼續」用，唔跟取貨頁 refresh 間隔 */
+const PRODUCT_PAGE_POLL_MS = 5_000;
+
+function pickupPageRefreshMs(): number {
+  const n = Number(CONFIG.productPollIntervalMs);
+  return Number.isFinite(n) && n >= 5_000 ? Math.floor(n) : 5 * 60_000;
+}
 
 type CheckoutConfig = typeof CONFIG;
 type FulfillmentPreference = CheckoutConfig["fulfillmentPreference"];
@@ -1895,11 +1903,11 @@ async function pollIphone18GotoUntilNextPage(page: Page): Promise<boolean> {
           console.log("  ✓ 404 復原後已有購物袋貨，當加購成功");
           return true;
         }
-        await sleepCheckingRelease(CONFIG.productPollIntervalMs);
+        await sleepCheckingRelease(PRODUCT_PAGE_POLL_MS);
         continue;
       }
       console.warn("  goto 頁仍似錯誤頁，refresh 再試…");
-      await sleepCheckingRelease(CONFIG.productPollIntervalMs);
+      await sleepCheckingRelease(PRODUCT_PAGE_POLL_MS);
       continue;
     }
 
@@ -1912,7 +1920,7 @@ async function pollIphone18GotoUntilNextPage(page: Page): Promise<boolean> {
 
     const before = page.url();
     const ok = await keepClickingContinueUntilNextPage(page, {
-      maxMs: Math.max(12_000, CONFIG.productPollIntervalMs * 3),
+      maxMs: Math.max(12_000, PRODUCT_PAGE_POLL_MS * 3),
     });
     if (ok || hasLeftBuyConfig(page.url(), before)) {
       console.log(`  ✓ iPhone 18 goto 已入下一頁 → ${page.url()}`);
@@ -1920,9 +1928,9 @@ async function pollIphone18GotoUntilNextPage(page: Page): Promise<boolean> {
     }
 
     console.log(
-      `  尚未入下一頁，${CONFIG.productPollIntervalMs / 1000}s 後 refresh goto…`
+      `  尚未入下一頁，${PRODUCT_PAGE_POLL_MS / 1000}s 後 refresh goto…`
     );
-    await sleepCheckingRelease(CONFIG.productPollIntervalMs);
+    await sleepCheckingRelease(PRODUCT_PAGE_POLL_MS);
     await withReleaseCheck(
       page.reload({ waitUntil: "domcontentloaded" }).catch(() => {})
     );
@@ -2899,7 +2907,7 @@ async function waitUntilSalePollWindow(): Promise<void> {
   }
   if (Date.now() < saleStart) {
     console.log(
-      `  已入搶購窗口（開賣前 ${Math.ceil((saleStart - Date.now()) / 1000)} 秒）。每 ${CONFIG.productPollIntervalMs / 1000} 秒 refresh 重試「繼續」。`
+      `  已入搶購窗口（開賣前 ${Math.ceil((saleStart - Date.now()) / 1000)} 秒）。每 ${PRODUCT_PAGE_POLL_MS / 1000} 秒 refresh 重試「繼續」。`
     );
   } else {
     console.log("  已過開賣時間，即刻每 5 秒 refresh 重試「繼續」。");
@@ -3565,7 +3573,7 @@ async function addToBagAndOpenBag(page: Page): Promise<void> {
         const added = await tryClickContinueOrAddToBag(page);
         if (added) break;
         console.log(`  加購重試 #${round}…`);
-        await sleepCheckingRelease(CONFIG.productPollIntervalMs);
+        await sleepCheckingRelease(PRODUCT_PAGE_POLL_MS);
         await reloadBuyPageAndSelect(page);
       }
       await settleAfterNavigation(page);
@@ -3591,7 +3599,7 @@ async function addToBagAndOpenBag(page: Page): Promise<void> {
 
   console.log("步驟：等待開賣並撳「繼續／加入購物袋」加入流程");
   console.log(
-    `  目標頁：${CONFIG.buyUrl}\n  開賣：${CONFIG.saleStartIso}（每 ${CONFIG.productPollIntervalMs / 1000} 秒 refresh 直到下一頁）`
+    `  目標頁：${CONFIG.buyUrl}\n  開賣：${CONFIG.saleStartIso}（每 ${PRODUCT_PAGE_POLL_MS / 1000} 秒 refresh 直到下一頁）`
   );
 
   await waitUntilSalePollWindow();
@@ -3748,10 +3756,10 @@ async function addToBagAndOpenBag(page: Page): Promise<void> {
       console.log(
         isIphone18Task()
           ? `  「繼續」仍未入到下一頁，短休後 refresh 再狂撳…`
-          : `  「繼續／加入購物袋」未入到下一頁，${CONFIG.productPollIntervalMs / 1000} 秒後再 refresh…`
+          : `  「繼續／加入購物袋」未入到下一頁，${PRODUCT_PAGE_POLL_MS / 1000} 秒後再 refresh…`
       );
     }
-    await sleepCheckingRelease(isIphone18Task() ? 800 : CONFIG.productPollIntervalMs);
+    await sleepCheckingRelease(isIphone18Task() ? 800 : PRODUCT_PAGE_POLL_MS);
   }
 
   await settleDom(page, 200);
@@ -6623,10 +6631,9 @@ async function attemptFullAddCartToPayment(
 }
 
 /**
- * Monitor+buying：停喺 Fulfillment-init 待命。
- * 監察到同型號＋同色＋同容量有貨 → 每 5 秒 refresh Fulfillment-init → 繼續取貨／聯絡／付款。
- * 若頁面 503 → 隔 6 秒再 refresh，直到可用再跑腳本。
- * 若 refresh 後落單失敗，先再試完整加購一次；之後繼續每 5 秒 refresh。
+ * Pickup credit card 訪客：停喺揀門市頁。
+ * 每隔 Dashboard「Refresh interval」refresh 一次，直到監控到同 SKU，
+ * 然後即刻再 refresh 同加車。
  */
 async function runMonitorHoldBuyLoop(
   page: Page,
@@ -6634,113 +6641,85 @@ async function runMonitorHoldBuyLoop(
   tag: string,
   session?: BrowserSession
 ): Promise<void> {
-  /** 連續幾耐冇「新」嘅匹配通知，就當呢波完 */
-  const STOCK_IDLE_MS = 8_000;
-  /** 有貨期間：正常 refresh 間隔 */
-  const STOCK_REFRESH_MS = 5_000;
   let lastConsumedAt = 0;
 
   console.log(
-    `${tag} Monitor+buying hold：等 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage} 有貨 → 每 ${STOCK_REFRESH_MS / 1000}s refresh Fulfillment-init（503→6s）→ 繼續加購`
+    `${tag} 取貨頁待命：等 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage}。未有貨就每 ${Math.round(pickupPageRefreshMs() / 1000)}s refresh；監控到同 SKU 就即刻 refresh 同加車`
   );
 
   while (true) {
+    await throwIfReleased();
+    const refreshMs = pickupPageRefreshMs();
     await ensureFulfillmentInitStandby(page);
     await writeStatus({
       phase: "waiting_for_stock_at_stores",
-      message: `待命 Fulfillment-init：等 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage} 有貨再每 ${STOCK_REFRESH_MS / 1000}s refresh`,
+      message: `揀門市頁待命：每 ${Math.round(refreshMs / 1000)}s refresh，直到監控到 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage}`,
       stuck: false,
       stuckSince: null,
     });
     await fs.unlink(STOCK_RESUME_SESSION_FLAG).catch(() => {});
 
-    // 只要「而家之後」寫入嘅新通知（避免舊 flag 即刻誤觸）
     const gateAt = Math.max(lastConsumedAt, Date.now());
     let pending = await waitForMatchingStockResume({
       afterMs: gateAt,
+      timeoutMs: refreshMs,
     });
 
-    while (pending) {
-      lastConsumedAt = pending.atMs;
-      const matchLabel = `${CONFIG.model}／${CONFIG.color}／${CONFIG.storage}`;
-
+    while (!pending) {
       console.log(
-        `  監察匹配有貨 — ${matchLabel}：每 ${STOCK_REFRESH_MS / 1000}s refresh Fulfillment-init（503 則 6s）→ 繼續腳本…`
+        `  ${Math.round(refreshMs / 1000)}s 內未有同 SKU 有貨，refresh 取貨頁…`
       );
-
-      // 有貨波：持續 refresh，直到到付款頁或冇新匹配通知
-      for (;;) {
-        await writeStatus({
-          phase: "resuming_after_stock",
-          message: `有貨（${matchLabel}）：每 ${STOCK_REFRESH_MS / 1000}s refresh Fulfillment-init（503→6s）`,
-        });
-
-        await reloadFulfillmentInitUntilReady(page);
-
-        try {
-          let reachedPay = await attemptPickupCheckoutToPayment(
-            page,
-            identity,
-            tag,
-            session
-          );
-          if (!reachedPay) {
-            console.warn(
-              `${tag} refresh 後直接繼續失敗 — 改試完整加購（產品頁→入袋→結帳）…`
-            );
-            reachedPay = await attemptFullAddCartToPayment(
-              page,
-              identity,
-              tag,
-              session
-            );
-          }
-          if (reachedPay) {
-            console.log(`${tag} 已到付款頁 — 結束 monitor hold loop`);
-            return;
-          }
-        } catch (err) {
-          if (err instanceof ReleaseError) throw err;
-          console.warn(
-            `${tag} 今次加購嘗試失敗：`,
-            err instanceof Error ? err.message : String(err)
-          );
-        }
-
-        console.log(
-          `  未到付款頁 — ${STOCK_REFRESH_MS / 1000}s 後再 refresh Fulfillment-init…`
-        );
-        const nextSoon = await waitForMatchingStockResume({
-          afterMs: lastConsumedAt,
-          timeoutMs: STOCK_REFRESH_MS,
-        });
-        if (nextSoon) {
-          lastConsumedAt = nextSoon.atMs;
-          continue;
-        }
-
-        // 5s 內冇新 flag：若最近仍有匹配庫存訊號，繼續 refresh；否則再等 idle 窗口
-        const still = await readStockResumePayload();
-        const stillMatch =
-          still &&
-          still.skus.some((s) => stockSkuMatchesCheckout(s)) &&
-          Date.now() - still.atMs < STOCK_IDLE_MS;
-        if (stillMatch) continue;
-
-        pending = await waitForMatchingStockResume({
-          afterMs: lastConsumedAt,
-          timeoutMs: STOCK_IDLE_MS,
-        });
-        if (pending) {
-          lastConsumedAt = pending.atMs;
-          continue;
-        }
-        console.log(
-          `  已 ${STOCK_IDLE_MS / 1000}s 冇新嘅 ${matchLabel} 通知 → 返 Fulfillment-init 待命`
-        );
-        break;
-      }
+      await reloadFulfillmentInitUntilReady(page);
+      await ensureFulfillmentInitStandby(page);
+      await writeStatus({
+        phase: "waiting_for_stock_at_stores",
+        message: `已 refresh 取貨頁，再等 ${Math.round(refreshMs / 1000)}s 或監控到同 SKU`,
+        stuck: false,
+        stuckSince: null,
+      });
+      pending = await waitForMatchingStockResume({
+        afterMs: gateAt,
+        timeoutMs: refreshMs,
+      });
     }
+
+    lastConsumedAt = pending.atMs;
+    const matchLabel = `${CONFIG.model}／${CONFIG.color}／${CONFIG.storage}`;
+    console.log(`  監控到同 SKU（${matchLabel}）— 即刻 refresh 取貨頁同加車`);
+    await writeStatus({
+      phase: "resuming_after_stock",
+      message: `監控到 ${matchLabel}：即刻 refresh 同加車`,
+    });
+    await reloadFulfillmentInitUntilReady(page);
+
+    try {
+      let reachedPay = await attemptPickupCheckoutToPayment(
+        page,
+        identity,
+        tag,
+        session
+      );
+      if (!reachedPay) {
+        console.warn(`${tag} 取貨頁加車未到付款 — 改由產品頁完整加購一次…`);
+        reachedPay = await attemptFullAddCartToPayment(
+          page,
+          identity,
+          tag,
+          session
+        );
+      }
+      if (reachedPay) {
+        console.log(`${tag} 已到付款頁 — 結束取貨頁待命`);
+        return;
+      }
+    } catch (err) {
+      if (err instanceof ReleaseError) throw err;
+      console.warn(
+        `${tag} 加車失敗：`,
+        err instanceof Error ? err.message : String(err)
+      );
+    }
+    console.log(`  今次加車未完成，返揀門市頁繼續每 ${Math.round(refreshMs / 1000)}s refresh`);
   }
 }
 
@@ -12057,7 +12036,7 @@ async function main(): Promise<void> {
 
   console.log(`準備同時開啟 ${count} 個獨立瀏覽器：`);
   console.log(
-    `開賣時間：${CONFIG.saleStartIso}｜產品頁每 ${CONFIG.productPollIntervalMs / 1000} 秒 refresh，重試「繼續」直到下一頁`
+    `開賣時間：${CONFIG.saleStartIso}｜產品頁每 ${PRODUCT_PAGE_POLL_MS / 1000} 秒 refresh，重試「繼續」直到下一頁`
   );
   identities.forEach((id, i) => {
     console.log(

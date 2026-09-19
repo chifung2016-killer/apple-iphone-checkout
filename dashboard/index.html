@@ -655,8 +655,11 @@
             <div id="checkoutCardsList" class="card-vault-list" aria-label="Saved credit cards"></div>
           </div>
           <div class="field">
-            <label for="productPollIntervalMs">Refresh interval (ms)</label>
-            <input id="productPollIntervalMs" name="productPollIntervalMs" type="number" min="1000" step="500" value="5000" />
+            <label for="productPollIntervalMs">取貨頁 refresh 間隔 (ms)</label>
+            <input id="productPollIntervalMs" name="productPollIntervalMs" type="number" min="5000" step="1000" value="300000" />
+            <p class="hint" style="margin:6px 0 0">
+              只限 <b>Pickup Credit Card 訪客模式</b>。停喺揀門市頁時，每隔呢個時間 refresh 一次。監控到同一個 SKU 就即刻再 refresh 同加車。預設 <b>300000</b>（5 分鐘）。
+            </p>
           </div>
           <div class="actions">
             <button type="submit" class="btn-primary" id="btnStart">Launch browsers</button>

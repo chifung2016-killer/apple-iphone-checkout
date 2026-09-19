@@ -641,7 +641,7 @@ function defaultConfig() {
     storage: "256GB",
     pickupSearch: "中環",
     saleStartIso: "2026-09-12T20:00:00+08:00",
-    productPollIntervalMs: 5000,
+    productPollIntervalMs: 300000,
     skipTradeIn: true,
     addAppleCare: false,
     cardCompany: "",
