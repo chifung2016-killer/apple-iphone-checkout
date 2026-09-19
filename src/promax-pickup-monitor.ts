@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 import {
   hasTelegramCreds,
   notifyPromaxHealthAlert,
+  notifyPromaxModeChange,
   notifyPromaxTelegram,
   upsertPromaxTelegramStatus,
 } from "./promax-telegram.js";
@@ -247,6 +248,8 @@ const state: MonitorState = {
 
 /** Telegram live status 上次推送時間（節流） */
 let lastTelegramStatusAt = 0;
+/** 上次已通知嘅監控模式（切換先再推） */
+let lastNotifiedPollMode: string | null = null;
 
 /** 健康檢查／自動修復 */
 const STALE_SUCCESS_MS = 8 * 60_000;
@@ -304,6 +307,7 @@ async function notifyEdgeCooldown(statusHint: string): Promise<void> {
     lastError: state.lastError,
     lastSuccessAt: state.lastSuccessAt,
     consecutiveFailures: state.consecutiveFailures,
+    pollMode: currentPollMode(),
   }).catch(() => {});
 }
 
@@ -438,6 +442,7 @@ async function maybeAutoHeal(reason: string): Promise<void> {
       lastSuccessAt: state.lastSuccessAt,
       consecutiveFailures: state.consecutiveFailures,
       autoHealAttempt: autoHealAttempts,
+      pollMode: currentPollMode(),
     }).catch(() => {});
   } else {
     rescheduleOverrideMs = randomBetween(90_000, 150_000);
@@ -449,6 +454,7 @@ async function maybeAutoHeal(reason: string): Promise<void> {
       consecutiveFailures: state.consecutiveFailures,
       rowsInLastPoll: state.latest?.rows_in_last_poll,
       autoHealAttempt: autoHealAttempts,
+      pollMode: currentPollMode(),
     }).catch(() => {});
   }
 }
@@ -478,6 +484,7 @@ async function evaluateHealthAfterPoll(rows: number): Promise<void> {
           : "監控已恢復正常",
       lastSuccessAt: state.lastSuccessAt,
       rowsInLastPoll: rows,
+      pollMode: currentPollMode(),
     }).catch(() => {});
   }
 }
@@ -1060,13 +1067,35 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
   );
   await evaluateHealthAfterPoll(matchedCells);
   if (newRestockEvents.some((e) => e.event === "restock" || e.event === "sold_out")) {
-    void notifyPromaxTelegram(newRestockEvents).catch((err) => {
+    void notifyPromaxTelegram(newRestockEvents, {
+      pollMode: status.poll_mode,
+    }).catch((err) => {
       console.warn(
         `[promax-pickup] telegram notify failed：${err instanceof Error ? err.message : String(err)}`
       );
     });
   }
-  // live status：有貨變化即更新；否則最多每 5 分鐘一次
+  // 模式切換／啟動 → Telegram 告知而家用緊邊個模式
+  if (lastNotifiedPollMode == null) {
+    lastNotifiedPollMode = status.poll_mode;
+    void notifyPromaxModeChange({
+      from: "啟動",
+      to: status.poll_mode,
+      reason: status.schedule?.reason,
+      peakWindows: status.schedule?.peakWindows,
+    }).catch(() => {});
+    lastTelegramStatusAt = 0;
+  } else if (lastNotifiedPollMode !== status.poll_mode) {
+    void notifyPromaxModeChange({
+      from: lastNotifiedPollMode,
+      to: status.poll_mode,
+      reason: status.schedule?.reason,
+      peakWindows: status.schedule?.peakWindows,
+    }).catch(() => {});
+    lastNotifiedPollMode = status.poll_mode;
+    lastTelegramStatusAt = 0;
+  }
+  // live status：有貨變化／模式切換即更新；否則最多每 5 分鐘一次
   const shouldUpsertStatus =
     newRestockEvents.some((e) => e.event === "restock" || e.event === "sold_out") ||
     !lastTelegramStatusAt ||

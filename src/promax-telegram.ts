@@ -37,6 +37,23 @@ function modelLine(model: string, storage: string, color: string): string {
   return `${escapeMd(model)} · ${escapeMd(storage)} · ${escapeMd(color)} ${logo}`;
 }
 
+const MODE_HELP: Record<string, string> = {
+  peak: "補貨時段 · ~45–60s",
+  hot: "有貨加密 · ~25–40s",
+  learning: "學習中 · ~60–90s",
+  quiet: "非時段疏掃 · ~12–18分",
+  idle: "密掃",
+};
+
+/** 統一「而家用緊邊個模式」一行 */
+export function formatMonitorModeLine(mode: string | null | undefined): string {
+  const m = String(mode || "—");
+  const help = MODE_HELP[m];
+  return help
+    ? `監控模式：*${escapeMd(m)}*（${escapeMd(help)}）`
+    : `監控模式：*${escapeMd(m)}*`;
+}
+
 async function tgApi(
   token: string,
   method: string,
@@ -63,7 +80,8 @@ async function tgApi(
 
 /** 有貨／售罄即時通知 */
 export async function notifyPromaxTelegram(
-  events: RestockHistoryEvent[]
+  events: RestockHistoryEvent[],
+  opts?: { pollMode?: string | null }
 ): Promise<void> {
   const creds = telegramCreds();
   if (!creds) {
@@ -93,6 +111,7 @@ export async function notifyPromaxTelegram(
     const text = [
       `*${escapeMd(title)}*`,
       modelLine(ev.model, ev.storage, ev.color),
+      formatMonitorModeLine(opts?.pollMode),
       `門市：${escapeMd(stores)}`,
       ...(ev.event === "sold_out" && ev.inStockForLabel
         ? [`在架時長：約 ${escapeMd(ev.inStockForLabel)}`]
@@ -109,6 +128,35 @@ export async function notifyPromaxTelegram(
   }
 }
 
+/** 監控模式切換時推送（peak↔quiet 等） */
+export async function notifyPromaxModeChange(opts: {
+  from: string;
+  to: string;
+  reason?: string | null;
+  peakWindows?: string[];
+}): Promise<void> {
+  const creds = telegramCreds();
+  if (!creds) return;
+  if (opts.from === opts.to) return;
+
+  const text = [
+    "*📡 監控模式已切換*",
+    `${escapeMd(opts.from || "—")} → *${escapeMd(opts.to)}*`,
+    formatMonitorModeLine(opts.to),
+    ...(opts.reason ? [escapeMd(opts.reason)] : []),
+    ...(opts.peakWindows?.length
+      ? [`補貨時段：${escapeMd(opts.peakWindows.join(" · "))}`]
+      : []),
+  ].join("\n");
+
+  await tgApi(creds.token, "sendMessage", {
+    chat_id: creds.chatId,
+    text,
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+  });
+}
+
 /** 可選：更新一則 live status（edit 同一條 message） */
 export async function upsertPromaxTelegramStatus(
   status: PromaxPickupStatus
@@ -116,17 +164,11 @@ export async function upsertPromaxTelegramStatus(
   const creds = telegramCreds();
   if (!creds) return;
 
-  const modeHelp: Record<string, string> = {
-    peak: "補貨時段 · ~45–60s",
-    hot: "有貨加密 · ~25–40s",
-    learning: "學習中 · ~60–90s",
-    quiet: "非時段疏掃 · ~12–18分（減 541）",
-  };
+  const modeHelp = MODE_HELP;
   const mode = String(status.poll_mode || "—");
   const lines: string[] = [
     "*iPhone 18 Pro Max 門市監控*",
-    `狀態：${status.running ? "ON" : "OFF"} · *${escapeMd(mode)}*` +
-      (modeHelp[mode] ? `（${escapeMd(modeHelp[mode])}）` : "") +
+    `狀態：${status.running ? "ON" : "OFF"} · ${formatMonitorModeLine(mode).replace(/^監控模式：/, "")}` +
       ` · 成功：${escapeMd(status.last_success_at || "—")}`,
     `模式一覽：peak｜hot｜learning｜quiet ← 而家 *${escapeMd(mode)}*`,
   ];
@@ -224,6 +266,7 @@ export type PromaxHealthAlert = {
   consecutiveFailures?: number;
   rowsInLastPoll?: number;
   autoHealAttempt?: number;
+  pollMode?: string | null;
 };
 
 let lastHealthAlertAt = 0;
@@ -272,6 +315,7 @@ export async function notifyPromaxHealthAlert(
     lines.push("3\\. 必要時喺專案目錄重啟：`npm run dashboard`");
     lines.push("4\\. 若成日 541：稍等再試，或同我講幫手查");
   }
+  lines.push(formatMonitorModeLine(alert.pollMode ?? null));
 
   if (alert.lastError) {
     lines.push(`錯誤：${escapeMd(String(alert.lastError).slice(0, 160))}`);
