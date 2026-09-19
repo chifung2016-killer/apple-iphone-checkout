@@ -566,7 +566,7 @@
             </div>
           </div>
           <div class="field">
-            <label for="proxy">Proxy / IP（可選，可填多個）</label>
+            <label for="proxy">結帳 Proxy / IP（可選，可填多個）</label>
             <textarea
               id="proxy"
               name="proxy"
@@ -579,9 +579,26 @@
               <button type="button" class="btn-ghost btn-sm" id="btnResetProxy" title="清黑名單，之後 Launch 可再分配呢啲 IP">Reset</button>
             </div>
             <p class="hint" style="margin:6px 0 0">
-              貼上 proxy 後撳 <strong>Save</strong> 先會用嚟開 browser；清空再 Save 就用<strong>本機 IP</strong>。
-              可填多個：<strong>每一條最多畀 3 個 browser 共用</strong>（用滿先換下一條）。失敗結帳會入黑名單；撳 <strong>Reset</strong> 可再重用。
+              只畀<strong>結帳瀏覽器</strong>用。貼上後撳 <strong>Save</strong>；清空再 Save＝本機 IP。
+              可填多個：<strong>每一條最多畀 3 個 browser 共用</strong>。失敗結帳會入黑名單；撳 <strong>Reset</strong> 可再重用。
               <span id="proxySaveMeta">—</span>
+            </p>
+          </div>
+          <div class="field">
+            <label for="monitorProxy">監控 Proxy / IP（可選，可填多個）</label>
+            <textarea
+              id="monitorProxy"
+              name="monitorProxy"
+              placeholder="獨立池，只畀 Pro Max 門市監控用&#10;例如：&#10;http://user:pass@hk-isp-host:port&#10;socks5://host:1080&#10;留空＝本機 IP"
+              autocomplete="off"
+              spellcheck="false"
+            ></textarea>
+            <div class="actions" style="margin-top:8px">
+              <button type="button" class="btn-primary btn-sm" id="btnSaveMonitorProxy">Save</button>
+            </div>
+            <p class="hint" style="margin:6px 0 0">
+              同結帳池<strong>分開</strong>。監控打到 541 會暫時 ban 呢條並轉下一條。香港住宅／ISP HTTP proxy 通常得。
+              <span id="monitorProxySaveMeta">—</span>
             </p>
           </div>
           <div class="field">
@@ -987,6 +1004,65 @@
       proxyBannedCount = Number(data.banned ?? proxyBannedCount);
       const n = Number(data.count ?? countProxyLines(text));
       updateProxySaveMeta(n > 0 ? `已 Save：${n} 條 proxy` : "已 Save：本機 IP");
+      return data;
+    }
+
+    const MONITOR_PROXY_LS_KEY = "apple-checkout:monitor-proxy-pool";
+    let savedMonitorProxyPool = "";
+
+    function updateMonitorProxySaveMeta(okMsg) {
+      const meta = $("monitorProxySaveMeta");
+      if (!meta) return;
+      const n = countProxyLines(savedMonitorProxyPool);
+      const mode = n > 0 ? `已 Save：${n} 條` : "已 Save：本機 IP";
+      meta.textContent = okMsg ? `｜${okMsg}` : `｜${mode}`;
+    }
+
+    function persistMonitorProxyField() {
+      try {
+        localStorage.setItem(MONITOR_PROXY_LS_KEY, savedMonitorProxyPool);
+      } catch {
+        /* ignore */
+      }
+    }
+
+    function restoreMonitorProxyField() {
+      const el = $("monitorProxy");
+      if (!el) return;
+      try {
+        const saved = localStorage.getItem(MONITOR_PROXY_LS_KEY);
+        if (saved === null) {
+          savedMonitorProxyPool = "";
+          updateMonitorProxySaveMeta();
+          return;
+        }
+        savedMonitorProxyPool = normalizeProxyText(saved);
+        el.value = savedMonitorProxyPool;
+        updateMonitorProxySaveMeta();
+      } catch {
+        /* ignore */
+      }
+    }
+
+    async function saveMonitorProxyPoolFromUi() {
+      const el = $("monitorProxy");
+      const text = normalizeProxyText(el?.value ?? "");
+      savedMonitorProxyPool = text;
+      if (el) el.value = text;
+      persistMonitorProxyField();
+      const res = await fetch("/api/monitor-proxy-pool", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ proxy: text }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.ok === false) {
+        throw new Error(data.error || `Save failed (${res.status})`);
+      }
+      const n = Number(data.count ?? countProxyLines(text));
+      updateMonitorProxySaveMeta(
+        n > 0 ? `已 Save：${n} 條監控 proxy` : "已 Save：本機 IP"
+      );
       return data;
     }
 
@@ -2435,6 +2511,28 @@
       }
     });
 
+    $("btnSaveMonitorProxy")?.addEventListener("click", async () => {
+      const btn = $("btnSaveMonitorProxy");
+      const prev = btn?.textContent || "Save";
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "Saving…";
+      }
+      try {
+        const data = await saveMonitorProxyPoolFromUi();
+        const n = Number(data.count ?? 0);
+        if (btn) btn.textContent = n > 0 ? `Saved (${n})` : "Saved · 本機 IP";
+        setTimeout(() => {
+          if (btn) btn.textContent = prev;
+        }, 1400);
+      } catch (err) {
+        alert(err instanceof Error ? err.message : String(err));
+        if (btn) btn.textContent = prev;
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    });
+
     $("btnResetProxy")?.addEventListener("click", async () => {
       const btn = $("btnResetProxy");
       const prev = btn?.textContent || "Reset";
@@ -2469,6 +2567,29 @@
     });
 
     restoreProxyField();
+    restoreMonitorProxyField();
+    // 同步伺服器已存嘅監控 proxy（重開 tab 時）
+    void fetch("/api/monitor-proxy-pool")
+      .then((r) => r.json())
+      .then((data) => {
+        if (!data || data.ok === false) return;
+        const text = normalizeProxyText(data.proxy ?? "");
+        const el = $("monitorProxy");
+        if (el && text && !normalizeProxyText(el.value)) {
+          el.value = text;
+          savedMonitorProxyPool = text;
+          persistMonitorProxyField();
+        } else if (el && savedMonitorProxyPool) {
+          // local 有值：確保 server 都有（例如 server 重啟後）
+          void saveMonitorProxyPoolFromUi().catch(() => {});
+        }
+        updateMonitorProxySaveMeta(
+          Number(data.count) > 0
+            ? `伺服器：${data.count} 條${data.active ? `｜用緊` : ""}`
+            : undefined
+        );
+      })
+      .catch(() => {});
     // 同 server 已 Save 嘅 pool／黑名單對齊
     void (async () => {
       try {

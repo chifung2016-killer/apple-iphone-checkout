@@ -21,6 +21,14 @@ import {
   notifyPromaxTelegram,
   upsertPromaxTelegramStatus,
 } from "./promax-telegram.js";
+import {
+  getMonitorProxyStatus,
+  monitorFetchGet,
+  rotateMonitorProxyOnBlock,
+  setMonitorProxyPool,
+} from "./promax-monitor-proxy.js";
+
+export { setMonitorProxyPool, getMonitorProxyStatus, getMonitorProxyPoolText } from "./promax-monitor-proxy.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SKU_MAP_PATH = path.join(ROOT, "config", "sku_map.json");
@@ -254,6 +262,14 @@ function edgeBlockRemainingMs(): number {
 
 function tripEdgeBlock(status: number, where: string): void {
   if (status !== 429 && status !== 403 && status !== 541) return;
+  // 有其他監控 proxy 可轉 → 短暫停一下就換線，唔使熔斷 12 分鐘
+  if (rotateMonitorProxyOnBlock(`HTTP ${status} @ ${where}`)) {
+    edgeBlockedUntil = Date.now() + randomBetween(8_000, 15_000);
+    console.warn(
+      `[promax-pickup] edge HTTP ${status} @ ${where} — rotated monitor proxy, brief pause`
+    );
+    return;
+  }
   const cool =
     status === 541
       ? EDGE_COOLDOWN_MS
@@ -580,14 +596,13 @@ async function fetchPickupMessageStores(sku: string): Promise<
   url.searchParams.set("parts.0", sku);
   url.searchParams.set("location", PICKUP_LOCATION);
 
-  const res = await fetch(url.toString(), {
-    method: "GET",
-    headers: browserHeaders(),
-    redirect: "follow",
-  });
+  const res = await monitorFetchGet(url.toString(), browserHeaders());
 
   if (res.status === 429 || res.status === 403 || res.status === 541) {
-    const err = new Error(`HTTP ${res.status} from pickup-message`);
+    const err = new Error(
+      `HTTP ${res.status} from pickup-message` +
+        (res.proxyUsed ? ` via ${res.proxyUsed}` : "")
+    );
     (err as Error & { status: number }).status = res.status;
     throw err;
   }
@@ -612,16 +627,14 @@ async function fetchFulfillmentMessagesStores(sku: string): Promise<
   url.searchParams.set("parts.0", sku);
   url.searchParams.set("location", PICKUP_LOCATION);
 
-  const res = await fetch(url.toString(), {
-    method: "GET",
-    headers: browserHeaders(),
-    redirect: "follow",
-  });
+  const res = await monitorFetchGet(url.toString(), browserHeaders());
 
   if (res.status === 429 || res.status === 403 || res.status === 541) {
-    const err = new Error(`HTTP ${res.status} from fulfillment-messages`);
+    const err = new Error(
+      `HTTP ${res.status} from fulfillment-messages` +
+        (res.proxyUsed ? ` via ${res.proxyUsed}` : "")
+    );
     (err as Error & { status: number }).status = res.status;
-    tripEdgeBlock(res.status, "fulfillment-messages");
     throw err;
   }
   if (!res.ok) {
@@ -660,7 +673,6 @@ export async function fetchFulfillmentStores(
           : " — try fulfillment-messages")
     );
     if (status === 429 || status === 403 || status === 541) {
-      tripEdgeBlock(status, "pickup-message");
       throw err;
     }
   }
@@ -1129,7 +1141,8 @@ export async function startPromaxPickupMonitor(opts?: {
       `｜telegram=${hasTelegramCreds() ? "on" : "off"}` +
       `｜idle=${Math.round(IDLE_POLL_MIN_MS / 1000)}-${Math.round(IDLE_POLL_MAX_MS / 1000)}s` +
       `｜hot=${Math.round(HOT_POLL_MIN_MS / 1000)}-${Math.round(HOT_POLL_MAX_MS / 1000)}s` +
-      `｜health-watch=on`
+      `｜health-watch=on` +
+      `｜monitor-proxy=${getMonitorProxyStatus().mode}`
   );
   if (opts?.runImmediately !== false) {
     try {
@@ -1152,6 +1165,15 @@ export function stopPromaxPickupMonitor(): void {
   }
   state.nextPollInMs = null;
   console.log("[promax-pickup] stopped");
+}
+
+/** 清 541 熔斷（例如換咗監控 proxy） */
+export function clearPromaxEdgeCooldown(): void {
+  edgeBlockedUntil = 0;
+  softLowRowStreak = 0;
+  autoHealAttempts = 0;
+  wasUnhealthy = false;
+  console.log("[promax-pickup] edge cooldown cleared");
 }
 
 /** API：最新 status matrix（含 last_success_at） */

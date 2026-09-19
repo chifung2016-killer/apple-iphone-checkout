@@ -11,7 +11,8 @@ alwaysApply: true
 
 | 路徑 | 用途 |
 |------|------|
-| `src/promax-pickup-monitor.ts` | 輪詢、parse、寫 collection、補貨事件、狀態 |
+| `src/promax-monitor-proxy.ts` | 監控專用 proxy 池（同結帳分開） |
+| `runtime/monitor-proxy-pool.txt` | 監控 proxy 持久化 |
 | `config/sku_map.json` | 真實 Part Number（`scripts/fetch_skus.py` 產生） |
 | `scripts/fetch_skus.py` | 由 Apple 產品頁 `PRODUCT_SELECTION_BOOTSTRAP` 抽 SKU |
 | `src/server.ts` | 啟動 monitor + hooks；`/api/promax-pickup/*`；snapshot 帶 Live 補貨 |

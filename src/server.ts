@@ -23,8 +23,12 @@ import {
   resolveDeliveryMethodLabel,
 } from "./fulfillment-label.js";
 import {
+  clearPromaxEdgeCooldown,
   getPromaxPickupStatus,
+  getMonitorProxyPoolText,
+  getMonitorProxyStatus,
   runPromaxPickupPollOnce,
+  setMonitorProxyPool,
   setPromaxPickupHooks,
   startPromaxPickupMonitor,
   stopPromaxPickupMonitor,
@@ -2402,6 +2406,47 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse) {
       mode: count > 0 ? "proxy" : "local",
     });
   }
+
+  /** 監控專用 Proxy 池（同結帳分開） */
+  if (pathname === "/api/monitor-proxy-pool" && req.method === "GET") {
+    const st = getMonitorProxyStatus();
+    return sendJson(res, 200, {
+      ok: true,
+      ...st,
+      proxy: getMonitorProxyPoolText(),
+    });
+  }
+
+  if (pathname === "/api/monitor-proxy-pool" && req.method === "POST") {
+    let body: { proxy?: string } = {};
+    try {
+      body = JSON.parse(await readBody(req)) as typeof body;
+    } catch {
+      return sendJson(res, 400, { ok: false, error: "invalid JSON" });
+    }
+    const proxy = String(body.proxy ?? "").replace(/^\s+|\s+$/g, "");
+    await ensureRuntimeDir();
+    await fs
+      .writeFile(path.join(RUNTIME_DIR, "monitor-proxy-pool.txt"), proxy, "utf8")
+      .catch(() => {});
+    const { count } = setMonitorProxyPool(proxy);
+    clearPromaxEdgeCooldown();
+    const st = getMonitorProxyStatus();
+    console.log(
+      count > 0
+        ? `[promax-proxy] pool saved：${count} 條`
+        : `[promax-proxy] pool cleared → 本機 IP`
+    );
+    broadcast({ type: "status", state: await snapshot() });
+    return sendJson(res, 200, {
+      ok: true,
+      proxy,
+      count,
+      banned: st.banned,
+      mode: st.mode,
+      active: st.active,
+    });
+  }
   if (pathname === "/api/orders" && req.method === "GET") {
     return sendJson(res, 200, await collectOrders());
   }
@@ -3124,6 +3169,15 @@ server.listen(PORT, "127.0.0.1", () => {
       };
     } catch {
       /* no saved pool */
+    }
+    try {
+      const monProxy = await fs.readFile(
+        path.join(RUNTIME_DIR, "monitor-proxy-pool.txt"),
+        "utf8"
+      );
+      setMonitorProxyPool(String(monProxy || "").replace(/^\s+|\s+$/g, ""));
+    } catch {
+      /* no monitor proxy pool */
     }
     await recoverCheckoutSessionsFromDisk().catch(() => {});
     await refreshNextIndexFromDisk();
