@@ -1,6 +1,12 @@
 /**
  * 由 restock-history 學習常見補貨時段（香港時區）
- * peak → 密輪詢；quiet → 疏輪詢（唔完全停，避免錯過異常補貨）
+ *
+ * 畢業前（少過 MIN_SAMPLE_DAYS 個唔同日有 Pro Max 補貨）：
+ *   - 保留闊預設時段（含晏晝），時段內 = peak
+ *   - 時段外 = learning（~60–90s），唔用 quiet（避免過早疏漏）
+ * 畢業後：
+ *   - 用學到嘅鐘點做 peak；其餘 = quiet（~12–18 分）
+ * 有貨一律 hot。
  */
 import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -18,32 +24,39 @@ export type ScheduleSnapshot = {
   /** 學習到嘅 peak 時段（HK，例如 "08:00–11:00"） */
   peakWindows: string[];
   restockSamples: number;
+  /** 有 Pro Max 補貨嘅唔同 HK 日數 */
+  sampleDays: number;
+  /** 畢業要幾多日 */
+  minSampleDays: number;
+  graduated: boolean;
   reason: string;
   /** 下一個 peak 開始（ISO），若而家已喺 peak 則 null */
   nextPeakAt: string | null;
   updatedAt: string;
 };
 
-type MinuteWindow = { startMin: number; endMin: number }; // 0..24*60, end exclusive; may wrap
+type MinuteWindow = { startMin: number; endMin: number };
 
 const HK_TZ = "Asia/Hong_Kong";
 
-/** 至少幾多個 restock 先算「學到」 */
-const MIN_SAMPLES = 3;
+/** 要湊夠幾多個「唔同日有補貨」先畢業用 quiet */
+const MIN_SAMPLE_DAYS = Number(process.env.PROMAX_SCHEDULE_MIN_DAYS || 3);
 /** 每個補貨鐘點向前後擴（分鐘） */
 const PAD_BEFORE_MIN = 75;
 const PAD_AFTER_MIN = 60;
-/** 鐘點出現次數達呢個先入 peak（絕對） */
 const HOUR_MIN_COUNT = 1;
 
-/** 未夠樣本時嘅預設 peak（HK 門市常見） */
+/**
+ * 學習期預設 peak：朝早到傍晚（含 12–15 晏晝）
+ * 畢業前唔好縮到淨係朝早
+ */
 const DEFAULT_WINDOWS: MinuteWindow[] = [
-  { startMin: 8 * 60, endMin: 12 * 60 },
-  { startMin: 14 * 60, endMin: 19 * 60 },
+  { startMin: 7 * 60 + 30, endMin: 19 * 60 },
 ];
 
 let cached: ScheduleSnapshot | null = null;
 let hourCounts: Map<number, number> = new Map();
+let dayKeys: Set<string> = new Set();
 let windows: MinuteWindow[] = [...DEFAULT_WINDOWS];
 let sampleCount = 0;
 let lastLoadAt = 0;
@@ -53,9 +66,13 @@ function hkParts(d = new Date()): {
   minute: number;
   weekday: number;
   dayMinute: number;
+  dayKey: string;
 } {
-  const fmt = new Intl.DateTimeFormat("en-GB", {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
     timeZone: HK_TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
     weekday: "short",
@@ -80,7 +97,12 @@ function hkParts(d = new Date()): {
     minute,
     weekday: wdMap[parts.weekday || ""] ?? 0,
     dayMinute: hour * 60 + minute,
+    dayKey: `${parts.year}-${parts.month}-${parts.day}`,
   };
+}
+
+function isGraduated(): boolean {
+  return dayKeys.size >= Math.max(1, MIN_SAMPLE_DAYS);
 }
 
 function formatWindow(w: MinuteWindow): string {
@@ -102,7 +124,6 @@ function mergeWindows(list: MinuteWindow[]): MinuteWindow[] {
     }))
     .sort((a, b) => a.startMin - b.startMin);
 
-  // 簡化：唔處理跨日 wrap；跨日拆成兩段
   const flat: MinuteWindow[] = [];
   for (const w of norm) {
     if (w.endMin > w.startMin) flat.push(w);
@@ -139,7 +160,6 @@ function nextPeakStart(dayMinute: number, wins: MinuteWindow[]): Date | null {
       return new Date(d.getTime() + deltaMin * 60_000);
     }
   }
-  // 聽日第一個
   const first = sorted[0]!;
   const d = new Date();
   const now = hkParts(d);
@@ -157,11 +177,22 @@ function rebuildWindowsFromHours(counts: Map<number, number>): MinuteWindow[] {
   return mergeWindows(raw);
 }
 
-export async function reloadPromaxSchedule(force = false): Promise<ScheduleSnapshot> {
+function recomputeWindows(): void {
+  const learned = rebuildWindowsFromHours(hourCounts);
+  // 畢業前：預設闊窗（含晏晝）∪ 已觀察鐘點；畢業後：只用學到嘅
+  windows = isGraduated()
+    ? learned
+    : mergeWindows([...DEFAULT_WINDOWS, ...learned]);
+}
+
+export async function reloadPromaxSchedule(
+  force = false
+): Promise<ScheduleSnapshot> {
   const now = Date.now();
   if (!force && cached && now - lastLoadAt < 60_000) return cached;
 
   const counts = new Map<number, number>();
+  const days = new Set<string>();
   let samples = 0;
   try {
     if (existsSync(RESTOCK_HISTORY_FILE)) {
@@ -180,13 +211,13 @@ export async function reloadPromaxSchedule(force = false): Promise<ScheduleSnaps
           continue;
         }
         if (ev.event !== "restock" || !ev.at) continue;
-        // 優先學 Pro Max；舊機 restock 唔污染時段
         const label = `${ev.model || ""} ${ev.name || ""}`;
         if (label.trim() && !/pro\s*max/i.test(label)) continue;
         const t = Date.parse(ev.at);
         if (!Number.isFinite(t)) continue;
-        const { hour } = hkParts(new Date(t));
-        counts.set(hour, (counts.get(hour) || 0) + 1);
+        const parts = hkParts(new Date(t));
+        counts.set(parts.hour, (counts.get(parts.hour) || 0) + 1);
+        days.add(parts.dayKey);
         samples += 1;
       }
     }
@@ -195,43 +226,50 @@ export async function reloadPromaxSchedule(force = false): Promise<ScheduleSnaps
   }
 
   hourCounts = counts;
+  dayKeys = days;
   sampleCount = samples;
-  windows =
-    samples >= MIN_SAMPLES
-      ? rebuildWindowsFromHours(counts)
-      : mergeWindows([...DEFAULT_WINDOWS, ...rebuildWindowsFromHours(counts)]);
+  recomputeWindows();
 
-  const snap = buildSnapshot("quiet");
+  const snap = buildSnapshot();
   cached = snap;
   lastLoadAt = now;
   await persistSchedule(snap).catch(() => {});
   return snap;
 }
 
-function buildSnapshot(fallbackMode: ScheduleMode): ScheduleSnapshot {
+function buildSnapshot(): ScheduleSnapshot {
   const now = new Date();
   const { dayMinute } = hkParts(now);
-  const learning = sampleCount < MIN_SAMPLES;
+  const graduated = isGraduated();
   const peak = inWindows(dayMinute, windows);
-  let mode: ScheduleMode = fallbackMode;
+  let mode: ScheduleMode;
   let reason: string;
-  if (learning) {
-    mode = peak ? "peak" : "learning";
-    reason = peak
-      ? `學習中（${sampleCount} 次補貨）· 預設／已知時段內 · ~60–90s`
-      : `學習中（${sampleCount}/${MIN_SAMPLES} 次補貨）· ~60–90s`;
+
+  if (!graduated) {
+    // 學習期：時段內 peak；時段外 learning（唔 quiet）
+    if (peak) {
+      mode = "peak";
+      reason = `學習中（${dayKeys.size}/${MIN_SAMPLE_DAYS} 日 · ${sampleCount} 次）· 預設／已知時段（含晏晝）· 密掃`;
+    } else {
+      mode = "learning";
+      reason = `學習中（${dayKeys.size}/${MIN_SAMPLE_DAYS} 日 · ${sampleCount} 次）· 時段外仍 ~60–90s，湊夠日數先 quiet`;
+    }
   } else if (peak) {
     mode = "peak";
-    reason = "喺學習到嘅補貨時段內 · 密輪詢";
+    reason = `已畢業（${dayKeys.size} 日樣本）· 補貨時段內密輪詢`;
   } else {
     mode = "quiet";
-    reason = "非補貨時段 · 疏輪詢（節省、減 541）";
+    reason = `已畢業（${dayKeys.size} 日樣本）· 非時段疏輪詢（減 541）`;
   }
+
   const next = peak ? null : nextPeakStart(dayMinute, windows);
   return {
     mode,
     peakWindows: windows.map(formatWindow),
     restockSamples: sampleCount,
+    sampleDays: dayKeys.size,
+    minSampleDays: MIN_SAMPLE_DAYS,
+    graduated,
     reason,
     nextPeakAt: next ? next.toISOString() : null,
     updatedAt: now.toISOString(),
@@ -246,6 +284,7 @@ async function persistSchedule(snap: ScheduleSnapshot): Promise<void> {
       {
         ...snap,
         hourCounts: Object.fromEntries(hourCounts),
+        sampleDayKeys: [...dayKeys],
         windows,
       },
       null,
@@ -257,7 +296,7 @@ async function persistSchedule(snap: ScheduleSnapshot): Promise<void> {
 
 /** 有貨時強制 hot；否則跟 schedule */
 export function resolveScheduleMode(anyInStock: boolean): ScheduleSnapshot {
-  const base = buildSnapshot("quiet");
+  const base = buildSnapshot();
   if (anyInStock) {
     return {
       ...base,
@@ -274,29 +313,26 @@ export function getCachedSchedule(): ScheduleSnapshot | null {
 }
 
 /**
- * 依 schedule 回輪詢間隔範圍 [min,max] ms
- * quiet：12–18 分；learning：60–90 秒（學時段期間都要夠密）；peak/hot 由 caller 用 IDLE/HOT
+ * quiet：12–18 分；learning：60–90 秒；peak/hot 由 caller 用 IDLE/HOT
  */
 export function scheduleIntervalRange(
   mode: ScheduleMode
 ): { min: number; max: number } | null {
   if (mode === "quiet") return { min: 12 * 60_000, max: 18 * 60_000 };
   if (mode === "learning") return { min: 60_000, max: 90_000 };
-  return null; // peak/hot → 用原本 IDLE/HOT
+  return null;
 }
 
 /** 新 restock 後即時計入學習 */
 export function noteRestockAt(iso: string): void {
   const t = Date.parse(iso);
   if (!Number.isFinite(t)) return;
-  const { hour } = hkParts(new Date(t));
-  hourCounts.set(hour, (hourCounts.get(hour) || 0) + 1);
+  const parts = hkParts(new Date(t));
+  hourCounts.set(parts.hour, (hourCounts.get(parts.hour) || 0) + 1);
+  dayKeys.add(parts.dayKey);
   sampleCount += 1;
-  windows =
-    sampleCount >= MIN_SAMPLES
-      ? rebuildWindowsFromHours(hourCounts)
-      : mergeWindows([...DEFAULT_WINDOWS, ...rebuildWindowsFromHours(hourCounts)]);
+  recomputeWindows();
   lastLoadAt = 0;
-  cached = buildSnapshot("quiet");
+  cached = buildSnapshot();
   void persistSchedule(cached).catch(() => {});
 }

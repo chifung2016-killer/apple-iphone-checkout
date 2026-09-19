@@ -672,8 +672,8 @@
             <strong>唔使開瀏覽器</strong>。四種模式：
             <b>peak</b> 補貨時段密掃（~45–60s）·
             <b>hot</b> 有貨加密（~25–40s）·
-            <b>learning</b> 樣本未夠、跟預設時段（~60–90s）·
-            <b>quiet</b> 非時段疏掃（~12–18 分，減 541，唔係停機）。
+            <b>learning</b> 未湊夠約 3 日補貨樣本時，時段外仍 ~60–90s（預設含晏晝 07:30–19:00）·
+            <b>quiet</b> 畢業後非時段疏掃（~12–18 分，減 541）。
           </p>
           <div class="meta" id="monitorMeta" style="margin-top:8px">
             <span>Auto monitor: <b id="monitorState">—</b></span>
@@ -683,8 +683,8 @@
           <div id="monitorModeBar" class="monitor-mode-bar" style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:center" aria-label="監控模式">
             <span class="monitor-mode-chip" data-mode="peak" title="學到嘅補貨時段內 · ~45–60s">peak</span>
             <span class="monitor-mode-chip" data-mode="hot" title="門市有貨 · ~25–40s">hot</span>
-            <span class="monitor-mode-chip" data-mode="learning" title="樣本不足 · ~60–90s">learning</span>
-            <span class="monitor-mode-chip" data-mode="quiet" title="非補貨時段 · ~12–18分">quiet</span>
+            <span class="monitor-mode-chip" data-mode="learning" title="未湊夠約3日樣本 · 時段外 ~60–90s">learning</span>
+            <span class="monitor-mode-chip" data-mode="quiet" title="已畢業·非時段 ~12–18分">quiet</span>
           </div>
           <p class="hint" id="monitorScheduleLine" style="margin-top:6px"></p>
           <div class="restock-history" style="margin-top:12px">
@@ -2063,10 +2063,19 @@
           ? sched.peakWindows.join(" · ")
           : "";
         const samples =
-          sched?.restockSamples != null ? `樣本 ${sched.restockSamples}` : "";
+          sched?.restockSamples != null ? `補貨 ${sched.restockSamples} 次` : "";
+        const days =
+          sched?.sampleDays != null && sched?.minSampleDays != null
+            ? `日數 ${sched.sampleDays}/${sched.minSampleDays}${
+                sched.graduated ? "（已畢業）" : "（學習中）"
+              }`
+            : sched?.sampleDays != null
+              ? `日數 ${sched.sampleDays}`
+              : "";
         const reason = sched?.reason ? String(sched.reason) : "";
         const bits = [
           peaks ? `補貨時段（HK）：${peaks}` : "",
+          days,
           samples,
           reason,
         ].filter(Boolean);

@@ -175,9 +175,13 @@ export async function upsertPromaxTelegramStatus(
   if (status.schedule?.peakWindows?.length) {
     lines.push(
       `補貨時段：${escapeMd(status.schedule.peakWindows.join(" · "))}` +
-        (status.schedule.restockSamples != null
-          ? `（樣本 ${status.schedule.restockSamples}）`
-          : "")
+        (status.schedule.sampleDays != null
+          ? `（日數 ${status.schedule.sampleDays}/${status.schedule.minSampleDays ?? 3}${
+              status.schedule.graduated ? " · 已畢業" : " · 學習中"
+            }）`
+          : status.schedule.restockSamples != null
+            ? `（樣本 ${status.schedule.restockSamples}）`
+            : "")
     );
   }
   if (status.schedule?.reason) {
