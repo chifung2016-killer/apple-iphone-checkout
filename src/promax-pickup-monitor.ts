@@ -27,8 +27,16 @@ import {
   rotateMonitorProxyOnBlock,
   setMonitorProxyPool,
 } from "./promax-monitor-proxy.js";
+import {
+  noteRestockAt,
+  reloadPromaxSchedule,
+  resolveScheduleMode,
+  scheduleIntervalRange,
+  type ScheduleSnapshot,
+} from "./promax-schedule.js";
 
 export { setMonitorProxyPool, getMonitorProxyStatus, getMonitorProxyPoolText } from "./promax-monitor-proxy.js";
+export type { ScheduleSnapshot };
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SKU_MAP_PATH = path.join(ROOT, "config", "sku_map.json");
@@ -137,8 +145,9 @@ export type PromaxPickupStatus = {
   consecutive_failures: number;
   next_poll_in_ms: number | null;
   poll_interval_ms: number;
-  /** idle=全無貨；hot=有至少一款有貨（加密輪詢） */
-  poll_mode: "idle" | "hot";
+  /** idle=全無貨密掃；hot=有貨；peak/quiet/learning=時段策略 */
+  poll_mode: "idle" | "hot" | "peak" | "quiet" | "learning";
+  schedule?: ScheduleSnapshot;
   running: boolean;
   rows_in_last_poll: number;
   /** sku → 首次偵測到有貨時間（ISO）；重啟後可恢復 */
@@ -317,8 +326,44 @@ function formatDurationLabel(ms: number): string {
   return rm ? `${h}小時${rm}分` : `${h}小時`;
 }
 
-function currentPollMode(): "idle" | "hot" {
+function currentPollMode(): PromaxPickupStatus["poll_mode"] {
+  const snap = resolveScheduleMode(state.anyInStock);
+  if (snap.mode === "hot") return "hot";
+  if (snap.mode === "peak") return "peak";
+  if (snap.mode === "learning") return "learning";
+  if (snap.mode === "quiet") return "quiet";
   return state.anyInStock ? "hot" : "idle";
+}
+
+/** idle/peak 密；quiet/learning 疏；hot 最密；失敗 ≥2 → backoff */
+function computeNextIntervalMs(failures: number): number {
+  const sched = resolveScheduleMode(state.anyInStock);
+  const ranged = scheduleIntervalRange(sched.mode);
+  let min: number;
+  let max: number;
+  if (sched.mode === "hot") {
+    min = HOT_POLL_MIN_MS;
+    max = HOT_POLL_MAX_MS;
+  } else if (ranged) {
+    min = ranged.min;
+    max = ranged.max;
+  } else {
+    // peak（或舊 idle）
+    min = IDLE_POLL_MIN_MS;
+    max = IDLE_POLL_MAX_MS;
+  }
+  max = Math.max(min, max);
+  const base = randomBetween(min, max);
+  const jitter =
+    sched.mode === "quiet" || sched.mode === "learning"
+      ? randomBetween(-60_000, 60_000)
+      : randomBetween(-JITTER_MS, JITTER_MS);
+  let ms = Math.max(10_000, base + jitter);
+  if (failures >= 2) {
+    const mult = Math.min(2 ** (failures - 1), 16);
+    ms = Math.min(BACKOFF_CAP_MS, ms * mult);
+  }
+  return ms;
 }
 
 function diagnoseUnhealthy(): { unhealthy: boolean; reason: string } | null {
@@ -331,9 +376,16 @@ function diagnoseUnhealthy(): { unhealthy: boolean; reason: string } | null {
       reason: `連續 ${state.consecutiveFailures} 次輪詢無有效門市數據`,
     };
   }
+  const sched = resolveScheduleMode(state.anyInStock);
+  const staleMs =
+    sched.mode === "quiet"
+      ? 45 * 60_000
+      : sched.mode === "learning"
+        ? 20 * 60_000
+        : STALE_SUCCESS_MS;
   if (state.lastSuccessAt) {
     const age = Date.now() - Date.parse(state.lastSuccessAt);
-    if (Number.isFinite(age) && age > STALE_SUCCESS_MS) {
+    if (Number.isFinite(age) && age > staleMs) {
       return {
         unhealthy: true,
         reason: `超過 ${Math.round(age / 60_000)} 分鐘無成功更新（數據可能過期）`,
@@ -472,21 +524,6 @@ function stopHealthWatchdog(): void {
     clearInterval(healthWatchdog);
     healthWatchdog = null;
   }
-}
-
-/** idle 45–60s / hot 15–25s + jitter；失敗 ≥2 → backoff */
-function computeNextIntervalMs(failures: number): number {
-  const hot = state.anyInStock;
-  const min = hot ? HOT_POLL_MIN_MS : IDLE_POLL_MIN_MS;
-  const max = Math.max(min, hot ? HOT_POLL_MAX_MS : IDLE_POLL_MAX_MS);
-  const base = randomBetween(min, max);
-  const jitter = randomBetween(-JITTER_MS, JITTER_MS);
-  let ms = Math.max(10_000, base + jitter);
-  if (failures >= 2) {
-    const mult = Math.min(2 ** (failures - 1), 16);
-    ms = Math.min(BACKOFF_CAP_MS, ms * mult);
-  }
-  return ms;
 }
 
 async function ensureRuntime(): Promise<void> {
@@ -883,6 +920,7 @@ function buildStatus(partial: {
     next_poll_in_ms: state.nextPollInMs,
     poll_interval_ms: state.pollIntervalMs,
     poll_mode: currentPollMode(),
+    schedule: resolveScheduleMode(state.anyInStock),
     running: state.running,
     rows_in_last_poll: partial.rowsInLastPoll,
     available_since: Object.fromEntries(
@@ -983,6 +1021,9 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
     await appendCollection(collectionRows);
     newRestockEvents = detectRestockEvents(matrix, ts);
     await appendRestockEvents(newRestockEvents);
+    for (const ev of newRestockEvents) {
+      if (ev.event === "restock") noteRestockAt(ev.at);
+    }
     state.anyInStock = matrix.some((entry) =>
       entry.stores.some((c) => isAvailableDisplay(c.pickup_display))
     );
@@ -1080,13 +1121,23 @@ async function loadLatestFromDisk(): Promise<void> {
       (parsed.matrix || []).some((e) =>
         (e.stores || []).some((c) => isAvailableDisplay(c.pickup_display))
       );
-    // 重啟時若上次係 541／封鎖，先冷卻再打，避免一開機繼續狂撞
+    // 重啟時若上次係 541／封鎖，且成功數據已過期，先冷卻再打
+    const lastOk = parsed.last_success_at
+      ? Date.parse(parsed.last_success_at)
+      : NaN;
+    const okFresh =
+      Number.isFinite(lastOk) && Date.now() - lastOk < 5 * 60_000;
     if (
+      !okFresh &&
       /541|403|429|edge_cooldown|blocked/i.test(String(parsed.last_error || ""))
     ) {
       edgeBlockedUntil = Date.now() + EDGE_COOLDOWN_MS;
       console.warn(
         `[promax-pickup] restored edge cooldown ${Math.round(EDGE_COOLDOWN_MS / 60_000)}m from last_error`
+      );
+    } else if (okFresh) {
+      console.log(
+        "[promax-pickup] last_success fresh — skip restoring edge cooldown"
       );
     }
   } catch {
@@ -1135,14 +1186,18 @@ export async function startPromaxPickupMonitor(opts?: {
   state.running = true;
   await ensureRuntime();
   await loadLatestFromDisk();
+  await reloadPromaxSchedule(true);
   startHealthWatchdog();
+  const sched = resolveScheduleMode(state.anyInStock);
   console.log(
     `[promax-pickup] started｜sku_map=${SKU_MAP_PATH}｜stores=${HK_APPLE_STORES.length}` +
       `｜telegram=${hasTelegramCreds() ? "on" : "off"}` +
       `｜idle=${Math.round(IDLE_POLL_MIN_MS / 1000)}-${Math.round(IDLE_POLL_MAX_MS / 1000)}s` +
       `｜hot=${Math.round(HOT_POLL_MIN_MS / 1000)}-${Math.round(HOT_POLL_MAX_MS / 1000)}s` +
       `｜health-watch=on` +
-      `｜monitor-proxy=${getMonitorProxyStatus().mode}`
+      `｜monitor-proxy=${getMonitorProxyStatus().mode}` +
+      `｜schedule=${sched.mode}` +
+      `｜peaks=${sched.peakWindows.join(",") || "—"}`
   );
   if (opts?.runImmediately !== false) {
     try {

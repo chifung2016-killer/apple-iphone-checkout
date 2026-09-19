@@ -118,10 +118,21 @@ export async function upsertPromaxTelegramStatus(
 
   const lines: string[] = [
     "*iPhone 18 Pro Max 門市監控*",
-    `狀態：${status.running ? "ON" : "OFF"} · 成功：${escapeMd(
-      status.last_success_at || "—"
-    )}`,
+    `狀態：${status.running ? "ON" : "OFF"} · 模式：${escapeMd(
+      status.poll_mode || "—"
+    )} · 成功：${escapeMd(status.last_success_at || "—")}`,
   ];
+  if (status.schedule?.peakWindows?.length) {
+    lines.push(
+      `補貨時段：${escapeMd(status.schedule.peakWindows.join(" · "))}` +
+        (status.schedule.restockSamples != null
+          ? `（樣本 ${status.schedule.restockSamples}）`
+          : "")
+    );
+  }
+  if (status.schedule?.reason) {
+    lines.push(escapeMd(status.schedule.reason));
+  }
   if (status.last_error) {
     lines.push(`錯誤：${escapeMd(String(status.last_error).slice(0, 120))}`);
   }
