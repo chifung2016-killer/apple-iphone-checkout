@@ -263,10 +263,14 @@ export async function monitorFetchGet(
       redirect: "follow",
       dispatcher: agent,
     });
+    const status = res.status;
+    const ok = res.ok;
+    // 必須喺 close agent 之前讀晒 body，否則 undici 會 throw "terminated"
+    const text = await res.text();
     return {
-      status: res.status,
-      ok: res.ok,
-      json: () => res.json() as Promise<unknown>,
+      status,
+      ok,
+      json: async () => JSON.parse(text) as unknown,
       proxyUsed: proxy.raw,
     };
   } finally {

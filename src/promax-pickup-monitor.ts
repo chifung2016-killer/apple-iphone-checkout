@@ -449,6 +449,13 @@ function diagnoseUnhealthy(): { unhealthy: boolean; reason: string } | null {
   return null;
 }
 
+/** 取消現有 timer，用 override 立刻重新排程（auto-heal／清熔斷用） */
+function kickScheduleSoon(ms: number): void {
+  if (!state.running) return;
+  rescheduleOverrideMs = Math.max(500, ms);
+  void scheduleNext();
+}
+
 async function maybeAutoHeal(reason: string): Promise<void> {
   if (!state.running) return;
   const now = Date.now();
@@ -457,7 +464,16 @@ async function maybeAutoHeal(reason: string): Promise<void> {
 
   const rem = edgeBlockRemainingMs();
   if (rem > 0) {
-    rescheduleOverrideMs = rem + randomBetween(5_000, 20_000);
+    // 有監控 proxy 池 → 唔好乾等長熔斷；清冷卻即刻再試（真正 541 時 poll 會自己 rotate）
+    if (getMonitorProxyStatus().count > 0) {
+      edgeBlockedUntil = 0;
+      kickScheduleSoon(randomBetween(2_000, 5_000));
+      console.warn(
+        `[promax-pickup] auto-heal：有 proxy 池，取消長冷卻，約 2–5s 再 poll`
+      );
+      return;
+    }
+    kickScheduleSoon(rem + randomBetween(5_000, 20_000));
     await notifyEdgeCooldown(state.lastError || "541");
     return;
   }
@@ -468,7 +484,7 @@ async function maybeAutoHeal(reason: string): Promise<void> {
   console.warn(`[promax-pickup] auto-heal #${autoHealAttempts}：${reason}`);
 
   if (autoHealAttempts <= MAX_AUTO_HEAL) {
-    rescheduleOverrideMs = randomBetween(45_000, 75_000);
+    kickScheduleSoon(randomBetween(2_000, 8_000));
     void notifyPromaxHealthAlert({
       kind: "auto_heal",
       reason,
@@ -480,7 +496,7 @@ async function maybeAutoHeal(reason: string): Promise<void> {
       proxy: telegramProxyOpts(),
     }).catch(() => {});
   } else {
-    rescheduleOverrideMs = randomBetween(90_000, 150_000);
+    kickScheduleSoon(randomBetween(15_000, 30_000));
     void notifyPromaxHealthAlert({
       kind: "needs_fix",
       reason: `${reason}（自動修復 ${MAX_AUTO_HEAL} 次仍失敗）`,
@@ -636,8 +652,10 @@ function parsePickupStores(
   const pickupMessage = (content.pickupMessage ||
     body.pickupMessage ||
     {}) as Record<string, unknown>;
-  const stores = (pickupMessage.stores ||
-    body.stores ||
+  // 而家 Apple 多數直接 body.stores；舊路徑 body.content.pickupMessage.stores
+  const stores = (body.stores ||
+    pickupMessage.stores ||
+    content.stores ||
     []) as Record<string, unknown>[];
 
   const rows: {
@@ -730,8 +748,8 @@ async function fetchFulfillmentMessagesStores(sku: string): Promise<
 
 /**
  * 優先 retail/pickup-message；
- * 541/403/429 唔好打 fulfillment（只會加倍觸發封鎖）。
- * 其他錯誤／空 stores 先 fallback。
+ * 541/403/429／proxy 斷線（terminated）唔好打 fulfillment（只會加倍觸發封鎖）。
+ * 僅空 stores 時先 fallback。
  */
 export async function fetchFulfillmentStores(
   sku: string
@@ -747,16 +765,27 @@ export async function fetchFulfillmentStores(
     if (rows.length) return rows;
   } catch (err) {
     const status = (err as { status?: number }).status;
+    const msg = err instanceof Error ? err.message : String(err);
+    const edgeLike =
+      status === 429 ||
+      status === 403 ||
+      status === 541 ||
+      /terminated|ECONNRESET|ECONNREFUSED|ETIMEDOUT|socket hang up|ProxyResponseError/i.test(
+        msg
+      );
     console.warn(
-      `[promax-pickup] pickup-message failed for ${sku}: ${
-        err instanceof Error ? err.message : String(err)
-      }` +
-        (status === 429 || status === 403 || status === 541
-          ? " — skip fulfillment fallback"
-          : " — try fulfillment-messages")
+      `[promax-pickup] pickup-message failed for ${sku}: ${msg}` +
+        (edgeLike ? " — skip fulfillment fallback" : " — try fulfillment-messages")
     );
-    if (status === 429 || status === 403 || status === 541) {
-      throw err;
+    if (edgeLike) {
+      const e =
+        err instanceof Error
+          ? err
+          : new Error(msg);
+      if (!(e as Error & { status?: number }).status) {
+        (e as Error & { status: number }).status = 541;
+      }
+      throw e;
     }
   }
   return fetchFulfillmentMessagesStores(sku);
@@ -1194,19 +1223,24 @@ async function loadLatestFromDisk(): Promise<void> {
       (parsed.matrix || []).some((e) =>
         (e.stores || []).some((c) => isAvailableDisplay(c.pickup_display))
       );
-    // 重啟時若上次係 541／封鎖，且成功數據已過期，先冷卻再打
+    // 重啟時：有監控 proxy 池就唔恢復長熔斷（可轉線即試）；本機／無池先短冷卻
     const lastOk = parsed.last_success_at
       ? Date.parse(parsed.last_success_at)
       : NaN;
     const okFresh =
       Number.isFinite(lastOk) && Date.now() - lastOk < 5 * 60_000;
-    if (
+    const hadEdge =
       !okFresh &&
-      /541|403|429|edge_cooldown|blocked/i.test(String(parsed.last_error || ""))
-    ) {
-      edgeBlockedUntil = Date.now() + EDGE_COOLDOWN_MS;
+      /541|403|429|edge_cooldown|blocked/i.test(String(parsed.last_error || ""));
+    if (hadEdge && getMonitorProxyStatus().count > 0) {
+      edgeBlockedUntil = 0;
+      console.log(
+        "[promax-pickup] last_error 有 541／cooldown，但有監控 proxy — 唔恢復長熔斷，即刻試轉線"
+      );
+    } else if (hadEdge) {
+      edgeBlockedUntil = Date.now() + Math.min(EDGE_COOLDOWN_MS, 3 * 60_000);
       console.warn(
-        `[promax-pickup] restored edge cooldown ${Math.round(EDGE_COOLDOWN_MS / 60_000)}m from last_error`
+        `[promax-pickup] restored short edge cooldown ${Math.round(edgeBlockRemainingMs() / 60_000)}m from last_error（無 proxy 池）`
       );
     } else if (okFresh) {
       console.log(
@@ -1295,13 +1329,14 @@ export function stopPromaxPickupMonitor(): void {
   console.log("[promax-pickup] stopped");
 }
 
-/** 清 541 熔斷（例如換咗監控 proxy） */
+/** 清 541 熔斷（例如換咗監控 proxy）並盡快再 poll */
 export function clearPromaxEdgeCooldown(): void {
   edgeBlockedUntil = 0;
   softLowRowStreak = 0;
   autoHealAttempts = 0;
   wasUnhealthy = false;
   console.log("[promax-pickup] edge cooldown cleared");
+  if (state.running) kickScheduleSoon(randomBetween(1_000, 3_000));
 }
 
 /** API：最新 status matrix（含 last_success_at） */
