@@ -273,6 +273,8 @@ const EXPECTED_ROWS_SOFT = 24; // 8×6=48；少過呢個當半失效
 
 let healthWatchdog: ReturnType<typeof setInterval> | null = null;
 let wasUnhealthy = false;
+/** 曾經失效／自動修復；下次成功輪詢要推 Telegram「修復完成」 */
+let awaitingRecoveryNotice = false;
 let autoHealAttempts = 0;
 let softLowRowStreak = 0;
 /** 自動修復時覆寫下一次間隔（ms） */
@@ -519,12 +521,18 @@ async function evaluateHealthAfterPoll(rows: number): Promise<void> {
   const diag = diagnoseUnhealthy();
   if (diag?.unhealthy) {
     wasUnhealthy = true;
+    awaitingRecoveryNotice = true;
     await maybeAutoHeal(diag.reason);
     return;
   }
 
-  if (wasUnhealthy && rows > 0 && state.consecutiveFailures === 0) {
+  if (
+    awaitingRecoveryNotice &&
+    rows >= EXPECTED_ROWS_SOFT &&
+    state.consecutiveFailures === 0
+  ) {
     wasUnhealthy = false;
+    awaitingRecoveryNotice = false;
     const healedAfter = autoHealAttempts;
     autoHealAttempts = 0;
     softLowRowStreak = 0;
@@ -532,8 +540,8 @@ async function evaluateHealthAfterPoll(rows: number): Promise<void> {
       kind: "recovered",
       reason:
         healedAfter > 0
-          ? `自動修復後恢復正常（曾重試 ${healedAfter} 次）`
-          : "監控已恢復正常",
+          ? `監控修復完成，已恢復正常（曾重試 ${healedAfter} 次）`
+          : "監控修復完成，已恢復正常",
       lastSuccessAt: state.lastSuccessAt,
       rowsInLastPoll: rows,
       pollMode: currentPollMode(),
@@ -556,6 +564,7 @@ function startHealthWatchdog(): void {
       );
       if (Number.isFinite(age) && age > hungAfter) {
         wasUnhealthy = true;
+        awaitingRecoveryNotice = true;
         void (async () => {
           await maybeAutoHeal(
             `輪詢似乎卡住（${Math.round(age / 60_000)} 分鐘無 attempt）— 重新排程`
@@ -569,6 +578,7 @@ function startHealthWatchdog(): void {
     const diag = diagnoseUnhealthy();
     if (diag?.unhealthy) {
       wasUnhealthy = true;
+      awaitingRecoveryNotice = true;
       void (async () => {
         await maybeAutoHeal(diag.reason);
         // 若未排程中，確保有下一次
@@ -1232,6 +1242,9 @@ async function loadLatestFromDisk(): Promise<void> {
     const hadEdge =
       !okFresh &&
       /541|403|429|edge_cooldown|blocked/i.test(String(parsed.last_error || ""));
+    if (parsed.last_error && !okFresh) {
+      awaitingRecoveryNotice = true;
+    }
     if (hadEdge && getMonitorProxyStatus().count > 0) {
       edgeBlockedUntil = 0;
       console.log(
@@ -1333,8 +1346,6 @@ export function stopPromaxPickupMonitor(): void {
 export function clearPromaxEdgeCooldown(): void {
   edgeBlockedUntil = 0;
   softLowRowStreak = 0;
-  autoHealAttempts = 0;
-  wasUnhealthy = false;
   console.log("[promax-pickup] edge cooldown cleared");
   if (state.running) kickScheduleSoon(randomBetween(1_000, 3_000));
 }

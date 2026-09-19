@@ -416,7 +416,7 @@ export async function notifyPromaxHealthAlert(
 
   const lines: string[] = [];
   if (alert.kind === "recovered") {
-    lines.push("*✅ Pro Max 監控已恢復*");
+    lines.push("*✅ Pro Max 監控修復完成*");
     lines.push(escapeMd(alert.reason));
   } else if (alert.kind === "auto_heal") {
     lines.push("*🛠️ Pro Max 監控異常 — 正在自動修復*");
