@@ -101,8 +101,8 @@ let CONFIG = {
    */
   proxy: "",
   /**
-   * Monitor+buying：跑到取貨門市列表後停低。
-   * 每隔 productPollIntervalMs refresh 取貨頁，直到監控到同 SKU 先即刻 refresh 同加車。
+   * Pickup credit card 訪客：task 開定之後停低等監控。
+   * 一監控到同色同容量，即刻去該 SKU 網址加車。唔會每隔幾分鐘 refresh 取貨頁。
    */
   holdAtPickupStoresForStock: false,
 };
@@ -6679,9 +6679,9 @@ async function attemptFullAddCartToPayment(
 }
 
 /**
- * Pickup credit card 訪客：停喺揀門市頁。
- * 每隔 Dashboard「Refresh interval」refresh 一次，直到監控到同 SKU，
- * 然後即刻再 refresh 同加車。
+ * Pickup credit card 訪客：task 已經開定。
+ * 只等監控旗標（約 0.4 秒查一次）。一有同色同容量，即刻去該 SKU 網址加車。
+ * 唔 refresh 取貨頁，亦唔等 5 分鐘。
  */
 async function runMonitorHoldBuyLoop(
   page: Page,
@@ -6689,56 +6689,27 @@ async function runMonitorHoldBuyLoop(
   tag: string,
   session?: BrowserSession
 ): Promise<void> {
-  let lastConsumedAt = 0;
+  let lastConsumedAt = Date.now();
 
   console.log(
-    `${tag} 取貨頁待命：等 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage}。未有貨就每 ${Math.round(pickupPageRefreshMs() / 1000)}s refresh；監控到同 SKU 就即刻 refresh 同加車`
+    `${tag} task 已開，等監控到 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage}，然後即刻去該 SKU 網址加車`
   );
 
   while (true) {
     await throwIfReleased();
-    const refreshMs = pickupPageRefreshMs();
-    await ensureFulfillmentInitStandby(page);
     await writeStatus({
       phase: "waiting_for_stock_at_stores",
-      message: `揀門市頁待命：每 ${Math.round(refreshMs / 1000)}s refresh，直到監控到 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage}`,
+      message: `task 已開，等監控到 ${CONFIG.color}／${CONFIG.storage} 就即刻去 SKU 網址加車`,
       stuck: false,
       stuckSince: null,
     });
-    await fs.unlink(STOCK_RESUME_SESSION_FLAG).catch(() => {});
 
-    const gateAt = Math.max(lastConsumedAt, Date.now());
-    let pending = await waitForMatchingStockResume({
-      afterMs: gateAt,
-      timeoutMs: refreshMs,
-    });
-
-    while (!pending) {
-      console.log(
-        `  ${Math.round(refreshMs / 1000)}s 內未有同 SKU 有貨，refresh 取貨頁…`
-      );
-      await reloadFulfillmentInitUntilReady(page, gateAt);
-      pending = await waitForMatchingStockResume({
-        afterMs: gateAt,
-        timeoutMs: 500,
-      });
-      if (pending) break;
-      await ensureFulfillmentInitStandby(page);
-      await writeStatus({
-        phase: "waiting_for_stock_at_stores",
-        message: `已 refresh 取貨頁，再等 ${Math.round(refreshMs / 1000)}s 或監控到同 SKU`,
-        stuck: false,
-        stuckSince: null,
-      });
-      pending = await waitForMatchingStockResume({
-        afterMs: gateAt,
-        timeoutMs: refreshMs,
-      });
-    }
-
+    const pending = await waitForMatchingStockResume({ afterMs: lastConsumedAt });
+    if (!pending) continue;
     lastConsumedAt = pending.atMs;
+
     const matchLabel = `${CONFIG.storage} ${CONFIG.color}`;
-    console.log(`  監控到有貨（${matchLabel}）— 即刻去該 SKU 網址加車：${CONFIG.buyUrl}`);
+    console.log(`  監控到 ${matchLabel} — 即刻去 SKU 網址加車：${CONFIG.buyUrl}`);
     await writeStatus({
       phase: "resuming_after_stock",
       message: `監控到 ${matchLabel}：去產品頁加車`,
@@ -6752,7 +6723,7 @@ async function runMonitorHoldBuyLoop(
         session
       );
       if (reachedPay) {
-        console.log(`${tag} 已到付款頁 — 結束取貨頁待命`);
+        console.log(`${tag} 已到付款頁 — 結束待命`);
         return;
       }
     } catch (err) {
@@ -6762,7 +6733,7 @@ async function runMonitorHoldBuyLoop(
         err instanceof Error ? err.message : String(err)
       );
     }
-    console.log(`  今次加車未完成，返揀門市頁繼續每 ${Math.round(refreshMs / 1000)}s refresh`);
+    console.log(`  今次加車未完成，繼續等下一次 ${matchLabel}`);
   }
 }
 
@@ -11823,6 +11794,10 @@ async function runCheckoutToPayment(session: BrowserSession): Promise<void> {
   const base = { pauseOnError: false, page, retries: 2 };
 
   console.log(`\n${tag} 開啟購買頁：`, CONFIG.buyUrl);
+  if (CONFIG.holdAtPickupStoresForStock && isPickupCreditCardGuest()) {
+    await runMonitorHoldBuyLoop(page, identity, tag, session);
+    return;
+  }
   console.log(
     `${tag} 資料：${identity.lastName}${identity.firstName} / ${identity.area} ${identity.district} / ${identity.street} / ${identity.phone} / ${identity.email}`
   );

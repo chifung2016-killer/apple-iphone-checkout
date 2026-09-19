@@ -658,7 +658,7 @@
             <label for="productPollIntervalMs">取貨頁 refresh 間隔 (ms)</label>
             <input id="productPollIntervalMs" name="productPollIntervalMs" type="number" min="5000" step="1000" value="300000" />
             <p class="hint" style="margin:6px 0 0">
-              只限 <b>Pickup Credit Card 訪客模式</b>。停喺揀門市頁時，每隔呢個時間 refresh 一次。監控到同一個 SKU 就即刻再 refresh 同加車。預設 <b>300000</b>（5 分鐘）。
+              Pickup Credit Card 訪客：task 開定之後<strong>唔會</strong>每隔呢個時間 refresh。一監控到同一個顏色同容量，就即刻去該 SKU 網址加車。
             </p>
           </div>
           <div class="actions">

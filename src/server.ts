@@ -3266,41 +3266,8 @@ server.listen(PORT, "127.0.0.1", () => {
             )
             .join("；");
           console.log(
-            `[promax-pickup] 有貨 → 去該 SKU 網址加車：${labels}`
+            `[promax-pickup] 有貨 → 已開住嘅 task 跳去該 SKU 加車：${labels}`
           );
-          const live = [...sessions.values()].some((s) => s.running);
-          if (live) {
-            console.log("[promax-pickup] 已有結帳瀏覽器，交俾佢跳去有貨 SKU");
-          } else {
-            const target = pickRestockTarget(restocks);
-            const buyUrl = promaxBuyUrl(
-              String(target.storage || ""),
-              String(target.color || "")
-            );
-            console.log(
-              `[promax-pickup] 冇待命瀏覽器 → 即刻開一個：${target.storage} ${target.color} ${buyUrl}`
-            );
-            await spawnOneBrowser({
-              ...lastFormConfig,
-              model: target.model || "iPhone 18 Pro Max",
-              color: target.color,
-              storage: target.storage,
-              buyUrl,
-              fulfillmentPreference: "pickup",
-              holdAtPickupStoresForStock: false,
-              instantBuy: true,
-              preferredStoreCodes: (target.storeStocks || [])
-                .filter((s) => s.available && s.code)
-                .map((s) => String(s.code))
-                .join(","),
-              browserCount: 1,
-              quantity: Number(lastFormConfig.quantity) || 1,
-            }).catch((err) => {
-              console.warn(
-                `[promax-pickup] 即刻加車啟動失敗：${err instanceof Error ? err.message : String(err)}`
-              );
-            });
-          }
         }
         if (events.length) {
           broadcast({ type: "status", state: await snapshot() });
