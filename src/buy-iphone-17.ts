@@ -5717,15 +5717,7 @@ function buyUrlForPromax(storage: string, color: string): string {
 }
 
 function chooseRestockSku(payload: StockResumePayload): StockResumeSku | null {
-  const skus = payload.skus || [];
-  if (!skus.length) return null;
-  const exact = skus.find((s) => stockSkuMatchesCheckout(s));
-  if (exact) return exact;
-  const wantColor = normColorKey(CONFIG.color);
-  const sameColor = skus.find(
-    (s) => wantColor && normColorKey(String(s.color || "")) === wantColor
-  );
-  return sameColor || skus[0];
+  return (payload.skus || []).find((s) => stockSkuMatchesCheckout(s)) || null;
 }
 
 function applyRestockSku(sku: StockResumeSku): void {
@@ -5863,10 +5855,8 @@ async function waitForMatchingStockResume(opts?: {
 
   while (true) {
     await throwIfReleased();
-    if (deadline != null && Date.now() >= deadline) return null;
-
     const payload = await readStockResumePayload();
-    if (payload && payload.atMs > afterMs && payload.skus.length > 0) {
+    if (payload && payload.atMs > afterMs) {
       const sku = chooseRestockSku(payload);
       if (sku) {
         applyRestockSku(sku);
@@ -5876,6 +5866,7 @@ async function waitForMatchingStockResume(opts?: {
         return payload;
       }
     }
+    if (deadline != null && Date.now() >= deadline) return null;
     await sleepCheckingRelease(400);
   }
 }
@@ -6043,10 +6034,17 @@ async function gotoFulfillmentInit(page: Page): Promise<void> {
 /**
  * Monitor+buying：refresh Fulfillment-init；若 503 就隔 6 秒再 refresh，直到頁面可用再交俾腳本。
  */
-async function reloadFulfillmentInitUntilReady(page: Page): Promise<void> {
+async function reloadFulfillmentInitUntilReady(
+  page: Page,
+  afterMs = 0
+): Promise<void> {
   const RETRY_503_MS = 6_000;
   for (let n = 1; ; n++) {
     await throwIfReleased();
+    if (await readStockResumePayload().then((p) => p && p.atMs > afterMs && chooseRestockSku(p))) {
+      console.log("  監控到同 SKU，停止 refresh 取貨頁");
+      return;
+    }
     const current = page.url();
     const target = fulfillmentInitUrlFrom(current);
     markCheckoutNav(target || current, "stockResumeRefresh");
@@ -6097,7 +6095,11 @@ async function reloadFulfillmentInitUntilReady(page: Page): Promise<void> {
     }
 
     console.log("  Fulfillment-init 已可用，等待詳細內容載入…");
-    const detailsOk = await waitForFulfillmentInitDetailsReady(page);
+    const detailsOk = await waitForFulfillmentInitDetailsReady(page, afterMs);
+    if (await readStockResumePayload().then((p) => p && p.atMs > afterMs && chooseRestockSku(p))) {
+      console.log("  監控到同 SKU，停止 refresh 取貨頁");
+      return;
+    }
     if (!detailsOk) {
       if (await isFulfillment503(page)) {
         await writeStatus({
@@ -6126,11 +6128,16 @@ async function reloadFulfillmentInitUntilReady(page: Page): Promise<void> {
 /**
  * 等 Fulfillment-init 載入齊取貨／送貨等詳細 UI，先好撳「我會前來取貨」。
  */
-async function waitForFulfillmentInitDetailsReady(page: Page): Promise<boolean> {
+async function waitForFulfillmentInitDetailsReady(
+  page: Page,
+  afterMs = 0
+): Promise<boolean> {
   console.log("  等待 Fulfillment-init 詳細內容（我會前來取貨／送貨選項）…");
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
     await throwIfReleased();
+    const pending = await readStockResumePayload();
+    if (pending && pending.atMs > afterMs && chooseRestockSku(pending)) return false;
     if (await isFulfillment503(page)) {
       console.warn("  等詳細內容期間出現 503");
       return false;
@@ -6710,7 +6717,12 @@ async function runMonitorHoldBuyLoop(
       console.log(
         `  ${Math.round(refreshMs / 1000)}s 內未有同 SKU 有貨，refresh 取貨頁…`
       );
-      await reloadFulfillmentInitUntilReady(page);
+      await reloadFulfillmentInitUntilReady(page, gateAt);
+      pending = await waitForMatchingStockResume({
+        afterMs: gateAt,
+        timeoutMs: 500,
+      });
+      if (pending) break;
       await ensureFulfillmentInitStandby(page);
       await writeStatus({
         phase: "waiting_for_stock_at_stores",
