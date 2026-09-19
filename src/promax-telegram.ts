@@ -339,6 +339,38 @@ export function hasTelegramCreds(): boolean {
   return Boolean(telegramCreds());
 }
 
+/** Proxy 被暫時 ban 時即時通知（唔節流，每次 ban 一則） */
+export async function notifyPromaxProxyBanned(opts: {
+  bannedFull: string;
+  reason: string;
+  banMs: number;
+  nextFull: string | null;
+  count: number;
+  banned: number;
+}): Promise<void> {
+  const creds = telegramCreds();
+  if (!creds) return;
+  const mins = Math.max(1, Math.round(opts.banMs / 60_000));
+  const until = new Date(Date.now() + opts.banMs).toISOString();
+  const lines = [
+    "*🚫 監控 Proxy 被 Ban*",
+    `被 ban：${escapeMd(opts.bannedFull)}`,
+    `原因：${escapeMd(opts.reason)}`,
+    `暫停：約 ${mins} 分鐘（至 ${escapeMd(formatHkDisplay(until))}）`,
+    opts.nextFull
+      ? `轉用：${escapeMd(opts.nextFull)}`
+      : "轉用：無剩餘 proxy（本機／等解禁）",
+    `池 ${opts.count} 條 · 暫 ban ${opts.banned}`,
+    `時間：${escapeMd(formatHkDisplay(new Date().toISOString()))}`,
+  ];
+  await tgApi(creds.token, "sendMessage", {
+    chat_id: creds.chatId,
+    text: lines.join("\n"),
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+  });
+}
+
 export type PromaxHealthAlert = {
   kind: "auto_heal" | "needs_fix" | "recovered";
   reason: string;

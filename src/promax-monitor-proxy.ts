@@ -4,6 +4,7 @@
  * - SOCKS5：Playwright APIRequest（已有依賴）
  */
 import { ProxyAgent, fetch as undiciFetch } from "undici";
+import { notifyPromaxProxyBanned } from "./promax-telegram.js";
 
 export type ParsedProxy = {
   raw: string;
@@ -173,15 +174,32 @@ export function rotateMonitorProxyOnBlock(
   reason: string,
   banMs = 30 * 60_000
 ): boolean {
-  if (activeRaw) {
-    bannedUntil.set(activeRaw, Date.now() + banMs);
+  const bannedRaw = activeRaw;
+  if (bannedRaw) {
+    bannedUntil.set(bannedRaw, Date.now() + banMs);
     console.warn(
-      `[promax-proxy] ban ${redactProxyForDisplay(activeRaw)} ${Math.round(banMs / 60_000)}m｜${reason}`
+      `[promax-proxy] ban ${redactProxyForDisplay(bannedRaw)} ${Math.round(banMs / 60_000)}m｜${reason}`
     );
     activeRaw = null;
     void disposePwContext();
   }
   const next = pickMonitorProxy();
+  if (bannedRaw) {
+    void notifyPromaxProxyBanned({
+      bannedFull: bannedRaw,
+      reason,
+      banMs,
+      nextFull: next?.raw || null,
+      count: pool.length,
+      banned: bannedUntil.size,
+    }).catch((err) => {
+      console.warn(
+        `[promax-proxy] telegram ban notify failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    });
+  }
   if (next) {
     console.log(
       `[promax-proxy] 轉用下一條：${redactProxyForDisplay(next.raw)}`
