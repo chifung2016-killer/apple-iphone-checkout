@@ -204,11 +204,13 @@ function envMs(name: string, fallback: number): number {
 /** 全無貨：稍密捉補貨（預設 45–60s） */
 const IDLE_POLL_MIN_MS = envMs("PROMAX_POLL_IDLE_MIN_MS", 45_000);
 const IDLE_POLL_MAX_MS = envMs("PROMAX_POLL_IDLE_MAX_MS", 60_000);
-/** 有貨中：加密捉售罄時長（預設 15–25s） */
-const HOT_POLL_MIN_MS = envMs("PROMAX_POLL_HOT_MIN_MS", 15_000);
-const HOT_POLL_MAX_MS = envMs("PROMAX_POLL_HOT_MAX_MS", 25_000);
+/** 有貨中：加密捉售罄（預設 25–40s；太密易觸發 541） */
+const HOT_POLL_MIN_MS = envMs("PROMAX_POLL_HOT_MIN_MS", 25_000);
+const HOT_POLL_MAX_MS = envMs("PROMAX_POLL_HOT_MAX_MS", 40_000);
 const JITTER_MS = 8_000;
 const BACKOFF_CAP_MS = 15 * 60_000;
+/** 541/403/429 熔斷冷卻（預設 12 分鐘） */
+const EDGE_COOLDOWN_MS = envMs("PROMAX_EDGE_COOLDOWN_MS", 12 * 60_000);
 const MAX_COLLECTION_LINES = 50_000;
 
 const state: MonitorState = {
@@ -242,6 +244,43 @@ let softLowRowStreak = 0;
 /** 自動修復時覆寫下一次間隔（ms） */
 let rescheduleOverrideMs: number | null = null;
 let lastAutoHealAt = 0;
+/** Apple 邊緣擋（541/403/429）冷卻至此時刻 */
+let edgeBlockedUntil = 0;
+let lastEdgeCooldownNotifyAt = 0;
+
+function edgeBlockRemainingMs(): number {
+  return Math.max(0, edgeBlockedUntil - Date.now());
+}
+
+function tripEdgeBlock(status: number, where: string): void {
+  if (status !== 429 && status !== 403 && status !== 541) return;
+  const cool =
+    status === 541
+      ? EDGE_COOLDOWN_MS
+      : Math.min(EDGE_COOLDOWN_MS, 5 * 60_000);
+  const until = Date.now() + cool;
+  if (until > edgeBlockedUntil) {
+    edgeBlockedUntil = until;
+    console.warn(
+      `[promax-pickup] edge block HTTP ${status} @ ${where} — cooldown ${Math.round(cool / 60_000)}m`
+    );
+  }
+}
+
+async function notifyEdgeCooldown(statusHint: string): Promise<void> {
+  const rem = edgeBlockRemainingMs();
+  if (rem <= 0) return;
+  const now = Date.now();
+  if (now - lastEdgeCooldownNotifyAt < 10 * 60_000) return;
+  lastEdgeCooldownNotifyAt = now;
+  void notifyPromaxHealthAlert({
+    kind: "auto_heal",
+    reason: `Apple 邊緣擋請求（${statusHint}）。已暫停輪詢約 ${Math.ceil(rem / 60_000)} 分鐘，冷卻後自動重試 — 唔使重啟 Dashboard。若成日發生可喺 Dashboard 加 proxy。`,
+    lastError: state.lastError,
+    lastSuccessAt: state.lastSuccessAt,
+    consecutiveFailures: state.consecutiveFailures,
+  }).catch(() => {});
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -268,6 +307,8 @@ function currentPollMode(): "idle" | "hot" {
 
 function diagnoseUnhealthy(): { unhealthy: boolean; reason: string } | null {
   if (!state.running) return null;
+  // 熔斷冷卻中：唔當「壞咗要狂修」，等冷卻完
+  if (edgeBlockRemainingMs() > 0) return null;
   if (state.consecutiveFailures >= 3) {
     return {
       unhealthy: true,
@@ -306,13 +347,20 @@ async function maybeAutoHeal(reason: string): Promise<void> {
   if (now - lastAutoHealAt < 45_000) return;
   lastAutoHealAt = now;
 
+  const rem = edgeBlockRemainingMs();
+  if (rem > 0) {
+    rescheduleOverrideMs = rem + randomBetween(5_000, 20_000);
+    await notifyEdgeCooldown(state.lastError || "541");
+    return;
+  }
+
   autoHealAttempts += 1;
-  // 縮短 backoff，唔好困喺 15 分鐘
+  // 縮短 backoff，唔好困喺 15 分鐘（非 541 熔斷時）
   state.consecutiveFailures = Math.min(state.consecutiveFailures, 1);
   console.warn(`[promax-pickup] auto-heal #${autoHealAttempts}：${reason}`);
 
   if (autoHealAttempts <= MAX_AUTO_HEAL) {
-    rescheduleOverrideMs = randomBetween(15_000, 25_000);
+    rescheduleOverrideMs = randomBetween(45_000, 75_000);
     void notifyPromaxHealthAlert({
       kind: "auto_heal",
       reason,
@@ -322,8 +370,7 @@ async function maybeAutoHeal(reason: string): Promise<void> {
       autoHealAttempt: autoHealAttempts,
     }).catch(() => {});
   } else {
-    // 之後仍會慢慢輪詢，但請人 Fix
-    rescheduleOverrideMs = randomBetween(60_000, 90_000);
+    rescheduleOverrideMs = randomBetween(90_000, 150_000);
     void notifyPromaxHealthAlert({
       kind: "needs_fix",
       reason: `${reason}（自動修復 ${MAX_AUTO_HEAL} 次仍失敗）`,
@@ -574,6 +621,7 @@ async function fetchFulfillmentMessagesStores(sku: string): Promise<
   if (res.status === 429 || res.status === 403 || res.status === 541) {
     const err = new Error(`HTTP ${res.status} from fulfillment-messages`);
     (err as Error & { status: number }).status = res.status;
+    tripEdgeBlock(res.status, "fulfillment-messages");
     throw err;
   }
   if (!res.ok) {
@@ -585,8 +633,9 @@ async function fetchFulfillmentMessagesStores(sku: string): Promise<
 }
 
 /**
- * 優先 retail/pickup-message（本機可通）；
- * fulfillment-messages 常被 541，只作 fallback。
+ * 優先 retail/pickup-message；
+ * 541/403/429 唔好打 fulfillment（只會加倍觸發封鎖）。
+ * 其他錯誤／空 stores 先 fallback。
  */
 export async function fetchFulfillmentStores(
   sku: string
@@ -601,11 +650,19 @@ export async function fetchFulfillmentStores(
     const rows = await fetchPickupMessageStores(sku);
     if (rows.length) return rows;
   } catch (err) {
+    const status = (err as { status?: number }).status;
     console.warn(
       `[promax-pickup] pickup-message failed for ${sku}: ${
         err instanceof Error ? err.message : String(err)
-      } — try fulfillment-messages`
+      }` +
+        (status === 429 || status === 403 || status === 541
+          ? " — skip fulfillment fallback"
+          : " — try fulfillment-messages")
     );
+    if (status === 429 || status === 403 || status === 541) {
+      tripEdgeBlock(status, "pickup-message");
+      throw err;
+    }
   }
   return fetchFulfillmentMessagesStores(sku);
 }
@@ -828,11 +885,29 @@ function buildStatus(partial: {
 
 export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
   state.lastAttemptAt = new Date().toISOString();
+
+  const coolRem = edgeBlockRemainingMs();
+  if (coolRem > 0) {
+    state.lastError = `edge_cooldown ${Math.ceil(coolRem / 1000)}s (Apple 541/403/429)`;
+    rescheduleOverrideMs = coolRem + randomBetween(5_000, 20_000);
+    console.warn(
+      `[promax-pickup] skip poll — edge cooldown ${Math.ceil(coolRem / 1000)}s`
+    );
+    await notifyEdgeCooldown(state.lastError);
+    const status = buildStatus({
+      matrix: state.latest?.matrix || [],
+      rowsInLastPoll: 0,
+    });
+    state.latest = status;
+    return status;
+  }
+
   const skus = await loadSkuMap();
   const matrix: MatrixEntry[] = [];
   const collectionRows: PromaxStockRow[] = [];
   const ts = state.lastAttemptAt;
   let blocked = 0;
+  let abortEdge = false;
 
   for (const item of skus) {
     const entry: MatrixEntry = {
@@ -841,6 +916,10 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
       storage: item.storage,
       stores: emptyStoreCells(),
     };
+    if (abortEdge) {
+      matrix.push(entry);
+      continue;
+    }
     try {
       const appleStores = await fetchFulfillmentStores(item.sku);
       for (const a of appleStores) {
@@ -863,15 +942,20 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
       }
       // SKU 之間間隔：hot 較短；idle 稍鬆
       const gap = state.anyInStock
-        ? randomBetween(200, 450)
-        : randomBetween(350, 700);
+        ? randomBetween(250, 550)
+        : randomBetween(400, 800);
       await sleep(gap);
     } catch (err) {
       const status = (err as { status?: number }).status;
-      if (status === 429 || status === 403 || status === 541) blocked += 1;
+      if (status === 429 || status === 403 || status === 541) {
+        blocked += 1;
+        tripEdgeBlock(status, `${item.storage}/${item.color}`);
+        abortEdge = true;
+      }
       state.lastError = err instanceof Error ? err.message : String(err);
       console.warn(
-        `[promax-pickup] ${item.storage}/${item.color} (${item.sku}) failed: ${state.lastError}`
+        `[promax-pickup] ${item.storage}/${item.color} (${item.sku}) failed: ${state.lastError}` +
+          (abortEdge ? " — abort remaining SKUs this poll" : "")
       );
     }
     matrix.push(entry);
@@ -883,6 +967,7 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
     state.consecutiveFailures = 0;
     state.lastSuccessAt = ts;
     state.lastError = null;
+    edgeBlockedUntil = 0;
     await appendCollection(collectionRows);
     newRestockEvents = detectRestockEvents(matrix, ts);
     await appendRestockEvents(newRestockEvents);
@@ -891,8 +976,15 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
     );
   } else {
     state.consecutiveFailures += 1;
-    if (blocked > 0 && !state.lastError) {
-      state.lastError = `blocked_or_empty (http 429/403/541 x${blocked})`;
+    if (blocked > 0) {
+      state.lastError =
+        state.lastError ||
+        `blocked_or_empty (http 429/403/541 x${blocked})`;
+      const rem = edgeBlockRemainingMs();
+      if (rem > 0) {
+        rescheduleOverrideMs = rem + randomBetween(5_000, 20_000);
+        await notifyEdgeCooldown(state.lastError);
+      }
     } else if (!state.lastError) {
       state.lastError = "no store rows matched in this poll";
     }
@@ -976,6 +1068,15 @@ async function loadLatestFromDisk(): Promise<void> {
       (parsed.matrix || []).some((e) =>
         (e.stores || []).some((c) => isAvailableDisplay(c.pickup_display))
       );
+    // 重啟時若上次係 541／封鎖，先冷卻再打，避免一開機繼續狂撞
+    if (
+      /541|403|429|edge_cooldown|blocked/i.test(String(parsed.last_error || ""))
+    ) {
+      edgeBlockedUntil = Date.now() + EDGE_COOLDOWN_MS;
+      console.warn(
+        `[promax-pickup] restored edge cooldown ${Math.round(EDGE_COOLDOWN_MS / 60_000)}m from last_error`
+      );
+    }
   } catch {
     /* first run */
   }

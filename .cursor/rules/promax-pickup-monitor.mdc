@@ -58,9 +58,10 @@ GET …/fulfillment-messages?…&location=HK
 - Dashboard `listen` 後 `startPromaxPickupMonitor({ runImmediately: true })`
 - **自適應間隔**：
   - `idle`（全無貨）：約 **45–60s**（捉補貨）
-  - `hot`（有至少一款有貨）：約 **15–25s**（捉售罄時長）
-  - 可 `.env` 覆寫：`PROMAX_POLL_IDLE_MIN_MS` / `IDLE_MAX` / `HOT_MIN` / `HOT_MAX`
+  - `hot`（有至少一款有貨）：約 **25–40s**（太密易 541）
+  - 可 `.env` 覆寫：`PROMAX_POLL_IDLE_MIN_MS` / `IDLE_MAX` / `HOT_MIN` / `HOT_MAX` / `PROMAX_EDGE_COOLDOWN_MS`
   - 連續失敗 ≥2 → backoff（最多約 15 分鐘）
+- **HTTP 541/403/429 熔斷**：停打約 12 分鐘、同一輪 abort 其餘 SKU、541 唔再打 fulfillment fallback；Telegram 報「冷卻中」而非狂 auto-heal
 - SKU 之間 sleep：idle ~350–700ms；hot ~200–450ms
 - `sold_out` 帶 `inStockForMs` / `inStockForLabel`（由首次有貨→全無貨）
 - **健康監控**：連續失敗≥3／成功數據超過 ~8 分鐘／rows 長期偏少／輪詢卡住 → Telegram `auto_heal`（自動縮短間隔重試最多 3 次）→ 仍失敗則 `needs_fix`；恢復則 `recovered`
