@@ -22,6 +22,26 @@ function escapeMd(s: string): string {
   return String(s || "").replace(/([_*`\[\]])/g, "\\$1");
 }
 
+/** ISO／可 parse 時間 → 香港時間（Telegram 顯示用） */
+function formatHkDisplay(isoOrDate: string | null | undefined): string {
+  const raw = String(isoOrDate || "").trim();
+  if (!raw || raw === "—") return "—";
+  const ms = Date.parse(raw);
+  if (!Number.isFinite(ms)) return raw;
+  return (
+    new Intl.DateTimeFormat("zh-HK", {
+      timeZone: "Asia/Hong_Kong",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).format(new Date(ms)) + " HKT"
+  );
+}
+
 /** 顏色 → 相近色 emoji（放喺型號／顏色後面） */
 function colorLogo(color: string): string {
   const c = String(color || "");
@@ -225,7 +245,7 @@ export async function upsertPromaxTelegramStatus(
   const lines: string[] = [
     "*iPhone 18 Pro Max 門市監控*",
     `狀態：${status.running ? "ON" : "OFF"} · ${formatMonitorModeLine(mode).replace(/^監控模式：/, "")}` +
-      ` · 成功：${escapeMd(status.last_success_at || "—")}`,
+      ` · 成功：${escapeMd(formatHkDisplay(status.last_success_at))}`,
     `模式一覽：hot（補貨時段／有貨）｜peak（時段外疏掃） ← 而家 *${escapeMd(mode)}*`,
     formatMonitorProxyLine(proxySt),
   ];
@@ -389,7 +409,7 @@ export async function notifyPromaxHealthAlert(
     lines.push(`錯誤：${escapeMd(String(alert.lastError).slice(0, 160))}`);
   }
   if (alert.lastSuccessAt) {
-    lines.push(`上次成功：${escapeMd(alert.lastSuccessAt)}`);
+    lines.push(`上次成功：${escapeMd(formatHkDisplay(alert.lastSuccessAt))}`);
   }
   if (alert.consecutiveFailures != null) {
     lines.push(`連續失敗：${alert.consecutiveFailures}`);
