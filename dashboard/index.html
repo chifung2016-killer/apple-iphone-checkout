@@ -438,15 +438,10 @@
       border-color: var(--warn);
       color: #1a1208;
     }
-    .monitor-mode-chip[data-mode="quiet"].is-active {
+    .monitor-mode-chip[data-mode="peak"].is-active {
       background: #2a3540;
       border-color: #5a7a90;
       color: #c5d8e8;
-    }
-    .monitor-mode-chip[data-mode="learning"].is-active {
-      background: #3a3550;
-      border-color: #8b7ec8;
-      color: #e4dff5;
     }
     .orders { display: flex; flex-direction: column; gap: 10px; }
     .card-limits-head {
@@ -634,7 +629,7 @@
               <button type="button" class="btn-primary btn-sm" id="btnSaveMonitorProxy">Save</button>
             </div>
             <p class="hint" style="margin:6px 0 0">
-              同結帳池<strong>分開</strong>。監控打到 541 會暫時 ban 呢條並轉下一條。香港住宅／ISP HTTP proxy 通常得。
+              同<strong>結帳 Proxy</strong>分開，只畀 Pro Max 門市監控用。打到 541 會暫時 ban 呢條並轉下一條。香港住宅／ISP HTTP proxy 通常得；留空＝本機 IP。
               <span id="monitorProxySaveMeta">—</span>
             </p>
           </div>
@@ -668,25 +663,34 @@
             <button type="button" class="btn-ghost" id="btnAdd">Add 1 browser</button>
           </div>
           <p class="hint" id="monitorHint" style="margin-top:10px">
-            <b>iPhone 18 Pro Max 門市庫存</b>會喺開 Dashboard 後自動背景監控（256／512 × 四色 × 6 店）。
-            <strong>唔使開瀏覽器</strong>。兩種模式：
-            <b>hot</b>＝已知會補貨嘅時間（預設約 07:30–19:00／學到嘅窗）或門市有貨 · ~90–150s（有貨 ~25–40s）·
-            <b>peak</b>＝呢段時間之外 · ~6–10 分疏掃（減 541）。
+            <b>iPhone 18 Pro Max 門市庫存</b>：開 Dashboard 後自動背景監控（256／512GB × 四色 × 香港 6 店）。
+            <strong>唔使開瀏覽器、唔使撳 Start</strong>。
+          </p>
+          <p class="hint" style="margin-top:4px">
+            <b>hot</b>＝已知會補貨嘅時間 Range（學習期預設約 <b>07:30–19:00</b>，之後跟學到嘅窗；門市有貨時亦會 hot）·
+            時段內約 <b>90–150 秒</b> 一輪；有貨時加密至約 <b>25–40 秒</b>（捉售罄）。
+            <br />
+            <b>peak</b>＝呢段時間之外 · 約 <b>6–10 分鐘</b> 疏掃，減低 Apple 541／封鎖。
+            <br />
+            湊夠約 <b>3 個唔同日</b> 有 Pro Max 補貨樣本後，會收窄 hot 時段；Telegram 會提示模式切換。
           </p>
           <div class="meta" id="monitorMeta" style="margin-top:8px">
-            <span>Auto monitor: <b id="monitorState">—</b></span>
+            <span>監控狀態: <b id="monitorState">—</b></span>
             <span>有貨 SKU: <b id="monitorStockTotal">—</b></span>
             <span id="monitorSkuLine"></span>
           </div>
           <div id="monitorModeBar" class="monitor-mode-bar" style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:center" aria-label="監控模式">
-            <span class="monitor-mode-chip" data-mode="hot" title="已知補貨時段／有貨">hot</span>
-            <span class="monitor-mode-chip" data-mode="peak" title="時段外疏掃 · ~6–10分">peak</span>
+            <span class="monitor-mode-chip" data-mode="hot" title="已知補貨時段／門市有貨 · 較密">hot · 補貨時段</span>
+            <span class="monitor-mode-chip" data-mode="peak" title="時段外 · 約 6–10 分鐘疏掃">peak · 時段外</span>
           </div>
           <p class="hint" id="monitorScheduleLine" style="margin-top:6px"></p>
           <div class="restock-history" style="margin-top:12px">
             <div class="restock-history-head">
               <h3 style="margin:0 0 6px;font-size:0.95rem">Live 補貨紀錄</h3>
-              <p class="hint" style="margin:0">自動監控寫入：補貨時間、型號、顏色、容量；門市格式 <b>IFC (有) · TST (0) · CWB (有)</b>（最新喺上）。</p>
+              <p class="hint" style="margin:0">
+                監控偵測到變化先寫：補貨上架／售罄、型號、顏色、容量；門市例如
+                <b>IFC (有) · TST (0) · CWB (有)</b>。售罄會顯示在架時長。最新喺上；同步 Telegram。
+              </p>
             </div>
             <div class="card-limits-wrap restock-wrap" style="max-height:260px;margin-top:8px">
               <table class="card-limits" id="restockHistoryTable">
@@ -701,7 +705,7 @@
                   </tr>
                 </thead>
                 <tbody id="restockHistoryBody">
-                  <tr><td colspan="6" class="empty">未有補貨紀錄。Dashboard 開住會自動監控；有貨變化會即時顯示。</td></tr>
+                  <tr><td colspan="6" class="empty">未有補貨紀錄。監控開住；hot 時段較密、peak 時段外較疏；有貨／售罄會即時顯示並推 Telegram。</td></tr>
                 </tbody>
               </table>
             </div>
@@ -1967,7 +1971,7 @@
       const list = Array.isArray(events) ? events : [];
       if (!list.length) {
         body.innerHTML =
-          '<tr><td colspan="6" class="empty">未有補貨紀錄。Dashboard 開住會自動監控；有貨變化會即時顯示。</td></tr>';
+          '<tr><td colspan="6" class="empty">未有補貨紀錄。監控開住；hot 時段較密、peak 時段外較疏；有貨／售罄會即時顯示並推 Telegram。</td></tr>';
         return;
       }
       body.innerHTML = list
@@ -2021,6 +2025,12 @@
         .join("");
     }
 
+    function formatNextPollLabel(sec) {
+      if (sec == null || !Number.isFinite(sec)) return null;
+      if (sec >= 120) return `下一次 ~${Math.round(sec / 60)} 分`;
+      return `下一次 ~${sec}s`;
+    }
+
     function applyMonitorUI(mon) {
       if (!$("monitorState")) return;
       const running = Boolean(mon?.running);
@@ -2037,14 +2047,21 @@
           : px?.next_poll_in_ms != null
             ? Math.round(Number(px.next_poll_in_ms) / 1000)
             : null;
+      const nextLabel = formatNextPollLabel(nextSec);
+      const modeLabel =
+        pollMode === "hot"
+          ? "hot（補貨時段／有貨）"
+          : pollMode === "peak"
+            ? "peak（時段外疏掃）"
+            : pollMode;
 
       $("monitorState").textContent = !running
         ? "off"
         : err
-          ? `ON · ${pollMode}（${String(err).slice(0, 36)}）`
-          : nextSec != null
-            ? `ON · ${pollMode}（下一次 ~${nextSec}s）`
-            : `ON · ${pollMode}`;
+          ? `ON · ${modeLabel}（${String(err).slice(0, 36)}）`
+          : nextLabel
+            ? `ON · ${modeLabel} · ${nextLabel}`
+            : `ON · ${modeLabel}`;
 
       document.querySelectorAll(".monitor-mode-chip").forEach((el) => {
         el.classList.toggle(
@@ -2059,18 +2076,22 @@
           ? sched.peakWindows.join(" · ")
           : "";
         const samples =
-          sched?.restockSamples != null ? `補貨 ${sched.restockSamples} 次` : "";
+          sched?.restockSamples != null
+            ? `已錄補貨 ${sched.restockSamples} 次`
+            : "";
         const days =
           sched?.sampleDays != null && sched?.minSampleDays != null
-            ? `日數 ${sched.sampleDays}/${sched.minSampleDays}${
-                sched.graduated ? "（已畢業）" : "（學習中）"
+            ? `學習進度 ${sched.sampleDays}/${sched.minSampleDays} 日${
+                sched.graduated
+                  ? "（已收窄時段）"
+                  : "（未夠日數，hot 窗保持較闊）"
               }`
             : sched?.sampleDays != null
-              ? `日數 ${sched.sampleDays}`
+              ? `學習日數 ${sched.sampleDays}`
               : "";
         const reason = sched?.reason ? String(sched.reason) : "";
         const bits = [
-          peaks ? `補貨時段（HK）：${peaks}` : "",
+          peaks ? `hot 時段（HK）：${peaks}` : "",
           days,
           samples,
           reason,
