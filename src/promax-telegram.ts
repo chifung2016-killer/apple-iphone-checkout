@@ -417,7 +417,37 @@ export type PromaxHealthAlert = {
 let lastHealthAlertAt = 0;
 let lastHealthAlertKind: string | null = null;
 
-/** 監控失效／自動修復／恢復 → Telegram（節流，避免洗版） */
+/** 今次 Dashboard／Script 啟動後，第一次成功輪詢 */
+export async function notifyPromaxScriptReady(opts: {
+  rowsInLastPoll: number;
+  lastSuccessAt?: string | null;
+  pollMode?: string | null;
+  proxy?: {
+    activeDisplay?: string | null;
+    activeFull?: string | null;
+    count?: number;
+    banned?: number;
+    mode?: string | null;
+  };
+}): Promise<void> {
+  const creds = telegramCreds();
+  if (!creds) return;
+  const lines = [
+    "*✅ 監控 Script 已更新，第一次成功*",
+    formatRowsLine(opts.rowsInLastPoll) || `今次 rows：${opts.rowsInLastPoll}／48`,
+    formatMonitorModeLine(opts.pollMode),
+    formatMonitorProxyLine(opts.proxy),
+  ];
+  if (opts.lastSuccessAt) {
+    lines.push(`成功時間：${escapeMd(formatHkDisplay(opts.lastSuccessAt))}`);
+  }
+  await tgApi(creds.token, "sendMessage", {
+    chat_id: creds.chatId,
+    text: lines.join("\n"),
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+  });
+}
 export async function notifyPromaxHealthAlert(
   alert: PromaxHealthAlert
 ): Promise<void> {

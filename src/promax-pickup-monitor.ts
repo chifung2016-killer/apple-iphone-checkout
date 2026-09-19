@@ -20,6 +20,7 @@ import {
   formatMonitorProxyLine,
   notifyPromaxHealthAlert,
   notifyPromaxModeChange,
+  notifyPromaxScriptReady,
   notifyPromaxTelegram,
   upsertPromaxTelegramStatus,
 } from "./promax-telegram.js";
@@ -275,6 +276,8 @@ let healthWatchdog: ReturnType<typeof setInterval> | null = null;
 let wasUnhealthy = false;
 /** 曾經失效／自動修復；下次成功輪詢要推 Telegram「修復完成」 */
 let awaitingRecoveryNotice = false;
+/** 呢次 process 已推過「Script 更新後第一次成功」 */
+let announcedScriptReady = false;
 let autoHealAttempts = 0;
 let softLowRowStreak = 0;
 /** 自動修復時覆寫下一次間隔（ms） */
@@ -569,6 +572,20 @@ async function evaluateHealthAfterPoll(rows: number): Promise<void> {
           : "監控修復完成，已恢復正常",
       lastSuccessAt: state.lastSuccessAt,
       rowsInLastPoll: rows,
+      pollMode: currentPollMode(),
+      proxy: telegramProxyOpts(),
+    }).catch(() => {});
+  }
+
+  if (
+    !announcedScriptReady &&
+    rows >= EXPECTED_ROWS_SOFT &&
+    state.consecutiveFailures === 0
+  ) {
+    announcedScriptReady = true;
+    void notifyPromaxScriptReady({
+      rowsInLastPoll: rows,
+      lastSuccessAt: state.lastSuccessAt,
       pollMode: currentPollMode(),
       proxy: telegramProxyOpts(),
     }).catch(() => {});
