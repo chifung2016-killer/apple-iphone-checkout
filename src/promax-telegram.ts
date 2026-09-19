@@ -116,11 +116,19 @@ export async function upsertPromaxTelegramStatus(
   const creds = telegramCreds();
   if (!creds) return;
 
+  const modeHelp: Record<string, string> = {
+    peak: "補貨時段 · ~45–60s",
+    hot: "有貨加密 · ~25–40s",
+    learning: "學習中 · ~60–90s",
+    quiet: "非時段疏掃 · ~12–18分（減 541）",
+  };
+  const mode = String(status.poll_mode || "—");
   const lines: string[] = [
     "*iPhone 18 Pro Max 門市監控*",
-    `狀態：${status.running ? "ON" : "OFF"} · 模式：${escapeMd(
-      status.poll_mode || "—"
-    )} · 成功：${escapeMd(status.last_success_at || "—")}`,
+    `狀態：${status.running ? "ON" : "OFF"} · *${escapeMd(mode)}*` +
+      (modeHelp[mode] ? `（${escapeMd(modeHelp[mode])}）` : "") +
+      ` · 成功：${escapeMd(status.last_success_at || "—")}`,
+    `模式一覽：peak｜hot｜learning｜quiet ← 而家 *${escapeMd(mode)}*`,
   ];
   if (status.schedule?.peakWindows?.length) {
     lines.push(

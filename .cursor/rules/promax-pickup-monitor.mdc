@@ -65,7 +65,7 @@ GET …/fulfillment-messages?…&location=HK
 - **HTTP 541/403/429 熔斷**：停打約 12 分鐘、同一輪 abort 其餘 SKU、541 唔再打 fulfillment fallback；Telegram 報「冷卻中」而非狂 auto-heal
 - SKU 之間 sleep：idle ~350–700ms；hot ~200–450ms
 - `sold_out` 帶 `inStockForMs` / `inStockForLabel`（由首次有貨→全無貨）
-- **時段學習**：讀 `restock-history.jsonl` 嘅 `restock` 時間（HK）→ peak 窗口；peak 內密輪詢（45–60s），quiet 疏（12–18 分），有貨仍 hot（25–40s）。樣本不足時用預設 08–12／14–19 + learning 3–5 分。快照：`runtime/promax-schedule.json`
+- **時段學習**：讀 `restock-history.jsonl` 嘅 `restock` 時間（HK）→ peak 窗口；peak 內密輪詢（45–60s），quiet 疏（12–18 分），learning（60–90s），有貨仍 hot（25–40s）。樣本不足時用預設 08–12／14–19。快照：`runtime/promax-schedule.json`
 - 成功：`last_success_at` 更新、`consecutive_failures=0`、寫 jsonl；快照含 `prev_available` / `available_since`（重啟唔當補貨、可續計時長）
 - 失敗：保留舊 `last_success_at`；API 仍回 matrix（可能全 null）+ `last_error`
 - 前端用 **`last_success_at`** 判斷新唔新鮮，唔好當「有 matrix 就係新數據」

@@ -2256,6 +2256,10 @@ async function snapshot() {
       status: {
         mode: "promax-pickup",
         product: promax.product,
+        pollMode: promax.poll_mode,
+        schedule: promax.schedule || null,
+        pollIntervalMs: promax.poll_interval_ms,
+        nextPollInMs: promax.next_poll_in_ms,
         lastSuccessAt: promax.last_success_at,
         lastError: promax.last_error,
         consecutiveFailures: promax.consecutive_failures,

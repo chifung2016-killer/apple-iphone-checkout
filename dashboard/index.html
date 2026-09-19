@@ -411,6 +411,43 @@
       flex: 0 1 auto;
     }
     .hint { color: var(--muted); font-size: 0.8rem; margin: -6px 0 12px; }
+    .monitor-mode-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: var(--field);
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      text-transform: lowercase;
+      opacity: 0.55;
+    }
+    .monitor-mode-chip.is-active {
+      opacity: 1;
+      border-color: var(--accent);
+      color: var(--accent-ink);
+      background: var(--accent);
+      box-shadow: 0 0 0 1px rgba(196, 240, 77, 0.25);
+    }
+    .monitor-mode-chip[data-mode="hot"].is-active {
+      background: var(--warn);
+      border-color: var(--warn);
+      color: #1a1208;
+    }
+    .monitor-mode-chip[data-mode="quiet"].is-active {
+      background: #2a3540;
+      border-color: #5a7a90;
+      color: #c5d8e8;
+    }
+    .monitor-mode-chip[data-mode="learning"].is-active {
+      background: #3a3550;
+      border-color: #8b7ec8;
+      color: #e4dff5;
+    }
     .orders { display: flex; flex-direction: column; gap: 10px; }
     .card-limits-head {
       display: flex; justify-content: space-between; align-items: end;
@@ -631,14 +668,25 @@
             <button type="button" class="btn-ghost" id="btnAdd">Add 1 browser</button>
           </div>
           <p class="hint" id="monitorHint" style="margin-top:10px">
-            <b>iPhone 18 Pro Max 門市庫存</b>會喺開 Dashboard 後自動背景監控（256GB／512GB × 全部顏色 × 香港 6 間 Apple Store）。
-            <strong>唔使開瀏覽器</strong>；約每 90–120 秒輪詢一次。偵測到門市由無貨→有貨會寫入下方 Live 補貨紀錄。
+            <b>iPhone 18 Pro Max 門市庫存</b>會喺開 Dashboard 後自動背景監控（256／512 × 四色 × 6 店）。
+            <strong>唔使開瀏覽器</strong>。四種模式：
+            <b>peak</b> 補貨時段密掃（~45–60s）·
+            <b>hot</b> 有貨加密（~25–40s）·
+            <b>learning</b> 樣本未夠、跟預設時段（~60–90s）·
+            <b>quiet</b> 非時段疏掃（~12–18 分，減 541，唔係停機）。
           </p>
           <div class="meta" id="monitorMeta" style="margin-top:8px">
             <span>Auto monitor: <b id="monitorState">—</b></span>
             <span>有貨 SKU: <b id="monitorStockTotal">—</b></span>
             <span id="monitorSkuLine"></span>
           </div>
+          <div id="monitorModeBar" class="monitor-mode-bar" style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:center" aria-label="監控模式">
+            <span class="monitor-mode-chip" data-mode="peak" title="學到嘅補貨時段內 · ~45–60s">peak</span>
+            <span class="monitor-mode-chip" data-mode="hot" title="門市有貨 · ~25–40s">hot</span>
+            <span class="monitor-mode-chip" data-mode="learning" title="樣本不足 · ~60–90s">learning</span>
+            <span class="monitor-mode-chip" data-mode="quiet" title="非補貨時段 · ~12–18分">quiet</span>
+          </div>
+          <p class="hint" id="monitorScheduleLine" style="margin-top:6px"></p>
           <div class="restock-history" style="margin-top:12px">
             <div class="restock-history-head">
               <h3 style="margin:0 0 6px;font-size:0.95rem">Live 補貨紀錄</h3>
@@ -1981,12 +2029,50 @@
       if (!$("monitorState")) return;
       const running = Boolean(mon?.running);
       const st = mon?.status;
-      const err = st?.lastError || mon?.promax?.last_error;
-      $("monitorState").textContent = running
-        ? err
-          ? `ON（輪詢中／${String(err).slice(0, 42)}）`
-          : "ON（自動）"
-        : "off";
+      const px = mon?.promax;
+      const err = st?.lastError || px?.last_error;
+      const pollMode = String(
+        st?.pollMode || px?.poll_mode || (running ? "—" : "off")
+      ).toLowerCase();
+      const sched = st?.schedule || px?.schedule || null;
+      const nextSec =
+        st?.nextPollInMs != null
+          ? Math.round(Number(st.nextPollInMs) / 1000)
+          : px?.next_poll_in_ms != null
+            ? Math.round(Number(px.next_poll_in_ms) / 1000)
+            : null;
+
+      $("monitorState").textContent = !running
+        ? "off"
+        : err
+          ? `ON · ${pollMode}（${String(err).slice(0, 36)}）`
+          : nextSec != null
+            ? `ON · ${pollMode}（下一次 ~${nextSec}s）`
+            : `ON · ${pollMode}`;
+
+      document.querySelectorAll(".monitor-mode-chip").forEach((el) => {
+        el.classList.toggle(
+          "is-active",
+          running && el.getAttribute("data-mode") === pollMode
+        );
+      });
+
+      const schedLine = $("monitorScheduleLine");
+      if (schedLine) {
+        const peaks = Array.isArray(sched?.peakWindows)
+          ? sched.peakWindows.join(" · ")
+          : "";
+        const samples =
+          sched?.restockSamples != null ? `樣本 ${sched.restockSamples}` : "";
+        const reason = sched?.reason ? String(sched.reason) : "";
+        const bits = [
+          peaks ? `補貨時段（HK）：${peaks}` : "",
+          samples,
+          reason,
+        ].filter(Boolean);
+        schedLine.textContent = bits.join(" · ") || "";
+      }
+
       const total = st?.totalAvailableStock;
       $("monitorStockTotal").textContent =
         total == null ? "—" : String(total);

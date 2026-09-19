@@ -218,8 +218,8 @@ function buildSnapshot(fallbackMode: ScheduleMode): ScheduleSnapshot {
   if (learning) {
     mode = peak ? "peak" : "learning";
     reason = peak
-      ? `學習中（${sampleCount} 次補貨）· 預設／已知時段內`
-      : `學習中（${sampleCount}/${MIN_SAMPLES} 次補貨）· 疏輪詢`;
+      ? `學習中（${sampleCount} 次補貨）· 預設／已知時段內 · ~60–90s`
+      : `學習中（${sampleCount}/${MIN_SAMPLES} 次補貨）· ~60–90s`;
   } else if (peak) {
     mode = "peak";
     reason = "喺學習到嘅補貨時段內 · 密輪詢";
@@ -275,13 +275,13 @@ export function getCachedSchedule(): ScheduleSnapshot | null {
 
 /**
  * 依 schedule 回輪詢間隔範圍 [min,max] ms
- * quiet：12–18 分；learning 非 peak：3–5 分；peak/hot 由 caller 用 IDLE/HOT
+ * quiet：12–18 分；learning：60–90 秒（學時段期間都要夠密）；peak/hot 由 caller 用 IDLE/HOT
  */
 export function scheduleIntervalRange(
   mode: ScheduleMode
 ): { min: number; max: number } | null {
   if (mode === "quiet") return { min: 12 * 60_000, max: 18 * 60_000 };
-  if (mode === "learning") return { min: 3 * 60_000, max: 5 * 60_000 };
+  if (mode === "learning") return { min: 60_000, max: 90_000 };
   return null; // peak/hot → 用原本 IDLE/HOT
 }
 

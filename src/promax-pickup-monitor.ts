@@ -355,9 +355,11 @@ function computeNextIntervalMs(failures: number): number {
   max = Math.max(min, max);
   const base = randomBetween(min, max);
   const jitter =
-    sched.mode === "quiet" || sched.mode === "learning"
+    sched.mode === "quiet"
       ? randomBetween(-60_000, 60_000)
-      : randomBetween(-JITTER_MS, JITTER_MS);
+      : sched.mode === "learning"
+        ? randomBetween(-10_000, 10_000)
+        : randomBetween(-JITTER_MS, JITTER_MS);
   let ms = Math.max(10_000, base + jitter);
   if (failures >= 2) {
     const mult = Math.min(2 ** (failures - 1), 16);
@@ -381,7 +383,7 @@ function diagnoseUnhealthy(): { unhealthy: boolean; reason: string } | null {
     sched.mode === "quiet"
       ? 45 * 60_000
       : sched.mode === "learning"
-        ? 20 * 60_000
+        ? 8 * 60_000
         : STALE_SUCCESS_MS;
   if (state.lastSuccessAt) {
     const age = Date.now() - Date.parse(state.lastSuccessAt);
