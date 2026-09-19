@@ -164,6 +164,7 @@ export type PromaxPickupStatus = {
   /** Telegram／UI：而家監控 proxy（已遮罩帳密） */
   monitor_proxy?: {
     activeDisplay: string;
+    activeFull: string;
     count: number;
     banned: number;
     mode: "proxy" | "local";
@@ -357,6 +358,7 @@ function currentPollMode(): PromaxPickupStatus["poll_mode"] {
 
 function telegramProxyOpts(): {
   activeDisplay: string;
+  activeFull: string;
   count: number;
   banned: number;
   mode: "proxy" | "local";
@@ -364,6 +366,7 @@ function telegramProxyOpts(): {
   const st = getMonitorProxyStatus();
   return {
     activeDisplay: st.activeDisplay,
+    activeFull: st.activeFull,
     count: st.count,
     banned: st.banned,
     mode: st.mode,

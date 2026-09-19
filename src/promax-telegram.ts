@@ -51,22 +51,27 @@ export function formatMonitorModeLine(mode: string | null | undefined): string {
     : `監控模式：*${escapeMd(m)}*`;
 }
 
-/** Telegram 用：遮罩帳密，只顯示 host:port */
+/** Telegram 用：顯示完整 active proxy（可含帳密） */
 export function formatMonitorProxyLine(opts?: {
   activeDisplay?: string | null;
+  activeFull?: string | null;
   count?: number;
   banned?: number;
   mode?: string | null;
 }): string {
-  const active = opts?.activeDisplay || "本機 IP";
+  const active =
+    String(opts?.activeFull || "").trim() ||
+    String(opts?.activeDisplay || "").trim() ||
+    "本機 IP";
   const count = opts?.count ?? 0;
   const banned = opts?.banned ?? 0;
   const mode = opts?.mode || (count > 0 ? "proxy" : "local");
   if (mode === "local" || count <= 0) {
-    return `監控 Proxy：*本機 IP*`;
+    return "監控 Proxy：本機 IP";
   }
+  // Markdown：escape 特殊字元，整條完整顯示
   return (
-    `監控 Proxy：*${escapeMd(active)}*` +
+    `監控 Proxy：${escapeMd(active)}` +
     `（池 ${count} 條` +
     (banned > 0 ? ` · 暫 ban ${banned}` : "") +
     `）`
@@ -206,6 +211,7 @@ export async function upsertPromaxTelegramStatus(
       const p = (status as PromaxPickupStatus & {
         monitor_proxy?: {
           activeDisplay?: string;
+          activeFull?: string;
           count?: number;
           banned?: number;
           mode?: string;

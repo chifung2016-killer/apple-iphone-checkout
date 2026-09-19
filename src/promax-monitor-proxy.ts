@@ -109,7 +109,10 @@ export function getMonitorProxyPoolText(): string {
 export function getMonitorProxyStatus(): {
   count: number;
   active: string | null;
+  /** 遮罩版（log／Dashboard） */
   activeDisplay: string;
+  /** 完整字串（Telegram，含帳密） */
+  activeFull: string;
   banned: number;
   bannedDisplay: string[];
   mode: "proxy" | "local";
@@ -119,6 +122,7 @@ export function getMonitorProxyStatus(): {
     count: pool.length,
     active: activeRaw,
     activeDisplay: redactProxyForDisplay(activeRaw),
+    activeFull: activeRaw?.trim() || "本機 IP",
     banned: [...bannedUntil.keys()].length,
     bannedDisplay: [...bannedUntil.keys()].map(redactProxyForDisplay),
     mode: pool.length > 0 ? "proxy" : "local",
