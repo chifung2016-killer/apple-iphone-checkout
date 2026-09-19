@@ -632,6 +632,33 @@ function killAddOrderTask(id: string) {
   if (t?.child) killProc(t.child);
 }
 
+function promaxBuyUrl(storage: string, color: string): string {
+  const gb = /512/i.test(storage) ? "512gb" : "256gb";
+  return `https://www.apple.com/hk-zh/shop/buy-iphone/iphone-18-pro/${encodeURI(`6.9-吋顯示器-${gb}-${color}`)}`;
+}
+
+function pickRestockTarget(
+  restocks: Array<{
+    model?: string;
+    color?: string;
+    storage?: string;
+    name?: string;
+    stockQty?: number;
+    storeStocks?: Array<{ code?: string; name?: string; available?: boolean }>;
+  }>
+) {
+  const wantColor = String(lastFormConfig.color || "").replace(/\s+/g, "");
+  const wantStorage = String(lastFormConfig.storage || "").replace(/\s+/g, "").toLowerCase();
+  const norm = (s: unknown) => String(s || "").replace(/\s+/g, "");
+  const exact = restocks.find(
+    (e) =>
+      norm(e.color) === wantColor &&
+      norm(e.storage).toLowerCase() === wantStorage
+  );
+  const sameColor = restocks.find((e) => norm(e.color) === wantColor);
+  return exact || sameColor || restocks[0];
+}
+
 function defaultConfig() {
   return {
     buyUrl:
@@ -1508,9 +1535,15 @@ async function spawnOneBrowser(
     ...cleanConfig,
     browserCount: 1,
   } as Record<string, unknown> & { browserCount: number };
-  // 只限 pickup credit card 訪客：去到取貨頁就停低，等監控到同色同容量先 refresh、揀店、加車
-  if (String(sessionConfig.fulfillmentPreference || "") === "pickup") {
+  // 只限 pickup credit card 訪客，而且唔係「有貨即刻加車」：先停喺揀門市頁等監控
+  if (
+    String(sessionConfig.fulfillmentPreference || "") === "pickup" &&
+    !sessionConfig.instantBuy
+  ) {
     sessionConfig.holdAtPickupStoresForStock = true;
+  }
+  if (sessionConfig.instantBuy) {
+    sessionConfig.holdAtPickupStoresForStock = false;
   }
   // 多個 proxy：每條最多分配畀 3 個 browser，用滿先換下一條（唔隨機重複）
   const assignedProxy = await pickProxyForNewTask(cleanConfig.proxy);
@@ -1544,7 +1577,9 @@ async function spawnOneBrowser(
   }
   const configPath = path.join(RUNTIME_DIR, `config-${id}.json`);
   await fs.writeFile(configPath, JSON.stringify(sessionConfig, null, 2), "utf8");
-  await fs.writeFile(RUNTIME_CONFIG, JSON.stringify({ ...cleanConfig }, null, 2), "utf8");
+  if (!sessionConfig.instantBuy) {
+    await fs.writeFile(RUNTIME_CONFIG, JSON.stringify({ ...cleanConfig }, null, 2), "utf8");
+  }
   // 清走舊 stop／close／dismiss flag，避免新 session 即刻被殺或唔顯示
   await clearLaunchFlags(id);
   await fs.unlink(path.join(RUNTIME_DIR, "stop-all.flag")).catch(() => {});
@@ -3203,6 +3238,7 @@ server.listen(PORT, "127.0.0.1", () => {
               storage: e.storage,
               name: e.name,
               stockQty: e.stockQty,
+              buyUrl: promaxBuyUrl(String(e.storage || ""), String(e.color || "")),
               stores: (e.storeStocks || [])
                 .filter((s) => s.available)
                 .map((s) => ({
@@ -3230,8 +3266,41 @@ server.listen(PORT, "127.0.0.1", () => {
             )
             .join("；");
           console.log(
-            `[promax-pickup] 有貨 → 通知待命取貨 task refresh／揀店／加車：${labels}`
+            `[promax-pickup] 有貨 → 去該 SKU 網址加車：${labels}`
           );
+          const live = [...sessions.values()].some((s) => s.running);
+          if (live) {
+            console.log("[promax-pickup] 已有結帳瀏覽器，交俾佢跳去有貨 SKU");
+          } else {
+            const target = pickRestockTarget(restocks);
+            const buyUrl = promaxBuyUrl(
+              String(target.storage || ""),
+              String(target.color || "")
+            );
+            console.log(
+              `[promax-pickup] 冇待命瀏覽器 → 即刻開一個：${target.storage} ${target.color} ${buyUrl}`
+            );
+            await spawnOneBrowser({
+              ...lastFormConfig,
+              model: target.model || "iPhone 18 Pro Max",
+              color: target.color,
+              storage: target.storage,
+              buyUrl,
+              fulfillmentPreference: "pickup",
+              holdAtPickupStoresForStock: false,
+              instantBuy: true,
+              preferredStoreCodes: (target.storeStocks || [])
+                .filter((s) => s.available && s.code)
+                .map((s) => String(s.code))
+                .join(","),
+              browserCount: 1,
+              quantity: Number(lastFormConfig.quantity) || 1,
+            }).catch((err) => {
+              console.warn(
+                `[promax-pickup] 即刻加車啟動失敗：${err instanceof Error ? err.message : String(err)}`
+              );
+            });
+          }
         }
         if (events.length) {
           broadcast({ type: "status", state: await snapshot() });

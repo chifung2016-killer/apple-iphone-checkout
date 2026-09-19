@@ -675,6 +675,15 @@ async function loadRuntimeConfig(): Promise<void> {
     ) {
       CONFIG.holdAtPickupStoresForStock = true;
     }
+    const prefStores = (parsed as Record<string, unknown>).preferredStoreCodes;
+    if (typeof prefStores === "string" && prefStores.trim()) {
+      preferredMonitorStoreCodes = new Set(
+        prefStores
+          .split(/[,，]/)
+          .map((s) => s.trim().toUpperCase())
+          .filter(Boolean)
+      );
+    }
     console.log(`已載入 runtime config：${file}`);
     console.log(
       `  ${CONFIG.model} / ${CONFIG.color} / ${CONFIG.storage} ×${CONFIG.quantity}｜${CONFIG.fulfillmentPreference}｜browsers=${CONFIG.browserCount}${
@@ -5699,7 +5708,43 @@ type StockResumeSku = {
   stockQty?: number | null;
   buyQty?: number;
   stores?: Array<{ code?: string; name?: string; available?: boolean }>;
+  buyUrl?: string;
 };
+
+function buyUrlForPromax(storage: string, color: string): string {
+  const gb = /512/i.test(storage) ? "512gb" : "256gb";
+  return `https://www.apple.com/hk-zh/shop/buy-iphone/iphone-18-pro/${encodeURI(`6.9-吋顯示器-${gb}-${color}`)}`;
+}
+
+function chooseRestockSku(payload: StockResumePayload): StockResumeSku | null {
+  const skus = payload.skus || [];
+  if (!skus.length) return null;
+  const exact = skus.find((s) => stockSkuMatchesCheckout(s));
+  if (exact) return exact;
+  const wantColor = normColorKey(CONFIG.color);
+  const sameColor = skus.find(
+    (s) => wantColor && normColorKey(String(s.color || "")) === wantColor
+  );
+  return sameColor || skus[0];
+}
+
+function applyRestockSku(sku: StockResumeSku): void {
+  if (sku.model) CONFIG.model = String(sku.model);
+  if (sku.color) CONFIG.color = String(sku.color);
+  if (sku.storage) CONFIG.storage = String(sku.storage);
+  CONFIG.buyUrl =
+    String(sku.buyUrl || "").trim() ||
+    buyUrlForPromax(CONFIG.storage, CONFIG.color);
+  const codes = new Set<string>();
+  for (const s of sku.stores || []) {
+    const code = String(s.code || "").trim().toUpperCase();
+    if (code && s.available !== false) codes.add(code);
+  }
+  preferredMonitorStoreCodes = codes;
+  console.log(
+    `  改去有貨 SKU：${CONFIG.storage} ${CONFIG.color} ${CONFIG.buyUrl} 門市=${[...codes].join("、") || "?"}`
+  );
+}
 
 type StockResumePayload = {
   atMs: number;
@@ -5821,16 +5866,12 @@ async function waitForMatchingStockResume(opts?: {
     if (deadline != null && Date.now() >= deadline) return null;
 
     const payload = await readStockResumePayload();
-    if (payload && payload.atMs > afterMs) {
-      const matched =
-        payload.skus.length === 0
-          ? false
-          : payload.skus.some((s) => stockSkuMatchesCheckout(s));
-      // 舊格式冇 skus：唔當匹配（避免誤觸）
-      if (matched) {
-        setPreferredStoresFromResume(payload);
+    if (payload && payload.atMs > afterMs && payload.skus.length > 0) {
+      const sku = chooseRestockSku(payload);
+      if (sku) {
+        applyRestockSku(sku);
         console.log(
-          `  收到有貨通知（匹配 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage}）at=${new Date(payload.atMs).toISOString()}`
+          `  收到有貨通知（${CONFIG.storage}／${CONFIG.color}）at=${new Date(payload.atMs).toISOString()}`
         );
         return payload;
       }
@@ -6684,30 +6725,20 @@ async function runMonitorHoldBuyLoop(
     }
 
     lastConsumedAt = pending.atMs;
-    const matchLabel = `${CONFIG.model}／${CONFIG.color}／${CONFIG.storage}`;
-    console.log(`  監控到同 SKU（${matchLabel}）— 即刻 refresh 取貨頁同加車`);
+    const matchLabel = `${CONFIG.storage} ${CONFIG.color}`;
+    console.log(`  監控到有貨（${matchLabel}）— 即刻去該 SKU 網址加車：${CONFIG.buyUrl}`);
     await writeStatus({
       phase: "resuming_after_stock",
-      message: `監控到 ${matchLabel}：即刻 refresh 同加車`,
+      message: `監控到 ${matchLabel}：去產品頁加車`,
     });
-    await reloadFulfillmentInitUntilReady(page);
 
     try {
-      let reachedPay = await attemptPickupCheckoutToPayment(
+      const reachedPay = await attemptFullAddCartToPayment(
         page,
         identity,
         tag,
         session
       );
-      if (!reachedPay) {
-        console.warn(`${tag} 取貨頁加車未到付款 — 改由產品頁完整加購一次…`);
-        reachedPay = await attemptFullAddCartToPayment(
-          page,
-          identity,
-          tag,
-          session
-        );
-      }
       if (reachedPay) {
         console.log(`${tag} 已到付款頁 — 結束取貨頁待命`);
         return;
