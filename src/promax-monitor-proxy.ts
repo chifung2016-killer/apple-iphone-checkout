@@ -63,15 +63,40 @@ export function parseProxyConfig(raw: string): ParsedProxy | null {
   }
 }
 
+export function redactProxyForDisplay(raw: string | null | undefined): string {
+  const s = String(raw || "").trim();
+  if (!s) return "本機 IP";
+  try {
+    const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(s) ? s : `http://${s}`;
+    const u = new URL(withScheme);
+    if (!u.hostname) return "(proxy)";
+    const port =
+      u.port ||
+      (/^socks/i.test(u.protocol)
+        ? "1080"
+        : u.protocol === "https:"
+          ? "443"
+          : "80");
+    const proto = u.protocol.replace(/:$/, "");
+    return `${proto}://${u.hostname}:${port}`;
+  } catch {
+    // 唔好原樣回傳（可能有帳密）
+    return "(proxy)";
+  }
+}
+
 export function setMonitorProxyPool(raw: string): { count: number } {
   pool = parseMonitorProxyPool(raw);
   cursor = 0;
   bannedUntil.clear();
   activeRaw = null;
   void disposePwContext();
+  if (pool.length) {
+    pickMonitorProxy();
+  }
   console.log(
     pool.length
-      ? `[promax-proxy] monitor pool：${pool.length} 條`
+      ? `[promax-proxy] monitor pool：${pool.length} 條｜active=${redactProxyForDisplay(activeRaw)}`
       : `[promax-proxy] monitor pool：本機 IP`
   );
   return { count: pool.length };
@@ -84,14 +109,18 @@ export function getMonitorProxyPoolText(): string {
 export function getMonitorProxyStatus(): {
   count: number;
   active: string | null;
+  activeDisplay: string;
   banned: number;
+  bannedDisplay: string[];
   mode: "proxy" | "local";
 } {
   pruneBans();
   return {
     count: pool.length,
     active: activeRaw,
+    activeDisplay: redactProxyForDisplay(activeRaw),
     banned: [...bannedUntil.keys()].length,
+    bannedDisplay: [...bannedUntil.keys()].map(redactProxyForDisplay),
     mode: pool.length > 0 ? "proxy" : "local",
   };
 }
@@ -124,6 +153,17 @@ export function pickMonitorProxy(): ParsedProxy | null {
   return parseProxyConfig(raw);
 }
 
+/** 下一條 ban 解禁還有幾耐（ms）；有可用 proxy → 0 */
+export function nextMonitorProxyUnbanMs(): number {
+  pruneBans();
+  if (availableProxies().length) return 0;
+  let soonest = 0;
+  for (const until of bannedUntil.values()) {
+    if (!soonest || until < soonest) soonest = until;
+  }
+  return soonest > 0 ? Math.max(0, soonest - Date.now()) : 0;
+}
+
 /** 541/403/429 時暫ban 呢條，換下一條；有得換 → true */
 export function rotateMonitorProxyOnBlock(
   reason: string,
@@ -132,14 +172,16 @@ export function rotateMonitorProxyOnBlock(
   if (activeRaw) {
     bannedUntil.set(activeRaw, Date.now() + banMs);
     console.warn(
-      `[promax-proxy] ban ${activeRaw} ${Math.round(banMs / 60_000)}m｜${reason}`
+      `[promax-proxy] ban ${redactProxyForDisplay(activeRaw)} ${Math.round(banMs / 60_000)}m｜${reason}`
     );
     activeRaw = null;
     void disposePwContext();
   }
   const next = pickMonitorProxy();
   if (next) {
-    console.log(`[promax-proxy] 轉用下一條：${next.raw}`);
+    console.log(
+      `[promax-proxy] 轉用下一條：${redactProxyForDisplay(next.raw)}`
+    );
     return true;
   }
   console.warn(`[promax-proxy] 無剩餘 proxy，之後用本機／等 ban 完`);

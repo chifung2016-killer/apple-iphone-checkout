@@ -17,6 +17,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   hasTelegramCreds,
+  formatMonitorProxyLine,
   notifyPromaxHealthAlert,
   notifyPromaxModeChange,
   notifyPromaxTelegram,
@@ -25,6 +26,7 @@ import {
 import {
   getMonitorProxyStatus,
   monitorFetchGet,
+  nextMonitorProxyUnbanMs,
   rotateMonitorProxyOnBlock,
   setMonitorProxyPool,
 } from "./promax-monitor-proxy.js";
@@ -36,7 +38,11 @@ import {
   type ScheduleSnapshot,
 } from "./promax-schedule.js";
 
-export { setMonitorProxyPool, getMonitorProxyStatus, getMonitorProxyPoolText } from "./promax-monitor-proxy.js";
+export {
+  setMonitorProxyPool,
+  getMonitorProxyStatus,
+  getMonitorProxyPoolText,
+} from "./promax-monitor-proxy.js";
 export type { ScheduleSnapshot };
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -155,6 +161,13 @@ export type PromaxPickupStatus = {
   available_since?: Record<string, string>;
   /** `${sku}|${store_id}` → 上次是否 available（重啟恢復用） */
   prev_available?: Record<string, boolean>;
+  /** Telegram／UI：而家監控 proxy（已遮罩帳密） */
+  monitor_proxy?: {
+    activeDisplay: string;
+    count: number;
+    banned: number;
+    mode: "proxy" | "local";
+  };
 };
 
 type MonitorState = {
@@ -274,23 +287,29 @@ function edgeBlockRemainingMs(): number {
 
 function tripEdgeBlock(status: number, where: string): void {
   if (status !== 429 && status !== 403 && status !== 541) return;
-  // 有其他監控 proxy 可轉 → 短暫停一下就換線，唔使熔斷 12 分鐘
+  // 有其他監控 proxy → 即刻轉線，取消長暫停
   if (rotateMonitorProxyOnBlock(`HTTP ${status} @ ${where}`)) {
-    edgeBlockedUntil = Date.now() + randomBetween(8_000, 15_000);
+    edgeBlockedUntil = 0;
+    rescheduleOverrideMs = randomBetween(2_000, 5_000);
     console.warn(
-      `[promax-pickup] edge HTTP ${status} @ ${where} — rotated monitor proxy, brief pause`
+      `[promax-pickup] edge HTTP ${status} @ ${where} — rotated proxy, resume in ~${Math.round((rescheduleOverrideMs || 0) / 1000)}s（無 12 分鐘熔斷）`
     );
     return;
   }
+  // 成池都 ban 晒：等到最早一條解禁；本機／無池先用長冷卻
+  const unbanMs = nextMonitorProxyUnbanMs();
   const cool =
-    status === 541
-      ? EDGE_COOLDOWN_MS
-      : Math.min(EDGE_COOLDOWN_MS, 5 * 60_000);
+    unbanMs > 0
+      ? Math.min(EDGE_COOLDOWN_MS, unbanMs + randomBetween(5_000, 20_000))
+      : status === 541
+        ? EDGE_COOLDOWN_MS
+        : Math.min(EDGE_COOLDOWN_MS, 5 * 60_000);
   const until = Date.now() + cool;
   if (until > edgeBlockedUntil) {
     edgeBlockedUntil = until;
     console.warn(
-      `[promax-pickup] edge block HTTP ${status} @ ${where} — cooldown ${Math.round(cool / 60_000)}m`
+      `[promax-pickup] edge block HTTP ${status} @ ${where} — cooldown ${Math.round(cool / 60_000)}m` +
+        (unbanMs > 0 ? "（等 proxy ban 完）" : "（無可用 proxy）")
     );
   }
 }
@@ -308,6 +327,7 @@ async function notifyEdgeCooldown(statusHint: string): Promise<void> {
     lastSuccessAt: state.lastSuccessAt,
     consecutiveFailures: state.consecutiveFailures,
     pollMode: currentPollMode(),
+    proxy: telegramProxyOpts(),
   }).catch(() => {});
 }
 
@@ -333,6 +353,21 @@ function formatDurationLabel(ms: number): string {
 function currentPollMode(): PromaxPickupStatus["poll_mode"] {
   const snap = resolveScheduleMode(state.anyInStock);
   return snap.mode === "peak" ? "peak" : "hot";
+}
+
+function telegramProxyOpts(): {
+  activeDisplay: string;
+  count: number;
+  banned: number;
+  mode: "proxy" | "local";
+} {
+  const st = getMonitorProxyStatus();
+  return {
+    activeDisplay: st.activeDisplay,
+    count: st.count,
+    banned: st.banned,
+    mode: st.mode,
+  };
 }
 
 /** hot 有貨最密；hot 時段內次密；peak 時段外疏；失敗 ≥2 → backoff */
@@ -439,6 +474,7 @@ async function maybeAutoHeal(reason: string): Promise<void> {
       consecutiveFailures: state.consecutiveFailures,
       autoHealAttempt: autoHealAttempts,
       pollMode: currentPollMode(),
+      proxy: telegramProxyOpts(),
     }).catch(() => {});
   } else {
     rescheduleOverrideMs = randomBetween(90_000, 150_000);
@@ -451,6 +487,7 @@ async function maybeAutoHeal(reason: string): Promise<void> {
       rowsInLastPoll: state.latest?.rows_in_last_poll,
       autoHealAttempt: autoHealAttempts,
       pollMode: currentPollMode(),
+      proxy: telegramProxyOpts(),
     }).catch(() => {});
   }
 }
@@ -481,6 +518,7 @@ async function evaluateHealthAfterPoll(rows: number): Promise<void> {
       lastSuccessAt: state.lastSuccessAt,
       rowsInLastPoll: rows,
       pollMode: currentPollMode(),
+      proxy: telegramProxyOpts(),
     }).catch(() => {});
   }
 }
@@ -935,6 +973,7 @@ function buildStatus(partial: {
       ])
     ),
     prev_available: Object.fromEntries(state.prevAvailable.entries()),
+    monitor_proxy: telegramProxyOpts(),
   };
 }
 
@@ -1057,6 +1096,7 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
   await fs.writeFile(LATEST_PATH, JSON.stringify(status, null, 2), "utf8");
   console.log(
     `[promax-pickup] poll done rows=${matchedCells} mode=${status.poll_mode}` +
+      ` proxy=${status.monitor_proxy?.activeDisplay || "local"}` +
       ` failures=${state.consecutiveFailures}` +
       (newRestockEvents.length ? ` restockEvents=${newRestockEvents.length}` : "") +
       (state.lastError ? ` err=${state.lastError}` : "")
@@ -1065,6 +1105,7 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
   if (newRestockEvents.some((e) => e.event === "restock" || e.event === "sold_out")) {
     void notifyPromaxTelegram(newRestockEvents, {
       pollMode: status.poll_mode,
+      proxy: telegramProxyOpts(),
     }).catch((err) => {
       console.warn(
         `[promax-pickup] telegram notify failed：${err instanceof Error ? err.message : String(err)}`
@@ -1079,6 +1120,7 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
       to: status.poll_mode,
       reason: status.schedule?.reason,
       peakWindows: status.schedule?.peakWindows,
+      proxy: telegramProxyOpts(),
     }).catch(() => {});
     lastTelegramStatusAt = 0;
   } else if (lastNotifiedPollMode !== status.poll_mode) {
@@ -1087,6 +1129,7 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
       to: status.poll_mode,
       reason: status.schedule?.reason,
       peakWindows: status.schedule?.peakWindows,
+      proxy: telegramProxyOpts(),
     }).catch(() => {});
     lastNotifiedPollMode = status.poll_mode;
     lastTelegramStatusAt = 0;

@@ -51,6 +51,28 @@ export function formatMonitorModeLine(mode: string | null | undefined): string {
     : `監控模式：*${escapeMd(m)}*`;
 }
 
+/** Telegram 用：遮罩帳密，只顯示 host:port */
+export function formatMonitorProxyLine(opts?: {
+  activeDisplay?: string | null;
+  count?: number;
+  banned?: number;
+  mode?: string | null;
+}): string {
+  const active = opts?.activeDisplay || "本機 IP";
+  const count = opts?.count ?? 0;
+  const banned = opts?.banned ?? 0;
+  const mode = opts?.mode || (count > 0 ? "proxy" : "local");
+  if (mode === "local" || count <= 0) {
+    return `監控 Proxy：*本機 IP*`;
+  }
+  return (
+    `監控 Proxy：*${escapeMd(active)}*` +
+    `（池 ${count} 條` +
+    (banned > 0 ? ` · 暫 ban ${banned}` : "") +
+    `）`
+  );
+}
+
 async function tgApi(
   token: string,
   method: string,
@@ -78,7 +100,15 @@ async function tgApi(
 /** 有貨／售罄即時通知 */
 export async function notifyPromaxTelegram(
   events: RestockHistoryEvent[],
-  opts?: { pollMode?: string | null }
+  opts?: {
+    pollMode?: string | null;
+    proxy?: {
+      activeDisplay?: string | null;
+      count?: number;
+      banned?: number;
+      mode?: string | null;
+    };
+  }
 ): Promise<void> {
   const creds = telegramCreds();
   if (!creds) {
@@ -109,6 +139,7 @@ export async function notifyPromaxTelegram(
       `*${escapeMd(title)}*`,
       modelLine(ev.model, ev.storage, ev.color),
       formatMonitorModeLine(opts?.pollMode),
+      formatMonitorProxyLine(opts?.proxy),
       `門市：${escapeMd(stores)}`,
       ...(ev.event === "sold_out" && ev.inStockForLabel
         ? [`在架時長：約 ${escapeMd(ev.inStockForLabel)}`]
@@ -131,6 +162,12 @@ export async function notifyPromaxModeChange(opts: {
   to: string;
   reason?: string | null;
   peakWindows?: string[];
+  proxy?: {
+    activeDisplay?: string | null;
+    count?: number;
+    banned?: number;
+    mode?: string | null;
+  };
 }): Promise<void> {
   const creds = telegramCreds();
   if (!creds) return;
@@ -140,6 +177,7 @@ export async function notifyPromaxModeChange(opts: {
     "*📡 監控模式已切換*",
     `${escapeMd(opts.from || "—")} → *${escapeMd(opts.to)}*`,
     formatMonitorModeLine(opts.to),
+    formatMonitorProxyLine(opts.proxy),
     ...(opts.reason ? [escapeMd(opts.reason)] : []),
     ...(opts.peakWindows?.length
       ? [`補貨時段：${escapeMd(opts.peakWindows.join(" · "))}`]
@@ -161,13 +199,29 @@ export async function upsertPromaxTelegramStatus(
   const creds = telegramCreds();
   if (!creds) return;
 
-  const modeHelp = MODE_HELP;
   const mode = String(status.poll_mode || "—");
+  const proxySt = (() => {
+    try {
+      // lazy: status 未必帶 proxy；由 monitor 寫入 optional 欄
+      const p = (status as PromaxPickupStatus & {
+        monitor_proxy?: {
+          activeDisplay?: string;
+          count?: number;
+          banned?: number;
+          mode?: string;
+        };
+      }).monitor_proxy;
+      return p;
+    } catch {
+      return undefined;
+    }
+  })();
   const lines: string[] = [
     "*iPhone 18 Pro Max 門市監控*",
     `狀態：${status.running ? "ON" : "OFF"} · ${formatMonitorModeLine(mode).replace(/^監控模式：/, "")}` +
       ` · 成功：${escapeMd(status.last_success_at || "—")}`,
     `模式一覽：hot（補貨時段／有貨）｜peak（時段外疏掃） ← 而家 *${escapeMd(mode)}*`,
+    formatMonitorProxyLine(proxySt),
   ];
   if (status.schedule?.peakWindows?.length) {
     lines.push(
@@ -268,6 +322,12 @@ export type PromaxHealthAlert = {
   rowsInLastPoll?: number;
   autoHealAttempt?: number;
   pollMode?: string | null;
+  proxy?: {
+    activeDisplay?: string | null;
+    count?: number;
+    banned?: number;
+    mode?: string | null;
+  };
 };
 
 let lastHealthAlertAt = 0;
@@ -317,6 +377,7 @@ export async function notifyPromaxHealthAlert(
     lines.push("4\\. 若成日 541：稍等再試，或同我講幫手查");
   }
   lines.push(formatMonitorModeLine(alert.pollMode ?? null));
+  lines.push(formatMonitorProxyLine(alert.proxy));
 
   if (alert.lastError) {
     lines.push(`錯誤：${escapeMd(String(alert.lastError).slice(0, 160))}`);

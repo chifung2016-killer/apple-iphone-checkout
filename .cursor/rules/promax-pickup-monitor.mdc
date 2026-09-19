@@ -62,7 +62,7 @@ GET …/fulfillment-messages?…&location=HK
   - `hot`（有至少一款有貨）：約 **25–40s**（太密易 541）
   - 可 `.env` 覆寫：`PROMAX_POLL_IDLE_MIN_MS` / `IDLE_MAX` / `HOT_MIN` / `HOT_MAX` / `PROMAX_EDGE_COOLDOWN_MS`
   - 連續失敗 ≥2 → backoff（最多約 15 分鐘）
-- **HTTP 541/403/429 熔斷**：停打約 12 分鐘、同一輪 abort 其餘 SKU、541 唔再打 fulfillment fallback；Telegram 報「冷卻中」而非狂 auto-heal
+- **HTTP 541/403/429**：有監控 proxy 可轉 → **即刻換線**（約 2–5s 再 poll，無 12 分鐘熔斷）；成池 ban 晒 → 等到最早解禁／否則冷卻約 12 分鐘。541 唔打 fulfillment fallback；同一輪 abort 其餘 SKU
 - SKU 之間 sleep：idle ~350–700ms；hot ~200–450ms
 - `sold_out` 帶 `inStockForMs` / `inStockForLabel`（由首次有貨→全無貨）
 - **時段模式**：已知補貨 Range → **hot**（~90–150s；門市有貨再密到 ~25–40s）；時段外 → **peak**（~6–10 分，減 541）。畢業前預設 hot 窗 **07:30–19:00**（含晏晝）；`PROMAX_SCHEDULE_MIN_DAYS`（預設 3）湊夠唔同日補貨先收窄窗。快照：`runtime/promax-schedule.json`
