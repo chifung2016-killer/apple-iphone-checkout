@@ -22,6 +22,21 @@ function escapeMd(s: string): string {
   return String(s || "").replace(/([_*`\[\]])/g, "\\$1");
 }
 
+/** 顏色 → 相近色 emoji（放喺型號／顏色後面） */
+function colorLogo(color: string): string {
+  const c = String(color || "");
+  if (/布根|酒紅|紅/.test(c)) return "🔴";
+  if (/冰川|藍|青/.test(c)) return "🩵";
+  if (/銀/.test(c)) return "⚪";
+  if (/黑/.test(c)) return "⚫";
+  return "📱";
+}
+
+function modelLine(model: string, storage: string, color: string): string {
+  const logo = colorLogo(color);
+  return `${escapeMd(model)} · ${escapeMd(storage)} · ${escapeMd(color)} ${logo}`;
+}
+
 async function tgApi(
   token: string,
   method: string,
@@ -77,7 +92,7 @@ export async function notifyPromaxTelegram(
         : "⚪ Pro Max 門市售罄";
     const text = [
       `*${escapeMd(title)}*`,
-      `${escapeMd(ev.model)} · ${escapeMd(ev.storage)} · ${escapeMd(ev.color)}`,
+      modelLine(ev.model, ev.storage, ev.color),
       `門市：${escapeMd(stores)}`,
       ...(ev.event === "sold_out" && ev.inStockForLabel
         ? [`在架時長：約 ${escapeMd(ev.inStockForLabel)}`]
@@ -133,7 +148,7 @@ export async function upsertPromaxTelegramStatus(
       })
       .join(",");
     lines.push(
-      `• ${escapeMd(m.storage)} ${escapeMd(m.color)} → ${escapeMd(codes)}`
+      `• ${escapeMd(m.storage)} ${escapeMd(m.color)} ${colorLogo(m.color)} → ${escapeMd(codes)}`
     );
   }
   if (!anyAvail) lines.push("• 暫無門市 available");
