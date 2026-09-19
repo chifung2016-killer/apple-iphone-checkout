@@ -146,8 +146,8 @@ export type PromaxPickupStatus = {
   consecutive_failures: number;
   next_poll_in_ms: number | null;
   poll_interval_ms: number;
-  /** idle=全無貨密掃；hot=有貨；peak/quiet/learning=時段策略 */
-  poll_mode: "idle" | "hot" | "peak" | "quiet" | "learning";
+  /** hot=已知補貨時段或有貨；peak=時段外疏掃 */
+  poll_mode: "hot" | "peak";
   schedule?: ScheduleSnapshot;
   running: boolean;
   rows_in_last_poll: number;
@@ -332,39 +332,37 @@ function formatDurationLabel(ms: number): string {
 
 function currentPollMode(): PromaxPickupStatus["poll_mode"] {
   const snap = resolveScheduleMode(state.anyInStock);
-  if (snap.mode === "hot") return "hot";
-  if (snap.mode === "peak") return "peak";
-  if (snap.mode === "learning") return "learning";
-  if (snap.mode === "quiet") return "quiet";
-  return state.anyInStock ? "hot" : "idle";
+  return snap.mode === "peak" ? "peak" : "hot";
 }
 
-/** idle/peak 密；quiet/learning 疏；hot 最密；失敗 ≥2 → backoff */
+/** hot 有貨最密；hot 時段內次密；peak 時段外疏；失敗 ≥2 → backoff */
 function computeNextIntervalMs(failures: number): number {
   const sched = resolveScheduleMode(state.anyInStock);
-  const ranged = scheduleIntervalRange(sched.mode);
+  const ranged = scheduleIntervalRange(sched.mode, {
+    anyInStock: state.anyInStock,
+  });
   let min: number;
   let max: number;
-  if (sched.mode === "hot") {
+  if (sched.mode === "hot" && state.anyInStock) {
     min = HOT_POLL_MIN_MS;
     max = HOT_POLL_MAX_MS;
   } else if (ranged) {
     min = ranged.min;
     max = ranged.max;
+  } else if (sched.mode === "peak") {
+    min = 6 * 60_000;
+    max = 10 * 60_000;
   } else {
-    // peak（或舊 idle）
-    min = IDLE_POLL_MIN_MS;
-    max = IDLE_POLL_MAX_MS;
+    min = 90_000;
+    max = 150_000;
   }
   max = Math.max(min, max);
   const base = randomBetween(min, max);
   const jitter =
-    sched.mode === "quiet"
-      ? randomBetween(-60_000, 60_000)
-      : sched.mode === "learning"
-        ? randomBetween(-10_000, 10_000)
-        : randomBetween(-JITTER_MS, JITTER_MS);
-  let ms = Math.max(10_000, base + jitter);
+    sched.mode === "peak"
+      ? randomBetween(-45_000, 45_000)
+      : randomBetween(-JITTER_MS, JITTER_MS);
+  let ms = Math.max(15_000, base + jitter);
   if (failures >= 2) {
     const mult = Math.min(2 ** (failures - 1), 16);
     ms = Math.min(BACKOFF_CAP_MS, ms * mult);
@@ -384,11 +382,9 @@ function diagnoseUnhealthy(): { unhealthy: boolean; reason: string } | null {
   }
   const sched = resolveScheduleMode(state.anyInStock);
   const staleMs =
-    sched.mode === "quiet"
-      ? 45 * 60_000
-      : sched.mode === "learning"
-        ? 8 * 60_000
-        : STALE_SUCCESS_MS;
+    sched.mode === "peak"
+      ? 35 * 60_000
+      : STALE_SUCCESS_MS;
   if (state.lastSuccessAt) {
     const age = Date.now() - Date.parse(state.lastSuccessAt);
     if (Number.isFinite(age) && age > staleMs) {

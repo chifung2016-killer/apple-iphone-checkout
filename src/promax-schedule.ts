@@ -1,12 +1,12 @@
 /**
  * 由 restock-history 學習常見補貨時段（香港時區）
  *
- * 畢業前（少過 MIN_SAMPLE_DAYS 個唔同日有 Pro Max 補貨）：
- *   - 保留闊預設時段（含晏晝），時段內 = peak
- *   - 時段外 = learning（~60–90s），唔用 quiet（避免過早疏漏）
- * 畢業後：
- *   - 用學到嘅鐘點做 peak；其餘 = quiet（~12–18 分）
- * 有貨一律 hot。
+ * 模式（按你嘅定義）：
+ *   - **hot**：已知會補貨嘅時間 Range（預設／學到嘅窗）· 較密
+ *   - **peak**：時段之外 · 疏掃（減 541）
+ *   - 門市實際有貨時亦係 hot（再加密捉售罄）
+ *
+ * 畢業：少過 MIN_SAMPLE_DAYS 個唔同日有 Pro Max 補貨前，預設窗保持闊（含晏晝）。
  */
 import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -17,11 +17,11 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RESTOCK_HISTORY_FILE = path.join(ROOT, "runtime", "restock-history.jsonl");
 const SCHEDULE_CACHE_FILE = path.join(ROOT, "runtime", "promax-schedule.json");
 
-export type ScheduleMode = "hot" | "peak" | "quiet" | "learning";
+export type ScheduleMode = "hot" | "peak";
 
 export type ScheduleSnapshot = {
   mode: ScheduleMode;
-  /** 學習到嘅 peak 時段（HK，例如 "08:00–11:00"） */
+  /** 已知補貨時段（HK），呢段用 hot */
   peakWindows: string[];
   restockSamples: number;
   /** 有 Pro Max 補貨嘅唔同 HK 日數 */
@@ -30,7 +30,7 @@ export type ScheduleSnapshot = {
   minSampleDays: number;
   graduated: boolean;
   reason: string;
-  /** 下一個 peak 開始（ISO），若而家已喺 peak 則 null */
+  /** 下一個 hot 時段開始（ISO），若而家已喺窗內則 null */
   nextPeakAt: string | null;
   updatedAt: string;
 };
@@ -241,28 +241,23 @@ function buildSnapshot(): ScheduleSnapshot {
   const now = new Date();
   const { dayMinute } = hkParts(now);
   const graduated = isGraduated();
-  const peak = inWindows(dayMinute, windows);
+  const inRestockWindow = inWindows(dayMinute, windows);
   let mode: ScheduleMode;
   let reason: string;
 
-  if (!graduated) {
-    // 學習期：時段內 peak；時段外 learning（唔 quiet）
-    if (peak) {
-      mode = "peak";
-      reason = `學習中（${dayKeys.size}/${MIN_SAMPLE_DAYS} 日 · ${sampleCount} 次）· 預設／已知時段（含晏晝）· 密掃`;
-    } else {
-      mode = "learning";
-      reason = `學習中（${dayKeys.size}/${MIN_SAMPLE_DAYS} 日 · ${sampleCount} 次）· 時段外仍 ~60–90s，湊夠日數先 quiet`;
-    }
-  } else if (peak) {
-    mode = "peak";
-    reason = `已畢業（${dayKeys.size} 日樣本）· 補貨時段內密輪詢`;
+  if (inRestockWindow) {
+    mode = "hot";
+    reason = graduated
+      ? `已知補貨時段 · hot（較密）`
+      : `學習中（${dayKeys.size}/${MIN_SAMPLE_DAYS} 日 · ${sampleCount} 次）· 預設／已知補貨時段（含晏晝）· hot`;
   } else {
-    mode = "quiet";
-    reason = `已畢業（${dayKeys.size} 日樣本）· 非時段疏輪詢（減 541）`;
+    mode = "peak";
+    reason = graduated
+      ? `非補貨時段 · peak（疏掃，減 541）`
+      : `學習中（${dayKeys.size}/${MIN_SAMPLE_DAYS} 日 · ${sampleCount} 次）· 時段外 peak 疏掃`;
   }
 
-  const next = peak ? null : nextPeakStart(dayMinute, windows);
+  const next = inRestockWindow ? null : nextPeakStart(dayMinute, windows);
   return {
     mode,
     peakWindows: windows.map(formatWindow),
@@ -294,14 +289,14 @@ async function persistSchedule(snap: ScheduleSnapshot): Promise<void> {
   );
 }
 
-/** 有貨時強制 hot；否則跟 schedule */
+/** 有貨時強制 hot（再加密）；否則跟時段：窗內 hot／窗外 peak */
 export function resolveScheduleMode(anyInStock: boolean): ScheduleSnapshot {
   const base = buildSnapshot();
   if (anyInStock) {
     return {
       ...base,
       mode: "hot",
-      reason: "門市有貨 · 加密捉售罄",
+      reason: "門市有貨 · hot 加密捉售罄",
     };
   }
   cached = base;
@@ -313,13 +308,18 @@ export function getCachedSchedule(): ScheduleSnapshot | null {
 }
 
 /**
- * quiet：12–18 分；learning：60–90 秒；peak/hot 由 caller 用 IDLE/HOT
+ * hot（時段內、未有貨）：~90–150s
+ * peak（時段外）：~6–10 分（疏，減 541）
+ * hot + 有貨：由 caller 用 HOT_POLL（~25–40s）
  */
 export function scheduleIntervalRange(
-  mode: ScheduleMode
+  mode: ScheduleMode,
+  opts?: { anyInStock?: boolean }
 ): { min: number; max: number } | null {
-  if (mode === "quiet") return { min: 12 * 60_000, max: 18 * 60_000 };
-  if (mode === "learning") return { min: 60_000, max: 90_000 };
+  if (mode === "peak") return { min: 6 * 60_000, max: 10 * 60_000 };
+  if (mode === "hot" && !opts?.anyInStock) {
+    return { min: 90_000, max: 150_000 };
+  }
   return null;
 }
 

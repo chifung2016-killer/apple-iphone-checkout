@@ -669,11 +669,9 @@
           </div>
           <p class="hint" id="monitorHint" style="margin-top:10px">
             <b>iPhone 18 Pro Max 門市庫存</b>會喺開 Dashboard 後自動背景監控（256／512 × 四色 × 6 店）。
-            <strong>唔使開瀏覽器</strong>。四種模式：
-            <b>peak</b> 補貨時段密掃（~45–60s）·
-            <b>hot</b> 有貨加密（~25–40s）·
-            <b>learning</b> 未湊夠約 3 日補貨樣本時，時段外仍 ~60–90s（預設含晏晝 07:30–19:00）·
-            <b>quiet</b> 畢業後非時段疏掃（~12–18 分，減 541）。
+            <strong>唔使開瀏覽器</strong>。兩種模式：
+            <b>hot</b>＝已知會補貨嘅時間（預設約 07:30–19:00／學到嘅窗）或門市有貨 · ~90–150s（有貨 ~25–40s）·
+            <b>peak</b>＝呢段時間之外 · ~6–10 分疏掃（減 541）。
           </p>
           <div class="meta" id="monitorMeta" style="margin-top:8px">
             <span>Auto monitor: <b id="monitorState">—</b></span>
@@ -681,10 +679,8 @@
             <span id="monitorSkuLine"></span>
           </div>
           <div id="monitorModeBar" class="monitor-mode-bar" style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:center" aria-label="監控模式">
-            <span class="monitor-mode-chip" data-mode="peak" title="學到嘅補貨時段內 · ~45–60s">peak</span>
-            <span class="monitor-mode-chip" data-mode="hot" title="門市有貨 · ~25–40s">hot</span>
-            <span class="monitor-mode-chip" data-mode="learning" title="未湊夠約3日樣本 · 時段外 ~60–90s">learning</span>
-            <span class="monitor-mode-chip" data-mode="quiet" title="已畢業·非時段 ~12–18分">quiet</span>
+            <span class="monitor-mode-chip" data-mode="hot" title="已知補貨時段／有貨">hot</span>
+            <span class="monitor-mode-chip" data-mode="peak" title="時段外疏掃 · ~6–10分">peak</span>
           </div>
           <p class="hint" id="monitorScheduleLine" style="margin-top:6px"></p>
           <div class="restock-history" style="margin-top:12px">

@@ -38,11 +38,8 @@ function modelLine(model: string, storage: string, color: string): string {
 }
 
 const MODE_HELP: Record<string, string> = {
-  peak: "補貨時段 · ~45–60s",
-  hot: "有貨加密 · ~25–40s",
-  learning: "學習中 · ~60–90s",
-  quiet: "非時段疏掃 · ~12–18分",
-  idle: "密掃",
+  hot: "已知補貨時段／有貨 · ~90–150s（有貨 ~25–40s）",
+  peak: "非補貨時段 · ~6–10分（疏，減 541）",
 };
 
 /** 統一「而家用緊邊個模式」一行 */
@@ -170,7 +167,7 @@ export async function upsertPromaxTelegramStatus(
     "*iPhone 18 Pro Max 門市監控*",
     `狀態：${status.running ? "ON" : "OFF"} · ${formatMonitorModeLine(mode).replace(/^監控模式：/, "")}` +
       ` · 成功：${escapeMd(status.last_success_at || "—")}`,
-    `模式一覽：peak｜hot｜learning｜quiet ← 而家 *${escapeMd(mode)}*`,
+    `模式一覽：hot（補貨時段／有貨）｜peak（時段外疏掃） ← 而家 *${escapeMd(mode)}*`,
   ];
   if (status.schedule?.peakWindows?.length) {
     lines.push(
