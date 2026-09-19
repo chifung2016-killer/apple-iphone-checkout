@@ -1508,6 +1508,10 @@ async function spawnOneBrowser(
     ...cleanConfig,
     browserCount: 1,
   } as Record<string, unknown> & { browserCount: number };
+  // 取貨 task：去到 pickup 頁就停低，等 Pro Max 監控到同色同容量先 refresh、揀店、加車
+  if (/^pickup/i.test(String(sessionConfig.fulfillmentPreference || ""))) {
+    sessionConfig.holdAtPickupStoresForStock = true;
+  }
   // 多個 proxy：每條最多分配畀 3 個 browser，用滿先換下一條（唔隨機重複）
   const assignedProxy = await pickProxyForNewTask(cleanConfig.proxy);
   sessionConfig.proxy = assignedProxy;
@@ -3188,6 +3192,47 @@ server.listen(PORT, "127.0.0.1", () => {
     // 獨立 Pro Max 門市庫存監控（失敗唔影響 dashboard）；有貨變化 → Live 補貨紀錄
     setPromaxPickupHooks({
       onPollComplete: async (_status, events) => {
+        const restocks = (events || []).filter((e) => e.event === "restock");
+        if (restocks.length) {
+          const payload = {
+            at: new Date().toISOString(),
+            atMs: Date.now(),
+            skus: restocks.map((e) => ({
+              model: e.model,
+              color: e.color,
+              storage: e.storage,
+              name: e.name,
+              stockQty: e.stockQty,
+              stores: (e.storeStocks || [])
+                .filter((s) => s.available)
+                .map((s) => ({
+                  code: s.code,
+                  name: s.name,
+                  available: true,
+                })),
+            })),
+          };
+          await fs
+            .writeFile(
+              path.join(RUNTIME_DIR, "stock-resume-all.flag"),
+              JSON.stringify(payload),
+              "utf8"
+            )
+            .catch((err) => {
+              console.warn(
+                `[promax-pickup] stock-resume flag failed：${err instanceof Error ? err.message : String(err)}`
+              );
+            });
+          const labels = payload.skus
+            .map(
+              (s) =>
+                `${s.storage} ${s.color} @ ${(s.stores || []).map((st) => st.code).join(",") || "?"}`
+            )
+            .join("；");
+          console.log(
+            `[promax-pickup] 有貨 → 通知待命取貨 task refresh／揀店／加車：${labels}`
+          );
+        }
         if (events.length) {
           broadcast({ type: "status", state: await snapshot() });
         }

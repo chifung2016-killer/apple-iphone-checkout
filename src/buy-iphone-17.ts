@@ -5048,6 +5048,24 @@ function isNoisePickupText(text: string): boolean {
   return false;
 }
 
+/** 監控通知嘅有貨門市短碼（IFC／CWB…）；揀店時優先撳呢啲 */
+let preferredMonitorStoreCodes = new Set<string>();
+
+function setPreferredStoresFromResume(payload: StockResumePayload): void {
+  const codes = new Set<string>();
+  for (const sku of payload.skus) {
+    if (!stockSkuMatchesCheckout(sku)) continue;
+    for (const s of sku.stores || []) {
+      const code = String(s.code || "").trim().toUpperCase();
+      if (code && s.available !== false) codes.add(code);
+    }
+  }
+  preferredMonitorStoreCodes = codes;
+  if (codes.size) {
+    console.log(`  監控指定門市：${[...codes].join("、")}`);
+  }
+}
+
 function matchesPreferredStore(text: string): boolean {
   return pickupStoreKeywordPattern().test(text);
 }
@@ -5672,6 +5690,7 @@ type StockResumeSku = {
   storage?: string;
   stockQty?: number | null;
   buyQty?: number;
+  stores?: Array<{ code?: string; name?: string; available?: boolean }>;
 };
 
 type StockResumePayload = {
@@ -5801,6 +5820,7 @@ async function waitForMatchingStockResume(opts?: {
           : payload.skus.some((s) => stockSkuMatchesCheckout(s));
       // 舊格式冇 skus：唔當匹配（避免誤觸）
       if (matched) {
+        setPreferredStoresFromResume(payload);
         console.log(
           `  收到有貨通知（匹配 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage}）at=${new Date(payload.atMs).toISOString()}`
         );
@@ -6248,7 +6268,10 @@ async function clickAnyNearbyStore(page: Page): Promise<boolean> {
     (c) => c.available && (c.qty == null || c.qty > 0)
   );
   const pickFrom = inStock.length > 0 ? inStock : poolToPick;
-  const chosen = pickFrom[Math.floor(Math.random() * pickFrom.length)]!;
+  const monitored = pickFrom.filter(
+    (c) => c.code && preferredMonitorStoreCodes.has(c.code)
+  );
+  const chosen = (monitored.length > 0 ? monitored : pickFrom)[0]!;
   usedPickupStoreKeys.add(chosen.key);
   const label = chosen.text.replace(/\s+/g, " ").slice(0, 90) || "門市";
   const codeTag = chosen.code ? ` ${chosen.code}` : "";
