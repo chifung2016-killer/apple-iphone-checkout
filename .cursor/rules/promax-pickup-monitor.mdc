@@ -56,9 +56,14 @@ GET …/fulfillment-messages?…&location=HK
 ## 輪詢行為
 
 - Dashboard `listen` 後 `startPromaxPickupMonitor({ runImmediately: true })`
-- 間隔：90–120s base + ±20s jitter；連續失敗 ≥2 → backoff（最多約 15 分鐘）
-- SKU 之間 sleep ~400–900ms
-- 成功：`last_success_at` 更新、`consecutive_failures=0`、寫 jsonl
+- **自適應間隔**：
+  - `idle`（全無貨）：約 **45–60s**（捉補貨）
+  - `hot`（有至少一款有貨）：約 **15–25s**（捉售罄時長）
+  - 可 `.env` 覆寫：`PROMAX_POLL_IDLE_MIN_MS` / `IDLE_MAX` / `HOT_MIN` / `HOT_MAX`
+  - 連續失敗 ≥2 → backoff（最多約 15 分鐘）
+- SKU 之間 sleep：idle ~350–700ms；hot ~200–450ms
+- `sold_out` 帶 `inStockForMs` / `inStockForLabel`（由首次有貨→全無貨）
+- 成功：`last_success_at` 更新、`consecutive_failures=0`、寫 jsonl；快照含 `prev_available` / `available_since`（重啟唔當補貨、可續計時長）
 - 失敗：保留舊 `last_success_at`；API 仍回 matrix（可能全 null）+ `last_error`
 - 前端用 **`last_success_at`** 判斷新唔新鮮，唔好當「有 matrix 就係新數據」
 
@@ -66,7 +71,7 @@ GET …/fulfillment-messages?…&location=HK
 
 - 只喺**成功輪詢**且偵測到變化時寫入：
   - 門市 `unavailable`→`available` → `restock` + `store_stock`
-  - 全部變無貨 → `sold_out`
+  - 全部變無貨 → `sold_out`（含在架時長 `inStockForLabel`）
 - 經 `setPromaxPickupHooks({ onPollComplete })` broadcast snapshot 刷新 UI
 - 舊 Playwright 產品頁 monitor / Telegram monitor+buying **已移除**
 

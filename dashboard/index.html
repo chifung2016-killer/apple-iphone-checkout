@@ -1872,6 +1872,12 @@
             }
           } else if (e.event === "qty_up" && e.prevStockQty != null) {
             qty = `${e.prevStockQty} → ${e.stockQty ?? "?"}`;
+          } else if (e.event === "sold_out") {
+            qty = e.inStockForLabel
+              ? `在架約 ${e.inStockForLabel}`
+              : e.detail
+                ? String(e.detail)
+                : "0";
           } else if (e.stockQty != null && e.stockQty !== "") {
             qty = String(e.stockQty);
           } else if (e.detail) {

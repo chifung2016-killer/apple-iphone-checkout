@@ -128,8 +128,14 @@ export type PromaxPickupStatus = {
   consecutive_failures: number;
   next_poll_in_ms: number | null;
   poll_interval_ms: number;
+  /** idle=全無貨；hot=有至少一款有貨（加密輪詢） */
+  poll_mode: "idle" | "hot";
   running: boolean;
   rows_in_last_poll: number;
+  /** sku → 首次偵測到有貨時間（ISO）；重啟後可恢復 */
+  available_since?: Record<string, string>;
+  /** `${sku}|${store_id}` → 上次是否 available（重啟恢復用） */
+  prev_available?: Record<string, boolean>;
 };
 
 type MonitorState = {
@@ -144,6 +150,10 @@ type MonitorState = {
   latest: PromaxPickupStatus | null;
   /** `${sku}|${store_id}` → was available */
   prevAvailable: Map<string, boolean>;
+  /** sku → 首次有貨時間 ms */
+  availableSinceMs: Map<string, number>;
+  /** 上次成功輪詢時有冇任何門市有貨 */
+  anyInStock: boolean;
 };
 
 export type RestockHistoryEvent = {
@@ -158,6 +168,10 @@ export type RestockHistoryEvent = {
   buyQty: number;
   prevStockQty?: number | null;
   detail?: string;
+  /** 由有貨到售罄嘅時長（毫秒）；只 sold_out 有） */
+  inStockForMs?: number | null;
+  inStockForLabel?: string | null;
+  availableSince?: string | null;
   storeStocks?: Array<{
     code: string;
     name: string;
@@ -180,9 +194,19 @@ export function setPromaxPickupHooks(next: PromaxHooks): void {
   hooks = next;
 }
 
-const BASE_POLL_MIN_MS = 90_000;
-const BASE_POLL_MAX_MS = 120_000;
-const JITTER_MS = 20_000;
+/** 可 .env 覆寫：PROMAX_POLL_IDLE_MIN_MS / IDLE_MAX / HOT_MIN / HOT_MAX */
+function envMs(name: string, fallback: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n >= 5_000 ? Math.floor(n) : fallback;
+}
+
+/** 全無貨：稍密捉補貨（預設 45–60s） */
+const IDLE_POLL_MIN_MS = envMs("PROMAX_POLL_IDLE_MIN_MS", 45_000);
+const IDLE_POLL_MAX_MS = envMs("PROMAX_POLL_IDLE_MAX_MS", 60_000);
+/** 有貨中：加密捉售罄時長（預設 15–25s） */
+const HOT_POLL_MIN_MS = envMs("PROMAX_POLL_HOT_MIN_MS", 15_000);
+const HOT_POLL_MAX_MS = envMs("PROMAX_POLL_HOT_MAX_MS", 25_000);
+const JITTER_MS = 8_000;
 const BACKOFF_CAP_MS = 15 * 60_000;
 const MAX_COLLECTION_LINES = 50_000;
 
@@ -190,13 +214,15 @@ const state: MonitorState = {
   running: false,
   timer: null,
   consecutiveFailures: 0,
-  pollIntervalMs: 105_000,
+  pollIntervalMs: 52_000,
   nextPollInMs: null,
   lastSuccessAt: null,
   lastAttemptAt: null,
   lastError: null,
   latest: null,
   prevAvailable: new Map(),
+  availableSinceMs: new Map(),
+  anyInStock: false,
 };
 
 /** Telegram live status 上次推送時間（節流） */
@@ -210,11 +236,29 @@ function randomBetween(min: number, max: number): number {
   return Math.floor(min + Math.random() * (max - min + 1));
 }
 
-/** 90–120s base + ±20s jitter；失敗時 exponential backoff */
+function formatDurationLabel(ms: number): string {
+  const sec = Math.max(0, Math.round(ms / 1000));
+  if (sec < 60) return `${sec}秒`;
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  if (m < 60) return s ? `${m}分${s}秒` : `${m}分鐘`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return rm ? `${h}小時${rm}分` : `${h}小時`;
+}
+
+function currentPollMode(): "idle" | "hot" {
+  return state.anyInStock ? "hot" : "idle";
+}
+
+/** idle 45–60s / hot 15–25s + jitter；失敗 ≥2 → backoff */
 function computeNextIntervalMs(failures: number): number {
-  const base = randomBetween(BASE_POLL_MIN_MS, BASE_POLL_MAX_MS);
+  const hot = state.anyInStock;
+  const min = hot ? HOT_POLL_MIN_MS : IDLE_POLL_MIN_MS;
+  const max = Math.max(min, hot ? HOT_POLL_MAX_MS : IDLE_POLL_MAX_MS);
+  const base = randomBetween(min, max);
   const jitter = randomBetween(-JITTER_MS, JITTER_MS);
-  let ms = Math.max(30_000, base + jitter);
+  let ms = Math.max(10_000, base + jitter);
   if (failures >= 2) {
     const mult = Math.min(2 ** (failures - 1), 16);
     ms = Math.min(BACKOFF_CAP_MS, ms * mult);
@@ -505,6 +549,13 @@ function detectRestockEvents(
 
     if (!anyKnown) continue;
 
+    const sinceMs = state.availableSinceMs.get(entry.sku);
+    if (availableCount > 0) {
+      if (sinceMs == null) {
+        state.availableSinceMs.set(entry.sku, Date.parse(atIso) || Date.now());
+      }
+    }
+
     const base = {
       at: atIso,
       atHk,
@@ -517,6 +568,9 @@ function detectRestockEvents(
     };
 
     if (flippedToAvailable) {
+      if (sinceMs == null && !state.availableSinceMs.has(entry.sku)) {
+        state.availableSinceMs.set(entry.sku, Date.parse(atIso) || Date.now());
+      }
       events.push({
         ...base,
         event: "restock",
@@ -525,6 +579,9 @@ function detectRestockEvents(
           .filter((s) => s.available)
           .map((s) => s.label)
           .join(" · "),
+        availableSince: new Date(
+          state.availableSinceMs.get(entry.sku) || Date.now()
+        ).toISOString(),
       });
       events.push({
         ...base,
@@ -533,11 +590,25 @@ function detectRestockEvents(
         detail: storeStocks.map((s) => s.label).join(" · "),
       });
     } else if (flippedToUnavailable && availableCount === 0) {
+      const started = state.availableSinceMs.get(entry.sku);
+      const endMs = Date.parse(atIso) || Date.now();
+      const inStockForMs =
+        started != null && Number.isFinite(started)
+          ? Math.max(0, endMs - started)
+          : null;
+      const inStockForLabel =
+        inStockForMs != null ? formatDurationLabel(inStockForMs) : null;
+      state.availableSinceMs.delete(entry.sku);
       events.push({
         ...base,
         event: "sold_out",
         stockQty: 0,
-        detail: "六間門市皆 unavailable",
+        detail: inStockForLabel
+          ? `六間門市皆 unavailable · 在架約 ${inStockForLabel}`
+          : "六間門市皆 unavailable",
+        inStockForMs,
+        inStockForLabel,
+        availableSince: started != null ? new Date(started).toISOString() : null,
       });
     }
   }
@@ -582,8 +653,16 @@ function buildStatus(partial: {
     consecutive_failures: state.consecutiveFailures,
     next_poll_in_ms: state.nextPollInMs,
     poll_interval_ms: state.pollIntervalMs,
+    poll_mode: currentPollMode(),
     running: state.running,
     rows_in_last_poll: partial.rowsInLastPoll,
+    available_since: Object.fromEntries(
+      [...state.availableSinceMs.entries()].map(([sku, ms]) => [
+        sku,
+        new Date(ms).toISOString(),
+      ])
+    ),
+    prev_available: Object.fromEntries(state.prevAvailable.entries()),
   };
 }
 
@@ -622,8 +701,11 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
           pickup_quote: a.pickupQuote,
         });
       }
-      // small spacing between SKUs
-      await sleep(randomBetween(400, 900));
+      // SKU 之間間隔：hot 較短；idle 稍鬆
+      const gap = state.anyInStock
+        ? randomBetween(200, 450)
+        : randomBetween(350, 700);
+      await sleep(gap);
     } catch (err) {
       const status = (err as { status?: number }).status;
       if (status === 429 || status === 403 || status === 541) blocked += 1;
@@ -644,6 +726,9 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
     await appendCollection(collectionRows);
     newRestockEvents = detectRestockEvents(matrix, ts);
     await appendRestockEvents(newRestockEvents);
+    state.anyInStock = matrix.some((entry) =>
+      entry.stores.some((c) => isAvailableDisplay(c.pickup_display))
+    );
   } else {
     state.consecutiveFailures += 1;
     if (blocked > 0 && !state.lastError) {
@@ -661,7 +746,8 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
   await ensureRuntime();
   await fs.writeFile(LATEST_PATH, JSON.stringify(status, null, 2), "utf8");
   console.log(
-    `[promax-pickup] poll done rows=${matchedCells} failures=${state.consecutiveFailures}` +
+    `[promax-pickup] poll done rows=${matchedCells} mode=${status.poll_mode}` +
+      ` failures=${state.consecutiveFailures}` +
       (newRestockEvents.length ? ` restockEvents=${newRestockEvents.length}` : "") +
       (state.lastError ? ` err=${state.lastError}` : "")
   );
@@ -700,6 +786,35 @@ async function loadLatestFromDisk(): Promise<void> {
     state.lastAttemptAt = parsed.last_attempt_at;
     state.lastError = parsed.last_error;
     state.consecutiveFailures = Number(parsed.consecutive_failures) || 0;
+    if (parsed.prev_available && typeof parsed.prev_available === "object") {
+      state.prevAvailable = new Map(
+        Object.entries(parsed.prev_available).map(([k, v]) => [k, Boolean(v)])
+      );
+    } else if (parsed.matrix?.length) {
+      // 舊快照：用 matrix 重建基線，避免重啟當補貨
+      for (const entry of parsed.matrix) {
+        for (const cell of entry.stores || []) {
+          if (cell.pickup_display == null) continue;
+          state.prevAvailable.set(
+            `${entry.sku}|${cell.store_id}`,
+            isAvailableDisplay(cell.pickup_display)
+          );
+        }
+      }
+    }
+    if (parsed.available_since && typeof parsed.available_since === "object") {
+      state.availableSinceMs = new Map(
+        Object.entries(parsed.available_since)
+          .map(([sku, iso]) => [sku, Date.parse(String(iso))] as const)
+          .filter(([, ms]) => Number.isFinite(ms))
+      );
+    }
+    state.anyInStock =
+      parsed.poll_mode === "hot" ||
+      [...state.prevAvailable.values()].some(Boolean) ||
+      (parsed.matrix || []).some((e) =>
+        (e.stores || []).some((c) => isAvailableDisplay(c.pickup_display))
+      );
   } catch {
     /* first run */
   }
@@ -725,6 +840,7 @@ async function scheduleNext(): Promise<void> {
   }, state.pollIntervalMs);
   console.log(
     `[promax-pickup] next poll in ${Math.round(state.pollIntervalMs / 1000)}s` +
+      ` mode=${currentPollMode()}` +
       (state.consecutiveFailures >= 2
         ? ` (backoff failures=${state.consecutiveFailures})`
         : "")
@@ -741,7 +857,9 @@ export async function startPromaxPickupMonitor(opts?: {
   await loadLatestFromDisk();
   console.log(
     `[promax-pickup] started｜sku_map=${SKU_MAP_PATH}｜stores=${HK_APPLE_STORES.length}` +
-      `｜telegram=${hasTelegramCreds() ? "on" : "off"}`
+      `｜telegram=${hasTelegramCreds() ? "on" : "off"}` +
+      `｜idle=${Math.round(IDLE_POLL_MIN_MS / 1000)}-${Math.round(IDLE_POLL_MAX_MS / 1000)}s` +
+      `｜hot=${Math.round(HOT_POLL_MIN_MS / 1000)}-${Math.round(HOT_POLL_MAX_MS / 1000)}s`
   );
   if (opts?.runImmediately !== false) {
     try {
@@ -776,6 +894,7 @@ export function getPromaxPickupStatus(): PromaxPickupStatus {
       consecutive_failures: state.consecutiveFailures,
       next_poll_in_ms: state.nextPollInMs,
       poll_interval_ms: state.pollIntervalMs,
+      poll_mode: currentPollMode(),
       running: state.running,
     };
   }

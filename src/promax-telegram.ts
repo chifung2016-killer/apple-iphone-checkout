@@ -79,6 +79,9 @@ export async function notifyPromaxTelegram(
       `*${escapeMd(title)}*`,
       `${escapeMd(ev.model)} · ${escapeMd(ev.storage)} · ${escapeMd(ev.color)}`,
       `門市：${escapeMd(stores)}`,
+      ...(ev.event === "sold_out" && ev.inStockForLabel
+        ? [`在架時長：約 ${escapeMd(ev.inStockForLabel)}`]
+        : []),
       `時間：${escapeMd(ev.atHk || ev.at)}`,
     ].join("\n");
 
