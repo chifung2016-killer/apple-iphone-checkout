@@ -63,9 +63,11 @@ GET …/fulfillment-messages?…&location=HK
   - 連續失敗 ≥2 → backoff（最多約 15 分鐘）
 - SKU 之間 sleep：idle ~350–700ms；hot ~200–450ms
 - `sold_out` 帶 `inStockForMs` / `inStockForLabel`（由首次有貨→全無貨）
+- **健康監控**：連續失敗≥3／成功數據超過 ~8 分鐘／rows 長期偏少／輪詢卡住 → Telegram `auto_heal`（自動縮短間隔重試最多 3 次）→ 仍失敗則 `needs_fix`；恢復則 `recovered`
 - 成功：`last_success_at` 更新、`consecutive_failures=0`、寫 jsonl；快照含 `prev_available` / `available_since`（重啟唔當補貨、可續計時長）
 - 失敗：保留舊 `last_success_at`；API 仍回 matrix（可能全 null）+ `last_error`
 - 前端用 **`last_success_at`** 判斷新唔新鮮，唔好當「有 matrix 就係新數據」
+- 注意：Dashboard process 死咗就唔能自己打 Telegram；要靠你重開 `npm run dashboard`（或之後另加外部 watchdog）
 
 ## Live 補貨紀錄
 

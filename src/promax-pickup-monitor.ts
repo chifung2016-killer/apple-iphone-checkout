@@ -17,6 +17,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   hasTelegramCreds,
+  notifyPromaxHealthAlert,
   notifyPromaxTelegram,
   upsertPromaxTelegramStatus,
 } from "./promax-telegram.js";
@@ -228,6 +229,20 @@ const state: MonitorState = {
 /** Telegram live status 上次推送時間（節流） */
 let lastTelegramStatusAt = 0;
 
+/** 健康檢查／自動修復 */
+const STALE_SUCCESS_MS = 8 * 60_000;
+const WATCHDOG_MS = 60_000;
+const MAX_AUTO_HEAL = 3;
+const EXPECTED_ROWS_SOFT = 24; // 8×6=48；少過呢個當半失效
+
+let healthWatchdog: ReturnType<typeof setInterval> | null = null;
+let wasUnhealthy = false;
+let autoHealAttempts = 0;
+let softLowRowStreak = 0;
+/** 自動修復時覆寫下一次間隔（ms） */
+let rescheduleOverrideMs: number | null = null;
+let lastAutoHealAt = 0;
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -249,6 +264,151 @@ function formatDurationLabel(ms: number): string {
 
 function currentPollMode(): "idle" | "hot" {
   return state.anyInStock ? "hot" : "idle";
+}
+
+function diagnoseUnhealthy(): { unhealthy: boolean; reason: string } | null {
+  if (!state.running) return null;
+  if (state.consecutiveFailures >= 3) {
+    return {
+      unhealthy: true,
+      reason: `連續 ${state.consecutiveFailures} 次輪詢無有效門市數據`,
+    };
+  }
+  if (state.lastSuccessAt) {
+    const age = Date.now() - Date.parse(state.lastSuccessAt);
+    if (Number.isFinite(age) && age > STALE_SUCCESS_MS) {
+      return {
+        unhealthy: true,
+        reason: `超過 ${Math.round(age / 60_000)} 分鐘無成功更新（數據可能過期）`,
+      };
+    }
+  } else if (state.lastAttemptAt) {
+    const age = Date.now() - Date.parse(state.lastAttemptAt);
+    if (Number.isFinite(age) && age > 3 * 60_000) {
+      return {
+        unhealthy: true,
+        reason: "從未成功拉取庫存，且已嘗試超過 3 分鐘",
+      };
+    }
+  }
+  if (softLowRowStreak >= 3) {
+    return {
+      unhealthy: true,
+      reason: `連續 ${softLowRowStreak} 次 rows 偏少（<${EXPECTED_ROWS_SOFT}），可能被擋或部分失敗`,
+    };
+  }
+  return null;
+}
+
+async function maybeAutoHeal(reason: string): Promise<void> {
+  if (!state.running) return;
+  const now = Date.now();
+  if (now - lastAutoHealAt < 45_000) return;
+  lastAutoHealAt = now;
+
+  autoHealAttempts += 1;
+  // 縮短 backoff，唔好困喺 15 分鐘
+  state.consecutiveFailures = Math.min(state.consecutiveFailures, 1);
+  console.warn(`[promax-pickup] auto-heal #${autoHealAttempts}：${reason}`);
+
+  if (autoHealAttempts <= MAX_AUTO_HEAL) {
+    rescheduleOverrideMs = randomBetween(15_000, 25_000);
+    void notifyPromaxHealthAlert({
+      kind: "auto_heal",
+      reason,
+      lastError: state.lastError,
+      lastSuccessAt: state.lastSuccessAt,
+      consecutiveFailures: state.consecutiveFailures,
+      autoHealAttempt: autoHealAttempts,
+    }).catch(() => {});
+  } else {
+    // 之後仍會慢慢輪詢，但請人 Fix
+    rescheduleOverrideMs = randomBetween(60_000, 90_000);
+    void notifyPromaxHealthAlert({
+      kind: "needs_fix",
+      reason: `${reason}（自動修復 ${MAX_AUTO_HEAL} 次仍失敗）`,
+      lastError: state.lastError,
+      lastSuccessAt: state.lastSuccessAt,
+      consecutiveFailures: state.consecutiveFailures,
+      rowsInLastPoll: state.latest?.rows_in_last_poll,
+      autoHealAttempt: autoHealAttempts,
+    }).catch(() => {});
+  }
+}
+
+async function evaluateHealthAfterPoll(rows: number): Promise<void> {
+  if (rows > 0 && rows < EXPECTED_ROWS_SOFT) softLowRowStreak += 1;
+  else if (rows >= EXPECTED_ROWS_SOFT) softLowRowStreak = 0;
+  else if (rows === 0) softLowRowStreak += 1;
+
+  const diag = diagnoseUnhealthy();
+  if (diag?.unhealthy) {
+    wasUnhealthy = true;
+    await maybeAutoHeal(diag.reason);
+    return;
+  }
+
+  if (wasUnhealthy && rows > 0 && state.consecutiveFailures === 0) {
+    wasUnhealthy = false;
+    const healedAfter = autoHealAttempts;
+    autoHealAttempts = 0;
+    softLowRowStreak = 0;
+    void notifyPromaxHealthAlert({
+      kind: "recovered",
+      reason:
+        healedAfter > 0
+          ? `自動修復後恢復正常（曾重試 ${healedAfter} 次）`
+          : "監控已恢復正常",
+      lastSuccessAt: state.lastSuccessAt,
+      rowsInLastPoll: rows,
+    }).catch(() => {});
+  }
+}
+
+function startHealthWatchdog(): void {
+  if (healthWatchdog) return;
+  healthWatchdog = setInterval(() => {
+    if (!state.running) return;
+
+    // 輪詢 timer 卡住：太久無 attempt → 強制重新排程
+    if (state.lastAttemptAt) {
+      const age = Date.now() - Date.parse(state.lastAttemptAt);
+      const hungAfter = Math.max(
+        (state.pollIntervalMs || 60_000) * 3,
+        4 * 60_000
+      );
+      if (Number.isFinite(age) && age > hungAfter) {
+        wasUnhealthy = true;
+        void (async () => {
+          await maybeAutoHeal(
+            `輪詢似乎卡住（${Math.round(age / 60_000)} 分鐘無 attempt）— 重新排程`
+          );
+          await scheduleNext();
+        })();
+        return;
+      }
+    }
+
+    const diag = diagnoseUnhealthy();
+    if (diag?.unhealthy) {
+      wasUnhealthy = true;
+      void (async () => {
+        await maybeAutoHeal(diag.reason);
+        // 若未排程中，確保有下一次
+        if (!state.timer) await scheduleNext();
+      })();
+    }
+  }, WATCHDOG_MS);
+  if (typeof healthWatchdog === "object" && "unref" in healthWatchdog) {
+    healthWatchdog.unref();
+  }
+}
+
+function stopHealthWatchdog(): void {
+  if (healthWatchdog) {
+    clearInterval(healthWatchdog);
+    healthWatchdog = null;
+  }
 }
 
 /** idle 45–60s / hot 15–25s + jitter；失敗 ≥2 → backoff */
@@ -751,6 +911,7 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
       (newRestockEvents.length ? ` restockEvents=${newRestockEvents.length}` : "") +
       (state.lastError ? ` err=${state.lastError}` : "")
   );
+  await evaluateHealthAfterPoll(matchedCells);
   if (newRestockEvents.some((e) => e.event === "restock" || e.event === "sold_out")) {
     void notifyPromaxTelegram(newRestockEvents).catch((err) => {
       console.warn(
@@ -822,7 +983,12 @@ async function loadLatestFromDisk(): Promise<void> {
 
 async function scheduleNext(): Promise<void> {
   if (!state.running) return;
-  state.pollIntervalMs = computeNextIntervalMs(state.consecutiveFailures);
+  if (rescheduleOverrideMs != null) {
+    state.pollIntervalMs = rescheduleOverrideMs;
+    rescheduleOverrideMs = null;
+  } else {
+    state.pollIntervalMs = computeNextIntervalMs(state.consecutiveFailures);
+  }
   state.nextPollInMs = state.pollIntervalMs;
   if (state.timer) clearTimeout(state.timer);
   state.timer = setTimeout(() => {
@@ -833,6 +999,7 @@ async function scheduleNext(): Promise<void> {
         state.consecutiveFailures += 1;
         state.lastError = err instanceof Error ? err.message : String(err);
         console.warn(`[promax-pickup] poll crash: ${state.lastError}`);
+        await evaluateHealthAfterPoll(0);
       } finally {
         await scheduleNext();
       }
@@ -855,11 +1022,13 @@ export async function startPromaxPickupMonitor(opts?: {
   state.running = true;
   await ensureRuntime();
   await loadLatestFromDisk();
+  startHealthWatchdog();
   console.log(
     `[promax-pickup] started｜sku_map=${SKU_MAP_PATH}｜stores=${HK_APPLE_STORES.length}` +
       `｜telegram=${hasTelegramCreds() ? "on" : "off"}` +
       `｜idle=${Math.round(IDLE_POLL_MIN_MS / 1000)}-${Math.round(IDLE_POLL_MAX_MS / 1000)}s` +
-      `｜hot=${Math.round(HOT_POLL_MIN_MS / 1000)}-${Math.round(HOT_POLL_MAX_MS / 1000)}s`
+      `｜hot=${Math.round(HOT_POLL_MIN_MS / 1000)}-${Math.round(HOT_POLL_MAX_MS / 1000)}s` +
+      `｜health-watch=on`
   );
   if (opts?.runImmediately !== false) {
     try {
@@ -875,6 +1044,7 @@ export async function startPromaxPickupMonitor(opts?: {
 
 export function stopPromaxPickupMonitor(): void {
   state.running = false;
+  stopHealthWatchdog();
   if (state.timer) {
     clearTimeout(state.timer);
     state.timer = null;

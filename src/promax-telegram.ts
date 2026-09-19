@@ -196,3 +196,81 @@ export async function upsertPromaxTelegramStatus(
 export function hasTelegramCreds(): boolean {
   return Boolean(telegramCreds());
 }
+
+export type PromaxHealthAlert = {
+  kind: "auto_heal" | "needs_fix" | "recovered";
+  reason: string;
+  lastError?: string | null;
+  lastSuccessAt?: string | null;
+  consecutiveFailures?: number;
+  rowsInLastPoll?: number;
+  autoHealAttempt?: number;
+};
+
+let lastHealthAlertAt = 0;
+let lastHealthAlertKind: string | null = null;
+
+/** 監控失效／自動修復／恢復 → Telegram（節流，避免洗版） */
+export async function notifyPromaxHealthAlert(
+  alert: PromaxHealthAlert
+): Promise<void> {
+  const creds = telegramCreds();
+  if (!creds) return;
+
+  const now = Date.now();
+  const cooldownMs =
+    alert.kind === "recovered"
+      ? 30_000
+      : alert.kind === "auto_heal"
+        ? 5 * 60_000
+        : 12 * 60_000;
+  if (
+    lastHealthAlertKind === alert.kind &&
+    now - lastHealthAlertAt < cooldownMs
+  ) {
+    return;
+  }
+  lastHealthAlertAt = now;
+  lastHealthAlertKind = alert.kind;
+
+  const lines: string[] = [];
+  if (alert.kind === "recovered") {
+    lines.push("*✅ Pro Max 監控已恢復*");
+    lines.push(escapeMd(alert.reason));
+  } else if (alert.kind === "auto_heal") {
+    lines.push("*🛠️ Pro Max 監控異常 — 正在自動修復*");
+    lines.push(escapeMd(alert.reason));
+    if (alert.autoHealAttempt != null) {
+      lines.push(`自動重試：第 ${alert.autoHealAttempt} 次`);
+    }
+  } else {
+    lines.push("*🚨 Pro Max 監控失效 — 請 Fix*");
+    lines.push(escapeMd(alert.reason));
+    lines.push("");
+    lines.push("*請你做：*");
+    lines.push("1\\. 開 http://127\\.0\\.0\\.1:8787/api/health");
+    lines.push("2\\. 睇 /api/promax\\-pickup/status（last\\_success\\_at / last\\_error）");
+    lines.push("3\\. 必要時喺專案目錄重啟：`npm run dashboard`");
+    lines.push("4\\. 若成日 541：稍等再試，或同我講幫手查");
+  }
+
+  if (alert.lastError) {
+    lines.push(`錯誤：${escapeMd(String(alert.lastError).slice(0, 160))}`);
+  }
+  if (alert.lastSuccessAt) {
+    lines.push(`上次成功：${escapeMd(alert.lastSuccessAt)}`);
+  }
+  if (alert.consecutiveFailures != null) {
+    lines.push(`連續失敗：${alert.consecutiveFailures}`);
+  }
+  if (alert.rowsInLastPoll != null) {
+    lines.push(`今次 rows：${alert.rowsInLastPoll}`);
+  }
+
+  await tgApi(creds.token, "sendMessage", {
+    chat_id: creds.chatId,
+    text: lines.join("\n"),
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+  });
+}
