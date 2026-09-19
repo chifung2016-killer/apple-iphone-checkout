@@ -52,6 +52,11 @@ function colorLogo(color: string): string {
   return "📱";
 }
 
+function formatRowsLine(rows?: number | null): string | null {
+  if (rows == null || !Number.isFinite(Number(rows))) return null;
+  return `今次 rows：${Math.round(Number(rows))}／48`;
+}
+
 function modelLine(model: string, storage: string, color: string): string {
   const logo = colorLogo(color);
   return `${escapeMd(model)} · ${escapeMd(storage)} · ${escapeMd(color)} ${logo}`;
@@ -129,10 +134,12 @@ export async function notifyPromaxTelegram(
     pollMode?: string | null;
     proxy?: {
       activeDisplay?: string | null;
+      activeFull?: string | null;
       count?: number;
       banned?: number;
       mode?: string | null;
     };
+    rowsInLastPoll?: number | null;
   }
 ): Promise<void> {
   const creds = telegramCreds();
@@ -165,6 +172,9 @@ export async function notifyPromaxTelegram(
       modelLine(ev.model, ev.storage, ev.color),
       formatMonitorModeLine(opts?.pollMode),
       formatMonitorProxyLine(opts?.proxy),
+      ...(formatRowsLine(opts?.rowsInLastPoll)
+        ? [formatRowsLine(opts?.rowsInLastPoll)!]
+        : []),
       `門市：${escapeMd(stores)}`,
       ...(ev.event === "sold_out" && ev.inStockForLabel
         ? [`在架時長：約 ${escapeMd(ev.inStockForLabel)}`]
@@ -189,10 +199,12 @@ export async function notifyPromaxModeChange(opts: {
   peakWindows?: string[];
   proxy?: {
     activeDisplay?: string | null;
+    activeFull?: string | null;
     count?: number;
     banned?: number;
     mode?: string | null;
   };
+  rowsInLastPoll?: number | null;
 }): Promise<void> {
   const creds = telegramCreds();
   if (!creds) return;
@@ -203,6 +215,9 @@ export async function notifyPromaxModeChange(opts: {
     `${escapeMd(opts.from || "—")} → *${escapeMd(opts.to)}*`,
     formatMonitorModeLine(opts.to),
     formatMonitorProxyLine(opts.proxy),
+    ...(formatRowsLine(opts.rowsInLastPoll)
+      ? [formatRowsLine(opts.rowsInLastPoll)!]
+      : []),
     ...(opts.reason ? [escapeMd(opts.reason)] : []),
     ...(opts.peakWindows?.length
       ? [`補貨時段：${escapeMd(opts.peakWindows.join(" · "))}`]
@@ -248,6 +263,9 @@ export async function upsertPromaxTelegramStatus(
       ` · 成功：${escapeMd(formatHkDisplay(status.last_success_at))}`,
     `模式一覽：hot（補貨時段／有貨）｜peak（時段外疏掃） ← 而家 *${escapeMd(mode)}*`,
     formatMonitorProxyLine(proxySt),
+    ...(formatRowsLine(status.rows_in_last_poll)
+      ? [formatRowsLine(status.rows_in_last_poll)!]
+      : []),
   ];
   if (status.schedule?.peakWindows?.length) {
     lines.push(
@@ -347,6 +365,8 @@ export async function notifyPromaxProxyBanned(opts: {
   nextFull: string | null;
   count: number;
   banned: number;
+  rowsInLastPoll?: number | null;
+  resumeInMs?: number | null;
 }): Promise<void> {
   const creds = telegramCreds();
   if (!creds) return;
@@ -358,9 +378,15 @@ export async function notifyPromaxProxyBanned(opts: {
     `原因：${escapeMd(opts.reason)}`,
     `暫停：約 ${mins} 分鐘（至 ${escapeMd(formatHkDisplay(until))}）`,
     opts.nextFull
-      ? `轉用：${escapeMd(opts.nextFull)}`
+      ? `轉用：${escapeMd(opts.nextFull)}` +
+        (opts.resumeInMs
+          ? `（約 ${Math.max(1, Math.round(opts.resumeInMs / 60_000))} 分鐘後先打，唔即刻燒下一條）`
+          : "")
       : "轉用：無剩餘 proxy（本機／等解禁）",
     `池 ${opts.count} 條 · 暫 ban ${opts.banned}`,
+    ...(formatRowsLine(opts.rowsInLastPoll)
+      ? [formatRowsLine(opts.rowsInLastPoll)!]
+      : []),
     `時間：${escapeMd(formatHkDisplay(new Date().toISOString()))}`,
   ];
   await tgApi(creds.token, "sendMessage", {
@@ -447,7 +473,8 @@ export async function notifyPromaxHealthAlert(
     lines.push(`連續失敗：${alert.consecutiveFailures}`);
   }
   if (alert.rowsInLastPoll != null) {
-    lines.push(`今次 rows：${alert.rowsInLastPoll}`);
+    const rowLine = formatRowsLine(alert.rowsInLastPoll);
+    if (rowLine) lines.push(rowLine);
   }
 
   await tgApi(creds.token, "sendMessage", {

@@ -282,20 +282,37 @@ let rescheduleOverrideMs: number | null = null;
 let lastAutoHealAt = 0;
 /** Apple 邊緣擋（541/403/429）冷卻至此時刻 */
 let edgeBlockedUntil = 0;
+/** 541 後唔即刻打下一條 proxy；等到呢個時刻先再 poll */
+let proxyRotateNotBefore = 0;
 let lastEdgeCooldownNotifyAt = 0;
 
 function edgeBlockRemainingMs(): number {
   return Math.max(0, edgeBlockedUntil - Date.now());
 }
 
-function tripEdgeBlock(status: number, where: string): void {
+function rotateHoldRemainingMs(): number {
+  return Math.max(0, proxyRotateNotBefore - Date.now());
+}
+
+function tripEdgeBlock(
+  status: number,
+  where: string,
+  rowsSoFar = 0
+): void {
   if (status !== 429 && status !== 403 && status !== 541) return;
-  // 有其他監控 proxy → 即刻轉線，取消長暫停
-  if (rotateMonitorProxyOnBlock(`HTTP ${status} @ ${where}`)) {
+  // 有其他監控 proxy → ban 呢條，但等 1–2 分鐘先打下一條，避免連燒成池
+  const resumeInMs = randomBetween(60_000, 120_000);
+  if (
+    rotateMonitorProxyOnBlock(`HTTP ${status} @ ${where}`, 30 * 60_000, {
+      resumeInMs,
+      rowsInLastPoll: rowsSoFar,
+    })
+  ) {
     edgeBlockedUntil = 0;
-    rescheduleOverrideMs = randomBetween(2_000, 5_000);
+    proxyRotateNotBefore = Date.now() + resumeInMs;
+    rescheduleOverrideMs = resumeInMs;
     console.warn(
-      `[promax-pickup] edge HTTP ${status} @ ${where} — rotated proxy, resume in ~${Math.round((rescheduleOverrideMs || 0) / 1000)}s（無 12 分鐘熔斷）`
+      `[promax-pickup] edge HTTP ${status} @ ${where} — rotated proxy, next request in ~${Math.round(resumeInMs / 1000)}s（唔即刻燒下一條）`
     );
     return;
   }
@@ -465,6 +482,14 @@ async function maybeAutoHeal(reason: string): Promise<void> {
   lastAutoHealAt = now;
 
   const rem = edgeBlockRemainingMs();
+  const hold = rotateHoldRemainingMs();
+  if (hold > 0) {
+    kickScheduleSoon(hold);
+    console.warn(
+      `[promax-pickup] auto-heal：541 後暫停轉線，再等 ${Math.ceil(hold / 1000)}s`
+    );
+    return;
+  }
   if (rem > 0) {
     // 有監控 proxy 池 → 唔好乾等長熔斷；清冷卻即刻再試（真正 541 時 poll 會自己 rotate）
     if (getMonitorProxyStatus().count > 0) {
@@ -649,30 +674,25 @@ function browserHeaders(): Record<string, string> {
   };
 }
 
-function parsePickupStores(
+function parsePickupBySku(
   data: Record<string, unknown>,
-  sku: string
-): {
-  storeName: string;
-  pickupDisplay: string;
-  pickupQuote: string;
-}[] {
+  skus: string[]
+): Map<string, { storeName: string; pickupDisplay: string; pickupQuote: string }[]> {
   const body = (data.body || {}) as Record<string, unknown>;
   const content = (body.content || {}) as Record<string, unknown>;
   const pickupMessage = (content.pickupMessage ||
     body.pickupMessage ||
     {}) as Record<string, unknown>;
-  // 而家 Apple 多數直接 body.stores；舊路徑 body.content.pickupMessage.stores
   const stores = (body.stores ||
     pickupMessage.stores ||
     content.stores ||
     []) as Record<string, unknown>[];
 
-  const rows: {
-    storeName: string;
-    pickupDisplay: string;
-    pickupQuote: string;
-  }[] = [];
+  const out = new Map<
+    string,
+    { storeName: string; pickupDisplay: string; pickupQuote: string }[]
+  >();
+  for (const sku of skus) out.set(sku, []);
 
   for (const store of stores) {
     const storeName = String(store.storeName || "").trim();
@@ -681,31 +701,26 @@ function parsePickupStores(
       string,
       Record<string, unknown>
     >;
-    const part =
-      parts[sku] ||
-      parts[sku.toUpperCase()] ||
-      Object.values(parts)[0] ||
-      {};
-    rows.push({
-      storeName,
-      pickupDisplay: String(part.pickupDisplay ?? "").trim() || "unknown",
-      pickupQuote: String(part.pickupSearchQuote ?? "").trim(),
-    });
+    for (const sku of skus) {
+      const part = parts[sku] || parts[sku.toUpperCase()];
+      if (!part) continue;
+      out.get(sku)!.push({
+        storeName,
+        pickupDisplay: String(part.pickupDisplay ?? "").trim() || "unknown",
+        pickupQuote: String(part.pickupSearchQuote ?? "").trim(),
+      });
+    }
   }
-  return rows;
+  return out;
 }
 
-async function fetchPickupMessageStores(sku: string): Promise<
-  {
-    storeName: string;
-    pickupDisplay: string;
-    pickupQuote: string;
-  }[]
-> {
+async function fetchPickupMessageBatch(
+  skus: string[]
+): Promise<Map<string, { storeName: string; pickupDisplay: string; pickupQuote: string }[]>> {
   const url = new URL(PICKUP_MESSAGE_URL);
   url.searchParams.set("pl", "true");
-  url.searchParams.set("parts.0", sku);
   url.searchParams.set("location", PICKUP_LOCATION);
+  skus.forEach((sku, i) => url.searchParams.set(`parts.${i}`, sku));
 
   const res = await monitorFetchGet(url.toString(), browserHeaders());
 
@@ -722,7 +737,7 @@ async function fetchPickupMessageStores(sku: string): Promise<
   }
 
   const data = (await res.json()) as Record<string, unknown>;
-  return parsePickupStores(data, sku);
+  return parsePickupBySku(data, skus);
 }
 
 async function fetchFulfillmentMessagesStores(sku: string): Promise<
@@ -753,7 +768,7 @@ async function fetchFulfillmentMessagesStores(sku: string): Promise<
   }
 
   const data = (await res.json()) as Record<string, unknown>;
-  return parsePickupStores(data, sku);
+  return parsePickupBySku(data, [sku]).get(sku) || [];
 }
 
 /**
@@ -771,7 +786,8 @@ export async function fetchFulfillmentStores(
   }[]
 > {
   try {
-    const rows = await fetchPickupMessageStores(sku);
+    const bySku = await fetchPickupMessageBatch([sku]);
+    const rows = bySku.get(sku) || [];
     if (rows.length) return rows;
   } catch (err) {
     const status = (err as { status?: number }).status;
@@ -1020,6 +1036,15 @@ function buildStatus(partial: {
 }
 
 export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
+  const hold = rotateHoldRemainingMs();
+  if (hold > 0) {
+    rescheduleOverrideMs = hold;
+    console.warn(
+      `[promax-pickup] skip poll — rotate hold ${Math.ceil(hold / 1000)}s（等完先打下一條）`
+    );
+    return state.latest || buildStatus({ matrix: [], rowsInLastPoll: 0 });
+  }
+
   state.lastAttemptAt = new Date().toISOString();
 
   const coolRem = edgeBlockRemainingMs();
@@ -1039,62 +1064,101 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
   }
 
   const skus = await loadSkuMap();
-  const matrix: MatrixEntry[] = [];
+  const matrix: MatrixEntry[] = skus.map((item) => ({
+    sku: item.sku,
+    color: item.color,
+    storage: item.storage,
+    stores: emptyStoreCells(),
+  }));
   const collectionRows: PromaxStockRow[] = [];
   const ts = state.lastAttemptAt;
   let blocked = 0;
-  let abortEdge = false;
 
-  for (const item of skus) {
-    const entry: MatrixEntry = {
-      sku: item.sku,
-      color: item.color,
-      storage: item.storage,
-      stores: emptyStoreCells(),
-    };
-    if (abortEdge) {
-      matrix.push(entry);
-      continue;
+  const applyStores = (
+    item: { sku: string; color: string; storage: string },
+    appleStores: { storeName: string; pickupDisplay: string; pickupQuote: string }[]
+  ) => {
+    const entry = matrix.find((e) => e.sku === item.sku);
+    if (!entry) return;
+    for (const a of appleStores) {
+      const matched = matchStore(a.storeName);
+      if (!matched) continue;
+      const cell = entry.stores.find((c) => c.store_id === matched.id);
+      if (!cell) continue;
+      cell.pickup_display = a.pickupDisplay;
+      cell.pickup_quote = a.pickupQuote;
+      cell.matched_store_name = a.storeName;
+      collectionRows.push({
+        timestamp: ts,
+        sku: item.sku,
+        color: item.color,
+        storage: item.storage,
+        store_name: matched.name,
+        pickup_display: a.pickupDisplay,
+        pickup_quote: a.pickupQuote,
+      });
     }
-    try {
-      const appleStores = await fetchFulfillmentStores(item.sku);
-      for (const a of appleStores) {
-        const matched = matchStore(a.storeName);
-        if (!matched) continue;
-        const cell = entry.stores.find((c) => c.store_id === matched.id);
-        if (!cell) continue;
-        cell.pickup_display = a.pickupDisplay;
-        cell.pickup_quote = a.pickupQuote;
-        cell.matched_store_name = a.storeName;
-        collectionRows.push({
-          timestamp: ts,
-          sku: item.sku,
-          color: item.color,
-          storage: item.storage,
-          store_name: matched.name,
-          pickup_display: a.pickupDisplay,
-          pickup_quote: a.pickupQuote,
-        });
-      }
-      // SKU 之間間隔：hot 較短；idle 稍鬆
-      const gap = state.anyInStock
-        ? randomBetween(250, 550)
-        : randomBetween(400, 800);
-      await sleep(gap);
-    } catch (err) {
-      const status = (err as { status?: number }).status;
-      if (status === 429 || status === 403 || status === 541) {
-        blocked += 1;
-        tripEdgeBlock(status, `${item.storage}/${item.color}`);
-        abortEdge = true;
-      }
-      state.lastError = err instanceof Error ? err.message : String(err);
-      console.warn(
-        `[promax-pickup] ${item.storage}/${item.color} (${item.sku}) failed: ${state.lastError}` +
-          (abortEdge ? " — abort remaining SKUs this poll" : "")
+  };
+
+  try {
+    const bySku = await fetchPickupMessageBatch(skus.map((s) => s.sku));
+    const any = [...bySku.values()].some((rows) => rows.length > 0);
+    if (!any) throw new Error("pickup-message batch returned 0 stores");
+    for (const item of skus) applyStores(item, bySku.get(item.sku) || []);
+    console.log(
+      `[promax-pickup] batch pickup-message 1 request · skus=${skus.length} rows=${collectionRows.length}`
+    );
+  } catch (err) {
+    const status = (err as { status?: number }).status;
+    const msg = err instanceof Error ? err.message : String(err);
+    const edgeLike =
+      status === 429 ||
+      status === 403 ||
+      status === 541 ||
+      /terminated|ECONNRESET|ECONNREFUSED|ETIMEDOUT|socket hang up|ProxyResponseError/i.test(
+        msg
       );
+    if (edgeLike) {
+      blocked += 1;
+      tripEdgeBlock(status || 541, "batch", collectionRows.length);
+      state.lastError = msg;
+      console.warn(`[promax-pickup] batch failed: ${msg} — skip per-SKU（避免再打 8 次）`);
+    } else {
+      console.warn(
+        `[promax-pickup] batch failed: ${msg} — fallback 逐個 SKU，間隔加長`
+      );
+      for (const item of skus) {
+        try {
+          const appleStores = await fetchFulfillmentStores(item.sku);
+          applyStores(item, appleStores);
+          const gap = state.anyInStock
+            ? randomBetween(2_000, 3_500)
+            : randomBetween(3_000, 5_000);
+          await sleep(gap);
+        } catch (skuErr) {
+          const skuStatus = (skuErr as { status?: number }).status;
+          if (skuStatus === 429 || skuStatus === 403 || skuStatus === 541) {
+            blocked += 1;
+            tripEdgeBlock(
+              skuStatus,
+              `${item.storage}/${item.color}`,
+              collectionRows.length
+            );
+            state.lastError =
+              skuErr instanceof Error ? skuErr.message : String(skuErr);
+            console.warn(
+              `[promax-pickup] ${item.storage}/${item.color} failed: ${state.lastError} — abort remaining SKUs`
+            );
+            break;
+          }
+          state.lastError =
+            skuErr instanceof Error ? skuErr.message : String(skuErr);
+          console.warn(
+            `[promax-pickup] ${item.storage}/${item.color} (${item.sku}) failed: ${state.lastError}`
+          );
+        }
+      }
     }
-    matrix.push(entry);
   }
 
   const matchedCells = collectionRows.length;
@@ -1148,6 +1212,7 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
     void notifyPromaxTelegram(newRestockEvents, {
       pollMode: status.poll_mode,
       proxy: telegramProxyOpts(),
+      rowsInLastPoll: matchedCells,
     }).catch((err) => {
       console.warn(
         `[promax-pickup] telegram notify failed：${err instanceof Error ? err.message : String(err)}`
@@ -1163,6 +1228,7 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
       reason: status.schedule?.reason,
       peakWindows: status.schedule?.peakWindows,
       proxy: telegramProxyOpts(),
+      rowsInLastPoll: matchedCells,
     }).catch(() => {});
     lastTelegramStatusAt = 0;
   } else if (lastNotifiedPollMode !== status.poll_mode) {
@@ -1172,6 +1238,7 @@ export async function runPromaxPickupPollOnce(): Promise<PromaxPickupStatus> {
       reason: status.schedule?.reason,
       peakWindows: status.schedule?.peakWindows,
       proxy: telegramProxyOpts(),
+      rowsInLastPoll: matchedCells,
     }).catch(() => {});
     lastNotifiedPollMode = status.poll_mode;
     lastTelegramStatusAt = 0;
@@ -1267,7 +1334,10 @@ async function loadLatestFromDisk(): Promise<void> {
 
 async function scheduleNext(): Promise<void> {
   if (!state.running) return;
-  if (rescheduleOverrideMs != null) {
+  const hold = rotateHoldRemainingMs();
+  if (hold > 0) {
+    state.pollIntervalMs = hold;
+  } else if (rescheduleOverrideMs != null) {
     state.pollIntervalMs = rescheduleOverrideMs;
     rescheduleOverrideMs = null;
   } else {
@@ -1345,6 +1415,7 @@ export function stopPromaxPickupMonitor(): void {
 /** 清 541 熔斷（例如換咗監控 proxy）並盡快再 poll */
 export function clearPromaxEdgeCooldown(): void {
   edgeBlockedUntil = 0;
+  proxyRotateNotBefore = 0;
   softLowRowStreak = 0;
   console.log("[promax-pickup] edge cooldown cleared");
   if (state.running) kickScheduleSoon(randomBetween(1_000, 3_000));

@@ -39,8 +39,9 @@ alwaysApply: true
 
 **主 endpoint（可行）：**
 ```
-GET https://www.apple.com/hk/shop/retail/pickup-message?pl=true&parts.0={SKU}&location=中環
+GET https://www.apple.com/hk/shop/retail/pickup-message?pl=true&parts.0={SKU1}&parts.1={SKU2}&…&location=中環
 ```
+- 一輪用 **一次** request 帶晒全部監控 SKU（`parts.0`…），唔好逐個 SKU 打 8 次
 - `location` 要用地區名（**「中環」**）；用 `HK` 會 **0 stores**
 - 普通 `fetch` + 瀏覽器 UA／Referer／Accept-Language: zh-HK 就得
 - 成功時一次回晒 6 間店；parse：`body.content.pickupMessage.stores[]`
@@ -62,8 +63,8 @@ GET …/fulfillment-messages?…&location=HK
   - `hot`（有至少一款有貨）：約 **25–40s**（太密易 541）
   - 可 `.env` 覆寫：`PROMAX_POLL_IDLE_MIN_MS` / `IDLE_MAX` / `HOT_MIN` / `HOT_MAX` / `PROMAX_EDGE_COOLDOWN_MS`
   - 連續失敗 ≥2 → backoff（最多約 15 分鐘）
-- **HTTP 541/403/429**：有監控 proxy 可轉 → **即刻換線**（約 2–5s 再 poll，無 12 分鐘熔斷）；成池 ban 晒 → 等到最早解禁／否則冷卻約 12 分鐘。541 唔打 fulfillment fallback；同一輪 abort 其餘 SKU
-- SKU 之間 sleep：idle ~350–700ms；hot ~200–450ms
+- **HTTP 541/403/429**：ban 呢條，**等 1–2 分鐘**先打下一條（唔好 2–5s 即刻轉，避免燒晒成池）；成池 ban 晒 → 等到最早解禁／否則冷卻約 12 分鐘。541 唔打 fulfillment fallback；batch 失敗唔好再逐個 SKU 狂打
+- 只有 batch 失敗先逐個 SKU fallback，間隔約 **2–5s**（唔好 200–800ms）
 - `sold_out` 帶 `inStockForMs` / `inStockForLabel`（由首次有貨→全無貨）
 - **時段模式**：已知補貨 Range → **hot**（~90–150s；門市有貨再密到 ~25–40s）；時段外 → **peak**（~6–10 分，減 541）。畢業前預設 hot 窗 **07:30–19:00**（含晏晝）；`PROMAX_SCHEDULE_MIN_DAYS`（預設 3）湊夠唔同日補貨先收窄窗。快照：`runtime/promax-schedule.json`
 - 成功：`last_success_at` 更新、`consecutive_failures=0`、寫 jsonl；快照含 `prev_available` / `available_since`（重啟唔當補貨、可續計時長）

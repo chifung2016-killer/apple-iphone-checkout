@@ -172,7 +172,8 @@ export function nextMonitorProxyUnbanMs(): number {
 /** 541/403/429 時暫ban 呢條，換下一條；有得換 → true */
 export function rotateMonitorProxyOnBlock(
   reason: string,
-  banMs = 30 * 60_000
+  banMs = 30 * 60_000,
+  extra?: { resumeInMs?: number; rowsInLastPoll?: number }
 ): boolean {
   const bannedRaw = activeRaw;
   if (bannedRaw) {
@@ -192,6 +193,8 @@ export function rotateMonitorProxyOnBlock(
       nextFull: next?.raw || null,
       count: pool.length,
       banned: bannedUntil.size,
+      rowsInLastPoll: extra?.rowsInLastPoll,
+      resumeInMs: extra?.resumeInMs,
     }).catch((err) => {
       console.warn(
         `[promax-proxy] telegram ban notify failed: ${
