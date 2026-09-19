@@ -1508,8 +1508,8 @@ async function spawnOneBrowser(
     ...cleanConfig,
     browserCount: 1,
   } as Record<string, unknown> & { browserCount: number };
-  // 取貨 task：去到 pickup 頁就停低，等 Pro Max 監控到同色同容量先 refresh、揀店、加車
-  if (/^pickup/i.test(String(sessionConfig.fulfillmentPreference || ""))) {
+  // 只限 pickup credit card 訪客：去到取貨頁就停低，等監控到同色同容量先 refresh、揀店、加車
+  if (String(sessionConfig.fulfillmentPreference || "") === "pickup") {
     sessionConfig.holdAtPickupStoresForStock = true;
   }
   // 多個 proxy：每條最多分配畀 3 個 browser，用滿先換下一條（唔隨機重複）

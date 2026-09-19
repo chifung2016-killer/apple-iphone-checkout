@@ -10535,8 +10535,8 @@ async function fillShippingAndGoToPayment(
     await settleDom(page, 150);
   }
 
-  // Monitor+buying：喺 Fulfillment-init 待命，只響應同型號同色同容量有貨 → refresh → 繼續
-  if (CONFIG.holdAtPickupStoresForStock) {
+  // 只限 pickup credit card 訪客：Fulfillment-init 待命，同型號同色同容量有貨 → refresh → 揀監控門市 → 加車
+  if (CONFIG.holdAtPickupStoresForStock && isPickupCreditCardGuest()) {
     await runMonitorHoldBuyLoop(page, identity, tag, session);
     return;
   }
