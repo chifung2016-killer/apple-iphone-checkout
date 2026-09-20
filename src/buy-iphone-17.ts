@@ -14,6 +14,7 @@ import { chromium, type Frame, type Locator, type Page } from "playwright";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import fs from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
@@ -5713,7 +5714,32 @@ type StockResumeSku = {
   buyUrl?: string;
 };
 
+let promaxPartCache: Record<string, Record<string, string>> | null = null;
+
+function partNumberForPromax(storage: string, color: string): string {
+  if (!promaxPartCache) {
+    try {
+      promaxPartCache = JSON.parse(
+        readFileSync(path.join(ROOT, "config", "sku_map.json"), "utf8")
+      ) as Record<string, Record<string, string>>;
+    } catch {
+      promaxPartCache = {};
+    }
+  }
+  const gb = /512/i.test(storage) ? "512GB" : "256GB";
+  const bucket = promaxPartCache[gb] || {};
+  const want = String(color || "").replace(/\s+/g, "");
+  for (const [name, part] of Object.entries(bucket)) {
+    if (String(name).replace(/\s+/g, "") === want && part) return String(part);
+  }
+  return "";
+}
+
 function buyUrlForPromax(storage: string, color: string): string {
+  const part = partNumberForPromax(storage, color);
+  if (part) {
+    return `https://www.apple.com/hk-zh/shop/buy-iphone/iphone-18-pro?product=${encodeURIComponent(part)}&step=attach`;
+  }
   const gb = /512/i.test(storage) ? "512gb" : "256gb";
   return `https://www.apple.com/hk-zh/shop/buy-iphone/iphone-18-pro/${encodeURI(`6.9-吋顯示器-${gb}-${color}`)}`;
 }
@@ -5726,9 +5752,7 @@ function applyRestockSku(sku: StockResumeSku): void {
   if (sku.model) CONFIG.model = String(sku.model);
   if (sku.color) CONFIG.color = String(sku.color);
   if (sku.storage) CONFIG.storage = String(sku.storage);
-  CONFIG.buyUrl =
-    String(sku.buyUrl || "").trim() ||
-    buyUrlForPromax(CONFIG.storage, CONFIG.color);
+  CONFIG.buyUrl = buyUrlForPromax(CONFIG.storage, CONFIG.color);
   const codes = new Set<string>();
   for (const s of sku.stores || []) {
     const code = String(s.code || "").trim().toUpperCase();
@@ -6702,8 +6726,9 @@ async function attemptFullAddCartToPayment(
 
 /**
  * Pickup credit card 訪客：task 已經開定。
- * 只等監控旗標（約 0.4 秒查一次）。一有同色同容量，即刻去該 SKU 網址加車。
- * 唔 refresh 取貨頁，亦唔等 5 分鐘。
+ * 平時停喺空白頁等監控，唔入結帳（避免「操作階段已逾時」）。
+ * 一有同色同容量，即刻開該 Part Number 嘅 attach 連結（查看購物袋），再結帳、訪客、揀店。
+ * 加唔到就每 7 秒 refresh 揀門市頁再試，直至該款售罄。
  */
 async function runMonitorHoldBuyLoop(
   page: Page,
@@ -6714,14 +6739,14 @@ async function runMonitorHoldBuyLoop(
   let lastConsumedAt = Date.now();
 
   console.log(
-    `${tag} task 已開，等監控到 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage}，然後即刻去該 SKU 網址加車`
+    `${tag} task 已開（唔入結帳）。等監控到 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage}，然後即刻開 attach 連結加車`
   );
 
   while (true) {
     await throwIfReleased();
     await writeStatus({
       phase: "waiting_for_stock_at_stores",
-      message: `task 已開，等監控到 ${CONFIG.color}／${CONFIG.storage} 就即刻去 SKU 網址加車`,
+      message: `task 已開，等監控到 ${CONFIG.color}／${CONFIG.storage} 就開 attach 連結加車`,
       stuck: false,
       stuckSince: null,
     });
@@ -6731,7 +6756,7 @@ async function runMonitorHoldBuyLoop(
     lastConsumedAt = pending.atMs;
 
     const matchLabel = `${CONFIG.storage} ${CONFIG.color}`;
-    console.log(`  監控到 ${matchLabel} — 即刻去 SKU 網址加車：${CONFIG.buyUrl}`);
+    console.log(`  監控到 ${matchLabel} — 即刻開 attach 加車：${CONFIG.buyUrl}`);
     await writeStatus({
       phase: "resuming_after_stock",
       message: `監控到 ${matchLabel}：去產品頁加車`,
