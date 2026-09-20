@@ -2487,6 +2487,51 @@ function isShop404Url(url: string): boolean {
   return /\/shop\/404\b/i.test(url);
 }
 
+/** 結帳逾時：https://www.apple.com/hk-zh/shop/sorry/session_expired */
+function isSessionExpiredUrl(url: string): boolean {
+  return /\/shop\/sorry\/session_expired/i.test(url) || /session[_-]?expired/i.test(url);
+}
+
+const SESSION_EXPIRED_TEXT_RE =
+  /操作階段已逾時|Your session has expired|session has expired|Session expired/i;
+
+async function pageShowsSessionExpired(page: Page): Promise<boolean> {
+  if (isSessionExpiredUrl(page.url())) return true;
+  return page
+    .evaluate(() => {
+      const title = document.title || "";
+      const body = (document.body?.innerText || "").slice(0, 4000);
+      const h1 = document.querySelector("h1")?.textContent || "";
+      return `${title}\n${h1}\n${body}`;
+    })
+    .then((text) => SESSION_EXPIRED_TEXT_RE.test(text || ""))
+    .catch(() => false);
+}
+
+/** 逾時結帳唔可以 refresh 救返 — 要放棄 checkout，返產品頁重新加車 */
+async function recoverFromSessionExpired(
+  page: Page,
+  tag = ""
+): Promise<boolean> {
+  if (!(await pageShowsSessionExpired(page))) return false;
+  const prefix = tag ? `${tag} ` : "";
+  console.warn(
+    `  ${prefix}★ 操作階段已逾時（session expired）→ 放棄舊結帳，返產品頁重新加車｜${page.url()}`
+  );
+  await writeStatus({
+    phase: "session_expired",
+    stuck: false,
+    url: page.url(),
+    message: "操作階段已逾時：返產品頁重新加車",
+  }).catch(() => {});
+  const buy = String(CONFIG.buyUrl || "").trim() || buyUrlForNotFoundRecovery();
+  await withReleaseCheck(
+    page.goto(buy, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {})
+  );
+  await dismissCookies(page).catch(() => {});
+  return true;
+}
+
 /** Soft 404 文案（URL 仍可能係 Fulfillment-init 或 apple.com/search?src=pnf） */
 const PAGE_NOT_FOUND_TEXT_RE =
   /The page you[\u2019']?re looking for can[\u2019']?t be found|找不到你想去的網頁|找不到你要找的頁面|找不到你要尋找的頁面|找不到此頁面|頁面不存在/i;
@@ -5576,6 +5621,9 @@ async function hardRefreshFulfillmentInit(
   page: Page,
   label = "hard-refresh-fulfillment"
 ): Promise<void> {
+  if (await recoverFromSessionExpired(page, label)) {
+    return;
+  }
   const current = page.url();
   const target = fulfillmentInitUrlFrom(current);
   noteFulfillmentRefresh("soft");
@@ -5605,6 +5653,7 @@ async function hardRefreshFulfillmentInit(
     return;
   }
   await settleDom(page, 250);
+  if (await recoverFromSessionExpired(page, `${label}-after`)) return;
   await markPageErrorIfNotFound(page, label).catch(() => false);
   await recoverFromWrongAppleSearchIfNeeded(page, label).catch(() => false);
 }
@@ -6108,6 +6157,9 @@ async function isFulfillment503(
 }
 
 async function gotoFulfillmentInit(page: Page): Promise<void> {
+  if (await recoverFromSessionExpired(page, "[gotoFulfillment]")) {
+    return;
+  }
   const current = page.url();
   const target = fulfillmentInitUrlFrom(current);
   console.log(`  前往 Fulfillment-init：${target}`);
@@ -6124,6 +6176,9 @@ async function gotoFulfillmentInit(page: Page): Promise<void> {
     );
   }
   await settleAfterNavigation(page);
+  if (await recoverFromSessionExpired(page, "[gotoFulfillment-after]")) {
+    return;
+  }
 }
 
 /**
@@ -6237,7 +6292,8 @@ async function waitForFulfillmentInitDetailsReady(
       console.warn("  等詳細內容期間出現 503");
       return false;
     }
-    if (isShop404Url(page.url())) return false;
+    if (isShop404Url(page.url()) || isSessionExpiredUrl(page.url())) return false;
+    if (await pageShowsSessionExpired(page)) return false;
     if (
       isPickupContactPage(page.url()) ||
       isBillingPage(page.url()) ||
@@ -6831,21 +6887,54 @@ async function runMonitorHoldBuyLoop(
     while (!(await matchingSkuSoldOut(chaseFrom))) {
       await throwIfReleased();
       attempt += 1;
-      console.log(
-        `  加唔到車 — refresh 揀門市頁一次，${STORE_PAGE_RETRY_MS / 1000}s 後再試（第 ${attempt} 次）`
-      );
-      await writeStatus({
-        phase: "resuming_after_stock",
-        message: `${matchLabel} 加唔到車：refresh 揀門市頁，${STORE_PAGE_RETRY_MS / 1000}s 後再試`,
-      });
-      await gotoFulfillmentInit(page);
-      const soldDuringWait = await sleepUntilOrSoldOut(STORE_PAGE_RETRY_MS, chaseFrom);
-      if (soldDuringWait) break;
-      try {
-        reachedPay = await attemptPickupCheckoutToPayment(page, identity, tag, session);
-        if (!reachedPay) {
-          reachedPay = await attemptFullAddCartToPayment(page, identity, tag, session);
+      const expired = await pageShowsSessionExpired(page);
+      if (expired) {
+        console.log(
+          `  加唔到車（session expired）— 返產品頁重新加車（第 ${attempt} 次）`
+        );
+        await writeStatus({
+          phase: "resuming_after_stock",
+          message: `${matchLabel} session expired：返產品頁重新加車`,
+        });
+        await recoverFromSessionExpired(page, tag);
+      } else {
+        console.log(
+          `  加唔到車 — refresh 揀門市頁一次，${STORE_PAGE_RETRY_MS / 1000}s 後再試（第 ${attempt} 次）`
+        );
+        await writeStatus({
+          phase: "resuming_after_stock",
+          message: `${matchLabel} 加唔到車：refresh 揀門市頁，${STORE_PAGE_RETRY_MS / 1000}s 後再試`,
+        });
+        await gotoFulfillmentInit(page);
+        if (await pageShowsSessionExpired(page)) {
+          console.log("  refresh 後變 session expired — 改由產品頁重新加車");
+          await recoverFromSessionExpired(page, tag);
+        } else {
+          const soldDuringWait = await sleepUntilOrSoldOut(STORE_PAGE_RETRY_MS, chaseFrom);
+          if (soldDuringWait) break;
+          try {
+            reachedPay = await attemptPickupCheckoutToPayment(
+              page,
+              identity,
+              tag,
+              session
+            );
+            if (reachedPay) {
+              console.log(`${tag} 已到付款頁 — 結束待命`);
+              return;
+            }
+          } catch (err) {
+            if (err instanceof ReleaseError) throw err;
+            console.warn(
+              `${tag} 取貨頁再試失敗：`,
+              err instanceof Error ? err.message : String(err)
+            );
+          }
         }
+      }
+      if (await matchingSkuSoldOut(chaseFrom)) break;
+      try {
+        reachedPay = await attemptFullAddCartToPayment(page, identity, tag, session);
       } catch (err) {
         if (err instanceof ReleaseError) throw err;
         console.warn(
@@ -6928,6 +7017,14 @@ async function ensurePickupClickThenContinueReady(page: Page): Promise<boolean> 
     const roundStarted = Date.now();
     await throwIfReleased();
 
+    if (await pageShowsSessionExpired(page)) {
+      console.warn(
+        `  pickup credit card訪客：第 ${round} 輪已 session expired — 停止 refresh 結帳頁`
+      );
+      await recoverFromSessionExpired(page, `pickup-cc-guest-#${round}`);
+      return false;
+    }
+
     if (
       isPickupContactPage(page.url()) ||
       isBillingPage(page.url()) ||
@@ -6938,14 +7035,24 @@ async function ensurePickupClickThenContinueReady(page: Page): Promise<boolean> 
 
     // 第 1 輪：若已喺 Fulfillment 就先試；之後每輪一開始都 hard refresh
     if (round === 1) {
-      if (!/_s=Fulfillment/i.test(page.url()) || isShop404Url(page.url())) {
+      if (!/_s=Fulfillment/i.test(page.url()) || isShop404Url(page.url()) || isSessionExpiredUrl(page.url())) {
         if (isShop404Url(page.url())) {
           await recoverFromShop404IfNeeded(page, "[pickup-cc-guest]").catch(() => {});
+        }
+        if (await pageShowsSessionExpired(page)) {
+          await recoverFromSessionExpired(page, "[pickup-cc-guest]");
+          return false;
         }
         await hardRefreshFulfillmentInit(page, `pickup-cc-guest-5s-#${round}`);
       }
     } else {
       await hardRefreshFulfillmentInit(page, `pickup-cc-guest-5s-#${round}`);
+    }
+
+    if (await pageShowsSessionExpired(page)) {
+      console.warn(`  Fulfillment refresh 後 session expired（第 ${round} 輪）— 停止`);
+      await recoverFromSessionExpired(page, `pickup-cc-guest-#${round}`);
+      return false;
     }
 
     if (await isFulfillment503(page)) {
