@@ -5,7 +5,7 @@ import "dotenv/config";
  */
 import http from "node:http";
 import fs from "node:fs/promises";
-import { createReadStream, existsSync, readFileSync, watch as fsWatch, openSync } from "node:fs";
+import { createReadStream, existsSync, watch as fsWatch, openSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -632,32 +632,7 @@ function killAddOrderTask(id: string) {
   if (t?.child) killProc(t.child);
 }
 
-let promaxPartCache: Record<string, Record<string, string>> | null = null;
-
-function partNumberForPromax(storage: string, color: string): string {
-  if (!promaxPartCache) {
-    try {
-      promaxPartCache = JSON.parse(
-        readFileSync(path.join(ROOT, "config", "sku_map.json"), "utf8")
-      ) as Record<string, Record<string, string>>;
-    } catch {
-      promaxPartCache = {};
-    }
-  }
-  const gb = /512/i.test(storage) ? "512GB" : "256GB";
-  const bucket = promaxPartCache[gb] || {};
-  const want = String(color || "").replace(/\s+/g, "");
-  for (const [name, part] of Object.entries(bucket)) {
-    if (String(name).replace(/\s+/g, "") === want && part) return String(part);
-  }
-  return "";
-}
-
 function promaxBuyUrl(storage: string, color: string): string {
-  const part = partNumberForPromax(storage, color);
-  if (part) {
-    return `https://www.apple.com/hk-zh/shop/buy-iphone/iphone-18-pro?product=${encodeURIComponent(part)}&step=attach`;
-  }
   const gb = /512/i.test(storage) ? "512gb" : "256gb";
   return `https://www.apple.com/hk-zh/shop/buy-iphone/iphone-18-pro/${encodeURI(`6.9-吋顯示器-${gb}-${color}`)}`;
 }

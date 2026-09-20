@@ -14,7 +14,6 @@ import { chromium, type Frame, type Locator, type Page } from "playwright";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import fs from "node:fs/promises";
-import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
@@ -2247,6 +2246,62 @@ async function ensureTradeInAndAppleCareForAddToBag(page: Page): Promise<void> {
   console.warn("  未能確認「加入購物袋」已解鎖，稍後仍會 force 嘗試。");
 }
 
+/** 已配置 slug：型號／顏色／容量已選。只撳不換購、無 AppleCare、加入購物袋。 */
+async function addPromaxConfiguredSlugFast(page: Page): Promise<boolean> {
+  console.log("步驟：已配置產品頁 — 不換購 → 無 AppleCare → 加入購物袋");
+  await clickAutomOrRadio(
+    page,
+    "換購",
+    "不換購",
+    [
+      '[data-autom="choose-noTradeIn"]',
+      'input#noTradeIn',
+      'input[value="noTradeIn"]',
+      'label[for="noTradeIn"]',
+    ],
+    [/^不換購$/, /No trade[- ]?in/i]
+  ).catch(() => {});
+  await sleepCheckingRelease(200);
+  await clickAutomOrRadio(
+    page,
+    "AppleCare",
+    "無 AppleCare+ 服務計劃保障",
+    [
+      '[data-autom="noapplecare"]',
+      'input[data-autom="noapplecare"]',
+      'label[for*="noapplecare" i]',
+    ],
+    [/無 AppleCare/, /冇 AppleCare/, /No AppleCare/i]
+  ).catch(() => {});
+  await sleepCheckingRelease(200);
+
+  const addBtn = page.locator('[data-autom="add-to-cart"]').first();
+  if (!(await addBtn.count().catch(() => 0))) return false;
+  const disabled = await addBtn
+    .evaluate((n) => (n as HTMLButtonElement).disabled)
+    .catch(() => true);
+  if (disabled) {
+    console.warn("  加入購物袋仍然 disabled");
+    return false;
+  }
+  await humanClick(addBtn, { force: true }).catch(async () => {
+    await addBtn.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
+  });
+  console.log("  已撳加入購物袋");
+  await withReleaseCheck(
+    page
+      .waitForURL((u) => /step=attach|\/shop\/bag|\/shop\/checkout/i.test(u.toString()), {
+        timeout: 8000,
+      })
+      .catch(() => {})
+  );
+  if (isAttachStepUrl(page.url())) {
+    await clickReviewBagOnAttach(page);
+  }
+  if (/\/shop\/bag/i.test(page.url()) && (await isBagEmpty(page))) return false;
+  return (await confirmAddedToBag(page)) || isAttachStepUrl(page.url());
+}
+
 function isConfiguredProductSlugUrl(url: string): boolean {
   // 例：/iphone-17/6.3-…-256gb-… 或 /iphone-18-pro/6.9-…
   return /\/shop\/buy-iphone\/iphone-[^/]+\/\d+\.\d+/i.test(url);
@@ -3607,6 +3662,25 @@ async function addToBagAndOpenBag(page: Page): Promise<void> {
       );
     });
     return;
+  }
+
+  if (
+    isIphone18Task() &&
+    (isConfiguredProductSlugUrl(page.url()) || isConfiguredProductSlugUrl(CONFIG.buyUrl))
+  ) {
+    const fast = await addPromaxConfiguredSlugFast(page).catch((err) => {
+      console.warn(
+        `  快速加購失敗：${err instanceof Error ? err.message : String(err)}`
+      );
+      return false;
+    });
+    if (fast) {
+      await settleAfterNavigation(page);
+      await removeAccessoryItemsFromBag(page).catch(() => {});
+      console.log("  ✓ 已由已配置產品頁加入購物袋");
+      return;
+    }
+    console.warn("  快速加購未入袋，改用原有加購重試");
   }
 
   console.log("步驟：等待開賣並撳「繼續／加入購物袋」加入流程");
@@ -5714,32 +5788,7 @@ type StockResumeSku = {
   buyUrl?: string;
 };
 
-let promaxPartCache: Record<string, Record<string, string>> | null = null;
-
-function partNumberForPromax(storage: string, color: string): string {
-  if (!promaxPartCache) {
-    try {
-      promaxPartCache = JSON.parse(
-        readFileSync(path.join(ROOT, "config", "sku_map.json"), "utf8")
-      ) as Record<string, Record<string, string>>;
-    } catch {
-      promaxPartCache = {};
-    }
-  }
-  const gb = /512/i.test(storage) ? "512GB" : "256GB";
-  const bucket = promaxPartCache[gb] || {};
-  const want = String(color || "").replace(/\s+/g, "");
-  for (const [name, part] of Object.entries(bucket)) {
-    if (String(name).replace(/\s+/g, "") === want && part) return String(part);
-  }
-  return "";
-}
-
 function buyUrlForPromax(storage: string, color: string): string {
-  const part = partNumberForPromax(storage, color);
-  if (part) {
-    return `https://www.apple.com/hk-zh/shop/buy-iphone/iphone-18-pro?product=${encodeURIComponent(part)}&step=attach`;
-  }
   const gb = /512/i.test(storage) ? "512gb" : "256gb";
   return `https://www.apple.com/hk-zh/shop/buy-iphone/iphone-18-pro/${encodeURI(`6.9-吋顯示器-${gb}-${color}`)}`;
 }
@@ -6726,8 +6775,8 @@ async function attemptFullAddCartToPayment(
 
 /**
  * Pickup credit card 訪客：task 已經開定。
- * 平時停喺空白頁等監控，唔入結帳（避免「操作階段已逾時」）。
- * 一有同色同容量，即刻開該 Part Number 嘅 attach 連結（查看購物袋），再結帳、訪客、揀店。
+ * 平時停喺空白頁等監控，唔入結帳。
+ * 一有同色同容量，開已揀好型號／顏色／容量嘅產品頁，只撳不換購、無 AppleCare、加入購物袋。
  * 加唔到就每 7 秒 refresh 揀門市頁再試，直至該款售罄。
  */
 async function runMonitorHoldBuyLoop(
@@ -6739,14 +6788,14 @@ async function runMonitorHoldBuyLoop(
   let lastConsumedAt = Date.now();
 
   console.log(
-    `${tag} task 已開（唔入結帳）。等監控到 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage}，然後即刻開 attach 連結加車`
+    `${tag} task 已開（唔入結帳）。等監控到 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage}，然後開已配置產品頁加車`
   );
 
   while (true) {
     await throwIfReleased();
     await writeStatus({
       phase: "waiting_for_stock_at_stores",
-      message: `task 已開，等監控到 ${CONFIG.color}／${CONFIG.storage} 就開 attach 連結加車`,
+      message: `task 已開，等監控到 ${CONFIG.color}／${CONFIG.storage} 就開已配置產品頁加車`,
       stuck: false,
       stuckSince: null,
     });
@@ -6756,7 +6805,7 @@ async function runMonitorHoldBuyLoop(
     lastConsumedAt = pending.atMs;
 
     const matchLabel = `${CONFIG.storage} ${CONFIG.color}`;
-    console.log(`  監控到 ${matchLabel} — 即刻開 attach 加車：${CONFIG.buyUrl}`);
+    console.log(`  監控到 ${matchLabel} — 開已配置產品頁加車：${CONFIG.buyUrl}`);
     await writeStatus({
       phase: "resuming_after_stock",
       message: `監控到 ${matchLabel}：去產品頁加車`,
