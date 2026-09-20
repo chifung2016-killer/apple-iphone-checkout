@@ -3269,6 +3269,45 @@ server.listen(PORT, "127.0.0.1", () => {
             `[promax-pickup] 有貨 → 已開住嘅 task 跳去該 SKU 加車：${labels}`
           );
         }
+        const soldOuts = (events || []).filter((e) => e.event === "sold_out");
+        if (soldOuts.length) {
+          const soldPath = path.join(RUNTIME_DIR, "stock-soldout-all.flag");
+          let prevSkus: Array<Record<string, unknown>> = [];
+          try {
+            const prev = JSON.parse(await fs.readFile(soldPath, "utf8")) as {
+              skus?: Array<Record<string, unknown>>;
+            };
+            if (Array.isArray(prev.skus)) prevSkus = prev.skus;
+          } catch {
+            prevSkus = [];
+          }
+          const atMs = Date.now();
+          const keyOf = (s: { color?: string; storage?: string }) =>
+            `${String(s.storage || "").replace(/\s+/g, "").toLowerCase()}|${String(s.color || "").replace(/\s+/g, "")}`;
+          const byKey = new Map<string, Record<string, unknown>>();
+          for (const s of prevSkus) byKey.set(keyOf(s), s);
+          for (const e of soldOuts) {
+            byKey.set(keyOf(e), {
+              model: e.model,
+              color: e.color,
+              storage: e.storage,
+              name: e.name,
+              atMs,
+            });
+          }
+          await fs
+            .writeFile(
+              soldPath,
+              JSON.stringify({ atMs, skus: [...byKey.values()] }),
+              "utf8"
+            )
+            .catch(() => {});
+          console.log(
+            `[promax-pickup] 售罄 → 停止同款加車重試：${soldOuts
+              .map((e) => `${e.storage} ${e.color}`)
+              .join("；")}`
+          );
+        }
         if (events.length) {
           broadcast({ type: "status", state: await snapshot() });
         }

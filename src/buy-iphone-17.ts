@@ -394,6 +394,8 @@ const STOCK_RESUME_SESSION_FLAG = path.join(
   `stock-resume-${SESSION_ID}.flag`
 );
 const STOCK_RESUME_ALL_FLAG = path.join(RUNTIME_DIR, "stock-resume-all.flag");
+const STOCK_SOLDOUT_ALL_FLAG = path.join(RUNTIME_DIR, "stock-soldout-all.flag");
+const STORE_PAGE_RETRY_MS = 7_000;
 const STATUS_FILE = path.join(
   RUNTIME_DIR,
   SESSION_ID === "default" ? "runtime-status.json" : `status-${SESSION_ID}.json`
@@ -5871,6 +5873,26 @@ async function waitForMatchingStockResume(opts?: {
   }
 }
 
+async function matchingSkuSoldOut(afterMs: number): Promise<boolean> {
+  try {
+    const raw = await fs.readFile(STOCK_SOLDOUT_ALL_FLAG, "utf8");
+    const parsed = JSON.parse(raw) as {
+      atMs?: number;
+      skus?: StockResumeSku[];
+    };
+    const fileAt = typeof parsed.atMs === "number" ? parsed.atMs : 0;
+    return (parsed.skus || []).some((s) => {
+      const skuAt =
+        typeof (s as { atMs?: number }).atMs === "number"
+          ? (s as { atMs: number }).atMs
+          : fileAt;
+      return skuAt > afterMs && stockSkuMatchesCheckout(s);
+    });
+  } catch {
+    return false;
+  }
+}
+
 function fulfillmentInitUrlFrom(current: string): string {
   if (/\/shop\/checkout/i.test(current) && /store\.apple\.com/i.test(current)) {
     if (/[?&]_s=/i.test(current)) {
@@ -6715,17 +6737,10 @@ async function runMonitorHoldBuyLoop(
       message: `監控到 ${matchLabel}：去產品頁加車`,
     });
 
+    const chaseFrom = pending.atMs;
+    let reachedPay = false;
     try {
-      const reachedPay = await attemptFullAddCartToPayment(
-        page,
-        identity,
-        tag,
-        session
-      );
-      if (reachedPay) {
-        console.log(`${tag} 已到付款頁 — 結束待命`);
-        return;
-      }
+      reachedPay = await attemptFullAddCartToPayment(page, identity, tag, session);
     } catch (err) {
       if (err instanceof ReleaseError) throw err;
       console.warn(
@@ -6733,8 +6748,54 @@ async function runMonitorHoldBuyLoop(
         err instanceof Error ? err.message : String(err)
       );
     }
-    console.log(`  今次加車未完成，繼續等下一次 ${matchLabel}`);
+    if (reachedPay) {
+      console.log(`${tag} 已到付款頁 — 結束待命`);
+      return;
+    }
+
+    let attempt = 1;
+    while (!(await matchingSkuSoldOut(chaseFrom))) {
+      await throwIfReleased();
+      attempt += 1;
+      console.log(
+        `  加唔到車 — refresh 揀門市頁一次，${STORE_PAGE_RETRY_MS / 1000}s 後再試（第 ${attempt} 次）`
+      );
+      await writeStatus({
+        phase: "resuming_after_stock",
+        message: `${matchLabel} 加唔到車：refresh 揀門市頁，${STORE_PAGE_RETRY_MS / 1000}s 後再試`,
+      });
+      await gotoFulfillmentInit(page);
+      const soldDuringWait = await sleepUntilOrSoldOut(STORE_PAGE_RETRY_MS, chaseFrom);
+      if (soldDuringWait) break;
+      try {
+        reachedPay = await attemptPickupCheckoutToPayment(page, identity, tag, session);
+        if (!reachedPay) {
+          reachedPay = await attemptFullAddCartToPayment(page, identity, tag, session);
+        }
+      } catch (err) {
+        if (err instanceof ReleaseError) throw err;
+        console.warn(
+          `${tag} 再加車失敗：`,
+          err instanceof Error ? err.message : String(err)
+        );
+      }
+      if (reachedPay) {
+        console.log(`${tag} 已到付款頁 — 結束待命`);
+        return;
+      }
+    }
+    console.log(`  監控到 ${matchLabel} 售罄，停止呢輪加車，繼續等下一次有貨`);
+    lastConsumedAt = Date.now();
   }
+}
+
+async function sleepUntilOrSoldOut(ms: number, afterMs: number): Promise<boolean> {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (await matchingSkuSoldOut(afterMs)) return true;
+    await sleepCheckingRelease(Math.min(400, end - Date.now()));
+  }
+  return matchingSkuSoldOut(afterMs);
 }
 
 async function clickPickupOption(page: Page): Promise<boolean> {
