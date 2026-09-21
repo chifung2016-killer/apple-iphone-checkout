@@ -308,17 +308,28 @@ export function getCachedSchedule(): ScheduleSnapshot | null {
 }
 
 /**
- * hot（時段內、未有貨）：~90–150s
+ * hot（時段內、未有貨）：~60–95s（密啲捉補貨；可 .env 覆寫）
  * peak（時段外）：~6–10 分（疏，減 541）
  * hot + 有貨：由 caller 用 HOT_POLL（~25–40s）
  */
+function envMs(name: string, fallback: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n >= 5_000 ? Math.floor(n) : fallback;
+}
+
+const SCHEDULE_HOT_MIN_MS = envMs("PROMAX_POLL_SCHEDULE_HOT_MIN_MS", 60_000);
+const SCHEDULE_HOT_MAX_MS = envMs("PROMAX_POLL_SCHEDULE_HOT_MAX_MS", 95_000);
+
 export function scheduleIntervalRange(
   mode: ScheduleMode,
   opts?: { anyInStock?: boolean }
 ): { min: number; max: number } | null {
   if (mode === "peak") return { min: 6 * 60_000, max: 10 * 60_000 };
   if (mode === "hot" && !opts?.anyInStock) {
-    return { min: 90_000, max: 150_000 };
+    return {
+      min: SCHEDULE_HOT_MIN_MS,
+      max: Math.max(SCHEDULE_HOT_MIN_MS, SCHEDULE_HOT_MAX_MS),
+    };
   }
   return null;
 }
