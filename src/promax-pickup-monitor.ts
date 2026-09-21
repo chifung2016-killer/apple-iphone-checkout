@@ -228,7 +228,7 @@ export function setPromaxPickupHooks(next: PromaxHooks): void {
   hooks = next;
 }
 
-/** 可 .env 覆寫：PROMAX_POLL_IDLE_* / HOT_*（有貨）／SCHEDULE_HOT_*（時段內未有貨） */
+/** 可 .env 覆寫：PROMAX_POLL_IDLE_* / HOT_*（有貨）／SCHEDULE_HOT_*（時段內未有貨）／PEAK_*（時段外） */
 function envMs(name: string, fallback: number): number {
   const n = Number(process.env[name]);
   return Number.isFinite(n) && n >= 5_000 ? Math.floor(n) : fallback;
@@ -410,18 +410,18 @@ function computeNextIntervalMs(failures: number): number {
     min = ranged.min;
     max = ranged.max;
   } else if (sched.mode === "peak") {
-    min = 6 * 60_000;
-    max = 10 * 60_000;
+    min = 100_000;
+    max = 140_000;
   } else {
     // hot 時段內、未有貨（schedule 未回 range 時嘅後備）
-    min = 60_000;
-    max = 95_000;
+    min = 50_000;
+    max = 90_000;
   }
   max = Math.max(min, max);
   const base = randomBetween(min, max);
   const jitter =
     sched.mode === "peak"
-      ? randomBetween(-45_000, 45_000)
+      ? randomBetween(-20_000, 20_000)
       : randomBetween(-JITTER_MS, JITTER_MS);
   let ms = Math.max(15_000, base + jitter);
   if (failures >= 2) {

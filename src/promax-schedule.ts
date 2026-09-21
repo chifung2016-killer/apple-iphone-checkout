@@ -308,8 +308,8 @@ export function getCachedSchedule(): ScheduleSnapshot | null {
 }
 
 /**
- * hot（時段內、未有貨）：~60–95s（密啲捉補貨；可 .env 覆寫）
- * peak（時段外）：~6–10 分（疏，減 541）
+ * hot（時段內、未有貨）：~50–90s（密啲捉補貨；可 .env 覆寫）
+ * peak（時段外）：~2 分（疏啲，減 541；可 .env 覆寫）
  * hot + 有貨：由 caller 用 HOT_POLL（~25–40s）
  */
 function envMs(name: string, fallback: number): number {
@@ -317,14 +317,21 @@ function envMs(name: string, fallback: number): number {
   return Number.isFinite(n) && n >= 5_000 ? Math.floor(n) : fallback;
 }
 
-const SCHEDULE_HOT_MIN_MS = envMs("PROMAX_POLL_SCHEDULE_HOT_MIN_MS", 60_000);
-const SCHEDULE_HOT_MAX_MS = envMs("PROMAX_POLL_SCHEDULE_HOT_MAX_MS", 95_000);
+const SCHEDULE_HOT_MIN_MS = envMs("PROMAX_POLL_SCHEDULE_HOT_MIN_MS", 50_000);
+const SCHEDULE_HOT_MAX_MS = envMs("PROMAX_POLL_SCHEDULE_HOT_MAX_MS", 90_000);
+const PEAK_POLL_MIN_MS = envMs("PROMAX_POLL_PEAK_MIN_MS", 100_000);
+const PEAK_POLL_MAX_MS = envMs("PROMAX_POLL_PEAK_MAX_MS", 140_000);
 
 export function scheduleIntervalRange(
   mode: ScheduleMode,
   opts?: { anyInStock?: boolean }
 ): { min: number; max: number } | null {
-  if (mode === "peak") return { min: 6 * 60_000, max: 10 * 60_000 };
+  if (mode === "peak") {
+    return {
+      min: PEAK_POLL_MIN_MS,
+      max: Math.max(PEAK_POLL_MIN_MS, PEAK_POLL_MAX_MS),
+    };
+  }
   if (mode === "hot" && !opts?.anyInStock) {
     return {
       min: SCHEDULE_HOT_MIN_MS,

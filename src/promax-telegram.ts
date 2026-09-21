@@ -63,8 +63,8 @@ function modelLine(model: string, storage: string, color: string): string {
 }
 
 const MODE_HELP: Record<string, string> = {
-  hot: "已知補貨時段／有貨 · ~60–95s（有貨 ~25–40s）",
-  peak: "非補貨時段 · ~6–10分（疏，減 541）",
+  hot: "已知補貨時段／有貨 · ~50–90s（有貨 ~25–40s）",
+  peak: "非補貨時段 · ~2分（疏，減 541）",
 };
 
 /** 統一「而家用緊邊個模式」一行 */
