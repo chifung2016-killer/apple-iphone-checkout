@@ -409,6 +409,14 @@ class ReleaseError extends Error {
   }
 }
 
+/** 結帳逾時已撳返購物袋；hold task 要停低等下一次監控，唔好即刻再加車 */
+class SessionExpiredWaitError extends Error {
+  constructor(message = "session expired：已返回購物袋，等監控訊號") {
+    super(message);
+    this.name = "SessionExpiredWaitError";
+  }
+}
+
 async function ensureRuntimeDir(): Promise<void> {
   await fs.mkdir(RUNTIME_DIR, { recursive: true }).catch(() => {});
 }
@@ -2508,7 +2516,26 @@ async function pageShowsSessionExpired(page: Page): Promise<boolean> {
     .catch(() => false);
 }
 
-/** 逾時結帳唔可以 refresh 救返 — 要放棄 checkout，返產品頁重新加車 */
+/** 撳 session expired 頁嘅「返回購物袋。」 */
+async function clickReturnToBagButton(page: Page): Promise<boolean> {
+  const target = page
+    .getByRole("link", { name: /返回購物袋/ })
+    .or(page.getByRole("button", { name: /返回購物袋/ }))
+    .or(page.locator("a, button").filter({ hasText: /返回購物袋/ }))
+    .first();
+  if (!(await target.count().catch(() => 0))) return false;
+  await target.scrollIntoViewIfNeeded().catch(() => {});
+  await target.click({ timeout: 8000 }).catch(async () => {
+    await target.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
+  });
+  return true;
+}
+
+/**
+ * 逾時頁唔可以 refresh 救返。
+ * 撳「返回購物袋。」去 /shop/bag。
+ * Hold task 之後停低等下一次監控訊號，唔好即刻再加車。
+ */
 async function recoverFromSessionExpired(
   page: Page,
   tag = ""
@@ -2516,19 +2543,36 @@ async function recoverFromSessionExpired(
   if (!(await pageShowsSessionExpired(page))) return false;
   const prefix = tag ? `${tag} ` : "";
   console.warn(
-    `  ${prefix}★ 操作階段已逾時（session expired）→ 放棄舊結帳，返產品頁重新加車｜${page.url()}`
+    `  ${prefix}★ 操作階段已逾時（session expired）→ 撳「返回購物袋」｜${page.url()}`
   );
   await writeStatus({
     phase: "session_expired",
     stuck: false,
     url: page.url(),
-    message: "操作階段已逾時：返產品頁重新加車",
+    message: "操作階段已逾時：返回購物袋，等下一次監控",
   }).catch(() => {});
-  const buy = String(CONFIG.buyUrl || "").trim() || buyUrlForNotFoundRecovery();
-  await withReleaseCheck(
-    page.goto(buy, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {})
-  );
-  await dismissCookies(page).catch(() => {});
+
+  const clicked = await clickReturnToBagButton(page);
+  if (clicked) {
+    await page.waitForURL(/\/shop\/bag/i, { timeout: 20000 }).catch(() => {});
+  }
+  if (!/\/shop\/bag/i.test(page.url())) {
+    console.warn("  撳唔到「返回購物袋」或未跳轉，直接開購物袋");
+    await withReleaseCheck(
+      page
+        .goto("https://www.apple.com/hk-zh/shop/bag", {
+          waitUntil: "domcontentloaded",
+          timeout: 60000,
+        })
+        .catch(() => {})
+    );
+  }
+  await settleAfterNavigation(page).catch(() => {});
+  console.log(`  已返回購物袋：${page.url()}`);
+
+  if (CONFIG.holdAtPickupStoresForStock) {
+    throw new SessionExpiredWaitError();
+  }
   return true;
 }
 
@@ -7052,83 +7096,71 @@ async function runMonitorHoldBuyLoop(
 
     const chaseFrom = pending.atMs;
     let reachedPay = false;
+    let waitForNextSignal = false;
     try {
       reachedPay = await attemptFullAddCartToPayment(page, identity, tag, session);
+      if (!reachedPay) {
+        let attempt = 1;
+        while (!(await matchingSkuSoldOut(chaseFrom))) {
+          await throwIfReleased();
+          attempt += 1;
+          const expired = await pageShowsSessionExpired(page);
+          if (expired) {
+            console.log(
+              `  session expired — 撳「返回購物袋」，然後等下一次監控（第 ${attempt} 次）`
+            );
+            await recoverFromSessionExpired(page, tag);
+          } else {
+            console.log(
+              `  加唔到車 — refresh 揀門市頁一次，${STORE_PAGE_RETRY_MS / 1000}s 後再試（第 ${attempt} 次）`
+            );
+            await writeStatus({
+              phase: "resuming_after_stock",
+              message: `${matchLabel} 加唔到車：refresh 揀門市頁，${STORE_PAGE_RETRY_MS / 1000}s 後再試`,
+            });
+            await gotoFulfillmentInit(page);
+            if (await pageShowsSessionExpired(page)) {
+              console.log("  refresh 後變 session expired — 返回購物袋，等下一次監控");
+              await recoverFromSessionExpired(page, tag);
+            } else {
+              const soldDuringWait = await sleepUntilOrSoldOut(STORE_PAGE_RETRY_MS, chaseFrom);
+              if (soldDuringWait) break;
+              reachedPay = await attemptPickupCheckoutToPayment(
+                page,
+                identity,
+                tag,
+                session
+              );
+              if (reachedPay) break;
+            }
+          }
+          if (await pageShowsSessionExpired(page)) {
+            await recoverFromSessionExpired(page, tag);
+          }
+          if (await matchingSkuSoldOut(chaseFrom)) break;
+          reachedPay = await attemptFullAddCartToPayment(page, identity, tag, session);
+          if (reachedPay) break;
+        }
+      }
     } catch (err) {
       if (err instanceof ReleaseError) throw err;
-      console.warn(
-        `${tag} 加車失敗：`,
-        err instanceof Error ? err.message : String(err)
-      );
+      if (err instanceof SessionExpiredWaitError) {
+        waitForNextSignal = true;
+        console.log(`${tag} 已返回購物袋，停止呢輪加車，等下一次監控訊號`);
+      } else {
+        console.warn(
+          `${tag} 加車失敗：`,
+          err instanceof Error ? err.message : String(err)
+        );
+      }
     }
     if (reachedPay) {
       console.log(`${tag} 已到付款頁 — 結束待命`);
       return;
     }
-
-    let attempt = 1;
-    while (!(await matchingSkuSoldOut(chaseFrom))) {
-      await throwIfReleased();
-      attempt += 1;
-      const expired = await pageShowsSessionExpired(page);
-      if (expired) {
-        console.log(
-          `  加唔到車（session expired）— 返產品頁重新加車（第 ${attempt} 次）`
-        );
-        await writeStatus({
-          phase: "resuming_after_stock",
-          message: `${matchLabel} session expired：返產品頁重新加車`,
-        });
-        await recoverFromSessionExpired(page, tag);
-      } else {
-        console.log(
-          `  加唔到車 — refresh 揀門市頁一次，${STORE_PAGE_RETRY_MS / 1000}s 後再試（第 ${attempt} 次）`
-        );
-        await writeStatus({
-          phase: "resuming_after_stock",
-          message: `${matchLabel} 加唔到車：refresh 揀門市頁，${STORE_PAGE_RETRY_MS / 1000}s 後再試`,
-        });
-        await gotoFulfillmentInit(page);
-        if (await pageShowsSessionExpired(page)) {
-          console.log("  refresh 後變 session expired — 改由產品頁重新加車");
-          await recoverFromSessionExpired(page, tag);
-        } else {
-          const soldDuringWait = await sleepUntilOrSoldOut(STORE_PAGE_RETRY_MS, chaseFrom);
-          if (soldDuringWait) break;
-          try {
-            reachedPay = await attemptPickupCheckoutToPayment(
-              page,
-              identity,
-              tag,
-              session
-            );
-            if (reachedPay) {
-              console.log(`${tag} 已到付款頁 — 結束待命`);
-              return;
-            }
-          } catch (err) {
-            if (err instanceof ReleaseError) throw err;
-            console.warn(
-              `${tag} 取貨頁再試失敗：`,
-              err instanceof Error ? err.message : String(err)
-            );
-          }
-        }
-      }
-      if (await matchingSkuSoldOut(chaseFrom)) break;
-      try {
-        reachedPay = await attemptFullAddCartToPayment(page, identity, tag, session);
-      } catch (err) {
-        if (err instanceof ReleaseError) throw err;
-        console.warn(
-          `${tag} 再加車失敗：`,
-          err instanceof Error ? err.message : String(err)
-        );
-      }
-      if (reachedPay) {
-        console.log(`${tag} 已到付款頁 — 結束待命`);
-        return;
-      }
+    if (waitForNextSignal) {
+      lastConsumedAt = Date.now();
+      continue;
     }
     console.log(`  監控到 ${matchLabel} 售罄，停止呢輪加車，繼續等下一次有貨`);
     lastConsumedAt = Date.now();
