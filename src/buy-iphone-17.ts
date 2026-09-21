@@ -2937,7 +2937,7 @@ async function recoverAddToBagIfNeeded(page: Page, tag: string): Promise<boolean
     await page.goto(resumeUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
     await selectProductOptions(page, { randomColor: false });
     await addToBagAndOpenBag(page);
-    await setBagQuantity(page, CONFIG.quantity).catch((err) => {
+    await enforceConfiguredBagQuantity(page).catch((err) => {
       console.warn(`${tag} 改數量失敗：${err instanceof Error ? err.message : String(err)}`);
     });
     return true;
@@ -3954,8 +3954,160 @@ async function isBagEmpty(page: Page): Promise<boolean> {
   );
 }
 
+/** Run configuration 數量只接受 1 或 2 */
+function configuredBuyQty(): number {
+  return Number(CONFIG.quantity) === 2 ? 2 : 1;
+}
+
+async function gotoBagPage(page: Page): Promise<void> {
+  if (/\/shop\/bag/i.test(page.url())) return;
+  await withReleaseCheck(
+    page
+      .goto("https://www.apple.com/hk-zh/shop/bag", {
+        waitUntil: "domcontentloaded",
+        timeout: 60000,
+      })
+      .catch(() => {})
+  );
+  await settleAfterNavigation(page).catch(() => {});
+}
+
+/** 購物袋入面每一行 iPhone（唔包配件） */
+async function listIphoneBagRows(page: Page): Promise<Locator[]> {
+  if (!/\/shop\/bag/i.test(page.url())) return [];
+  const candidates = page.locator("div, li, article, section, tr").filter({
+    hasText: /iPhone/i,
+  });
+  const n = await candidates.count().catch(() => 0);
+  const rows: Locator[] = [];
+  for (let i = 0; i < Math.min(n, 40); i++) {
+    const row = candidates.nth(i);
+    const text = ((await row.innerText().catch(() => "")) || "").replace(/\s+/g, " ").trim();
+    if (!/iPhone/i.test(text)) continue;
+    if (/MagSafe|矽膠|護殼|保護殼|AirPods|掛繩|Wallet|銀包|Screen Protector/i.test(text) && !/iPhone\s*1[78]|iPhone\s*18/i.test(text)) {
+      continue;
+    }
+    // 只要有「移除」同數量區嘅細行，唔要成頁大容器
+    if (text.length > 900) continue;
+    const hasRemove =
+      (await row
+        .getByRole("button", { name: /移除|刪除|Remove/i })
+        .or(row.getByRole("link", { name: /移除|刪除|Remove/i }))
+        .or(row.locator('[data-autom*="remove" i], [data-autom*="delete" i]'))
+        .count()
+        .catch(() => 0)) > 0;
+    const hasQty =
+      (await row
+        .locator(
+          'select[id*="quantity" i], select[name*="quantity" i], [data-autom*="quantity" i]'
+        )
+        .count()
+        .catch(() => 0)) > 0;
+    if (!hasRemove && !hasQty) continue;
+    rows.push(row);
+  }
+  // 去重：若 A 包含 B，留細嗰個
+  const kept: Locator[] = [];
+  const texts: string[] = [];
+  for (const row of rows) {
+    const t = ((await row.innerText().catch(() => "")) || "").replace(/\s+/g, " ").trim();
+    if (!t) continue;
+    const subsumed = texts.some((prev) => prev.includes(t) && prev.length > t.length + 20);
+    if (subsumed) continue;
+    // 若新行包含舊行，踢走舊行
+    for (let j = texts.length - 1; j >= 0; j--) {
+      if (t.includes(texts[j]) && t.length > texts[j].length + 20) {
+        texts.splice(j, 1);
+        kept.splice(j, 1);
+      }
+    }
+    texts.push(t);
+    kept.push(row);
+  }
+  return kept;
+}
+
+async function removeOneBagRow(page: Page, row: Locator): Promise<boolean> {
+  const removeBtn = row
+    .getByRole("button", { name: /移除|刪除|Remove/i })
+    .or(row.getByRole("link", { name: /移除|刪除|Remove/i }))
+    .or(row.locator('[data-autom*="remove" i], [data-autom*="delete" i]'))
+    .first();
+  if (!(await removeBtn.count().catch(() => 0))) return false;
+  await removeBtn.scrollIntoViewIfNeeded().catch(() => {});
+  await humanClick(removeBtn, { force: true }).catch(async () => {
+    await removeBtn.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
+  });
+  await page.waitForTimeout(1200);
+  await settleAfterNavigation(page).catch(() => {});
+  return true;
+}
+
+/** 加車前清走袋入面所有 iPhone，避免重試時疊數量 */
+async function clearIphoneItemsFromBag(page: Page): Promise<void> {
+  await gotoBagPage(page);
+  if (await isBagEmpty(page)) return;
+  await removeAccessoryItemsFromBag(page).catch(() => {});
+  for (let round = 1; round <= 8; round++) {
+    const rows = await listIphoneBagRows(page);
+    if (!rows.length) {
+      if (round === 1) console.log("  購物袋冇舊 iPhone 要清");
+      return;
+    }
+    console.log(`  清走購物袋舊 iPhone（第 ${round} 輪，剩 ${rows.length} 行）…`);
+    const removed = await removeOneBagRow(page, rows[rows.length - 1]);
+    if (!removed) {
+      console.warn("  清唔到 iPhone 行，停止清理");
+      return;
+    }
+  }
+}
+
+/**
+ * 強制購物袋 iPhone 數量 = Run configuration（只得 1 或 2）。
+ * 多行就移除多餘；單行就用數量掣／select 改做目標。
+ */
+async function enforceConfiguredBagQuantity(page: Page): Promise<void> {
+  const want = configuredBuyQty();
+  console.log(`步驟：強制購物袋數量跟 Run configuration = ${want}`);
+  await gotoBagPage(page);
+  await removeAccessoryItemsFromBag(page).catch(() => {});
+  if (await isBagEmpty(page)) {
+    console.warn("  購物袋係空，無法強制數量");
+    return;
+  }
+
+  // 多過一行 iPhone → 移除到剩一行
+  for (let round = 1; round <= 8; round++) {
+    const rows = await listIphoneBagRows(page);
+    if (rows.length <= 1) break;
+    console.log(`  購物袋有 ${rows.length} 行 iPhone（要 ${want}）→ 移除多餘一行`);
+    const ok = await removeOneBagRow(page, rows[rows.length - 1]);
+    if (!ok) break;
+  }
+
+  await setBagQuantity(page, want).catch((err) => {
+    console.warn(
+      `  改數量失敗：${err instanceof Error ? err.message : String(err)}`
+    );
+  });
+
+  // 再確認：若仍然多行，再清
+  const left = await listIphoneBagRows(page);
+  if (left.length > 1) {
+    console.warn(`  改完數量後仍有 ${left.length} 行，再移除多餘…`);
+    for (let i = left.length - 1; i >= 1; i--) {
+      await removeOneBagRow(page, left[i]);
+    }
+    await setBagQuantity(page, want).catch(() => {});
+  }
+  console.log(`  ✓ 購物袋已跟 Run configuration 數量 ×${want}`);
+}
+
 async function setBagQuantity(page: Page, quantity: number): Promise<void> {
-  console.log(`步驟：購物袋數量改做 ${quantity}`);
+  // 永遠只跟 Run configuration：1 或 2（唔好因為重試加車而疊高）
+  const target = quantity === 2 ? 2 : 1;
+  console.log(`步驟：購物袋數量改做 ${target}（Run configuration）`);
 
   if (isShop404Url(page.url())) {
     await recoverFromShop404IfNeeded(page);
@@ -3984,7 +4136,7 @@ async function setBagQuantity(page: Page, quantity: number): Promise<void> {
     }
   }
 
-  const qtyStr = String(quantity);
+  const qtyStr = String(target);
 
   const autom = page.locator(
     '[data-autom*="quantity" i], select[id*="quantity" i], select[name*="quantity" i]'
@@ -3995,7 +4147,7 @@ async function setBagQuantity(page: Page, quantity: number): Promise<void> {
     const tag = await el.evaluate((n) => n.tagName.toLowerCase()).catch(() => "");
     if (tag === "select") {
       await el.selectOption(qtyStr, { force: true });
-      console.log(`  已用 data-autom/select 改數量 = ${quantity}`);
+      console.log(`  已用 data-autom/select 改數量 = ${target}`);
       await page.waitForTimeout(1500);
       return;
     }
@@ -4013,7 +4165,7 @@ async function setBagQuantity(page: Page, quantity: number): Promise<void> {
       .catch(() => [] as string[]);
     if (values.includes(qtyStr)) {
       await sel.selectOption(qtyStr, { force: true });
-      console.log(`  已用隱藏 select 改數量 = ${quantity}`);
+      console.log(`  已用隱藏 select 改數量 = ${target}`);
       await page.waitForTimeout(1500);
       return;
     }
@@ -4025,27 +4177,44 @@ async function setBagQuantity(page: Page, quantity: number): Promise<void> {
     const option = page.getByRole("option", { name: qtyStr, exact: true }).first();
     if (await option.count()) {
       await humanClick(option, { force: true });
-      console.log(`  已用 label/option 改數量 = ${quantity}`);
+      console.log(`  已用 label/option 改數量 = ${target}`);
       await page.waitForTimeout(1500);
       return;
     }
   }
 
-  const inc = page.getByRole("button", {
-    name: /增加數量|增加|Increment|Increase quantity/i,
-  });
-  for (let n = 0; n < quantity - 1; n++) {
-    if (!(await inc.first().count())) break;
-    await humanClick(inc.first(), { force: true });
+  // Stepper：先減到 1，再加到 target（避免加多咗減唔返）
+  const dec = page
+    .getByRole("button", { name: /減少數量|減少|Decrement|Decrease quantity/i })
+    .or(page.locator('[data-autom*="decrement" i], [aria-label*="減少" i]'));
+  for (let n = 0; n < 4; n++) {
+    const btn = dec.first();
+    if (!(await btn.count().catch(() => 0))) break;
+    if (await btn.isDisabled().catch(() => true)) break;
+    await humanClick(btn, { force: true }).catch(() => {});
     await page.waitForTimeout(400);
-    if (n === quantity - 2) {
-      console.log(`  已用增加掣改數量 = ${quantity}`);
-      await page.waitForTimeout(1000);
+  }
+  if (target >= 2) {
+    const inc = page
+      .getByRole("button", {
+        name: /增加數量|增加|Increment|Increase quantity/i,
+      })
+      .or(page.locator('[data-autom*="increment" i], [aria-label*="增加" i]'));
+    const btn = inc.first();
+    if (await btn.count().catch(() => 0)) {
+      await humanClick(btn, { force: true }).catch(() => {});
+      await page.waitForTimeout(500);
+      console.log(`  已用 stepper 改數量 = ${target}`);
+      await page.waitForTimeout(800);
       return;
     }
+  } else {
+    console.log(`  已用減少掣改數量 = ${target}`);
+    await page.waitForTimeout(800);
+    return;
   }
 
-  throw new StepError("數量", `購物袋揾唔到數量選擇器，請人手改做 ${quantity}。`);
+  throw new StepError("數量", `購物袋揾唔到數量選擇器，請人手改做 ${target}。`);
 }
 
 async function goToCheckout(page: Page): Promise<void> {
@@ -6787,13 +6956,22 @@ async function attemptFullAddCartToPayment(
   tag: string,
   session?: BrowserSession
 ): Promise<boolean> {
-  console.log(`${tag} 開始完整加購（${CONFIG.color}／${CONFIG.storage} ×${CONFIG.quantity}）…`);
+  const qty = configuredBuyQty();
+  console.log(`${tag} 開始完整加購（${CONFIG.color}／${CONFIG.storage} ×${qty}）…`);
   if (session) {
     await publishTaskSnapshot(session, "adding_cart", {
-      message: "有貨：重新加購",
+      message: `有貨：重新加購 ×${qty}`,
       url: CONFIG.buyUrl,
     }).catch(() => {});
   }
+
+  // 重試加車前先清走舊 iPhone，避免袋入面疊成好多部
+  await clearIphoneItemsFromBag(page).catch((err) => {
+    console.warn(
+      `${tag} 清購物袋舊機失敗：`,
+      err instanceof Error ? err.message : String(err)
+    );
+  });
 
   await withReleaseCheck(
     page.goto(CONFIG.buyUrl, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {})
@@ -6815,7 +6993,12 @@ async function attemptFullAddCartToPayment(
   }
 
   await addToBagAndOpenBag(page);
-  await setBagQuantity(page, CONFIG.quantity).catch(() => {});
+  await enforceConfiguredBagQuantity(page).catch((err) => {
+    console.warn(
+      `${tag} 強制數量失敗：`,
+      err instanceof Error ? err.message : String(err)
+    );
+  });
   await goToCheckout(page);
   await settleAfterNavigation(page);
 
@@ -6844,7 +7027,7 @@ async function runMonitorHoldBuyLoop(
   let lastConsumedAt = Date.now();
 
   console.log(
-    `${tag} task 已開（唔入結帳）。等監控到 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage}，然後開已配置產品頁加車`
+    `${tag} task 已開（唔入結帳）。等監控到 ${CONFIG.model}／${CONFIG.color}／${CONFIG.storage} ×${configuredBuyQty()}，然後開已配置產品頁加車`
   );
 
   while (true) {
@@ -12089,12 +12272,12 @@ async function runCheckoutToPayment(session: BrowserSession): Promise<void> {
     url: page.url(),
   });
   await runStep(
-    `${tag} 數量改做 ${CONFIG.quantity}`,
-    () => setBagQuantity(page, CONFIG.quantity),
+    `${tag} 數量改做 ${configuredBuyQty()}（Run configuration）`,
+    () => enforceConfiguredBagQuantity(page),
     base
   );
   await publishTaskSnapshot(session, "cart_ready", {
-    message: `購物袋數量 ×${CONFIG.quantity}`,
+    message: `購物袋數量 ×${configuredBuyQty()}`,
     url: page.url(),
   });
   await runStep(`${tag} 前往結帳`, () => goToCheckout(page), base);
