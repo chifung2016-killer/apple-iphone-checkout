@@ -3822,6 +3822,56 @@ async function addToBagAndOpenBag(page: Page): Promise<void> {
     console.warn("  快速加購未入袋，改用原有加購重試");
   }
 
+  // iPhone 17：直入 CONFIG.buyUrl（白色 slug）→ 自動揀黑色／容量／不換購／無 AppleCare → 加入購物袋
+  if (isIphone17Task()) {
+    console.log("步驟：iPhone 17 — 直入產品頁自動加車");
+    console.log(`  目標頁：${CONFIG.buyUrl}`);
+    if (
+      !/\/buy-iphone\/iphone-17/i.test(page.url()) ||
+      isShop404Url(page.url()) ||
+      isSessionExpiredUrl(page.url())
+    ) {
+      await withReleaseCheck(
+        page.goto(CONFIG.buyUrl, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {})
+      );
+      await dismissCookies(page).catch(() => {});
+    }
+    const fast17 = await addConfiguredSlugToBagOnce(page).catch((err) => {
+      console.warn(
+        `  iPhone 17 自動加車失敗：${err instanceof Error ? err.message : String(err)}`
+      );
+      return false;
+    });
+    if (fast17) {
+      await settleDom(page, 200);
+      await skipAccessoryUpsells(page);
+      if (isAttachStepUrl(page.url())) {
+        await clickReviewBagOnAttach(page);
+      }
+      if (!/\/shop\/bag/i.test(page.url())) {
+        const toBag = await clickByAccessibleName(page, [
+          /查看購物袋|檢視購物袋|前往購物袋|Review Bag|View Bag/i,
+        ]);
+        if (!toBag) {
+          await page
+            .goto("https://www.apple.com/hk-zh/shop/bag", {
+              waitUntil: "domcontentloaded",
+            })
+            .catch(() => {});
+        }
+      }
+      await settleDom(page, 300);
+      await removeAccessoryItemsFromBag(page).catch(() => {});
+      if (/\/shop\/bag/i.test(page.url()) && (await isBagEmpty(page))) {
+        console.warn("  購物袋係空 — iPhone 17 加購未成功，將重試");
+      } else if (await confirmAddedToBag(page)) {
+        console.log("  ✓ iPhone 17 已自動加入購物袋");
+        return;
+      }
+    }
+    console.warn("  iPhone 17 首次加購未入袋，改用輪詢重試");
+  }
+
   console.log("步驟：等待開賣並撳「繼續／加入購物袋」加入流程");
   console.log(
     `  目標頁：${CONFIG.buyUrl}\n  開賣：${CONFIG.saleStartIso}（每 ${PRODUCT_PAGE_POLL_MS / 1000} 秒 refresh 直到下一頁）`
@@ -11036,7 +11086,11 @@ async function fillShippingAndGoToPayment(
   }
 
   // 只限 pickup credit card 訪客：Fulfillment-init 待命，同型號同色同容量有貨 → refresh → 揀監控門市 → 加車
-  if (CONFIG.holdAtPickupStoresForStock && isPickupCreditCardGuest()) {
+  if (
+    CONFIG.holdAtPickupStoresForStock &&
+    isPickupCreditCardGuest() &&
+    !isIphone17Task()
+  ) {
     await runMonitorHoldBuyLoop(page, identity, tag, session);
     return;
   }
@@ -12301,7 +12355,11 @@ async function runCheckoutToPayment(session: BrowserSession): Promise<void> {
   const base = { pauseOnError: false, page, retries: 2 };
 
   console.log(`\n${tag} 開啟購買頁：`, CONFIG.buyUrl);
-  if (CONFIG.holdAtPickupStoresForStock && isPickupCreditCardGuest()) {
+  if (
+    CONFIG.holdAtPickupStoresForStock &&
+    isPickupCreditCardGuest() &&
+    !isIphone17Task()
+  ) {
     await runMonitorHoldBuyLoop(page, identity, tag, session);
     return;
   }
@@ -12325,8 +12383,8 @@ async function runCheckoutToPayment(session: BrowserSession): Promise<void> {
     isIphone17Task() &&
     (isConfiguredProductSlugUrl(CONFIG.buyUrl) || isConfiguredProductSlugUrl(page.url()))
   ) {
-    // delivery／pickup credit card 訪客：slug 頁已帶顏色容量，留待加購步驟一次過揀不換購／無 AppleCare
-    console.log(`${tag} 已配置 iPhone 17 slug — 規格揀選交俾「加入購物袋」步驟`);
+    // 直入白色 slug 頁；加購步驟會自動撳黑色／256GB／不換購／無 AppleCare → 加入購物袋
+    console.log(`${tag} iPhone 17 產品頁 — 稍後自動揀規格並加入購物袋`);
   } else {
     const okOptions = await runStep(
       `${tag} 揀型號／顏色／容量`,
