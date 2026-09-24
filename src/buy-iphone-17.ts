@@ -6026,14 +6026,12 @@ function stayOnFulfillmentInit(url: string): boolean {
   );
 }
 
-/** 只撳一次「繼續前往取貨詳情」，然後等 loading／下一頁 */
+/** 撳門市後：捲底 → 撳「繼續前往取貨詳情」；最多 5 次，每次隔 1 秒 */
 async function clickContinueToPickupDetailsOnce(page: Page): Promise<boolean> {
   if (isPickupContactPage(page.url())) {
     console.log("  已喺 PickupContact，唔使再撳「繼續前往取貨詳情」");
     return true;
   }
-
-  await scrollPageToBottom(page);
 
   const locators = [
     page.getByRole("button", { name: /繼續前往取貨詳情/ }),
@@ -6042,54 +6040,87 @@ async function clickContinueToPickupDetailsOnce(page: Page): Promise<boolean> {
     page.locator('button:has-text("繼續前往取貨詳情"), a:has-text("繼續前往取貨詳情")'),
   ];
 
-  let target: Locator | null = null;
-  for (const loc of locators) {
-    const el = loc.first();
-    if (await visible(el, 1200)) {
-      target = el;
-      break;
+  const maxAttempts = 5;
+  const delayMs = 1_000;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    await throwIfReleased();
+
+    if (isPickupContactPage(page.url())) {
+      console.log("  ✓ 已載入去 PickupContact（取貨詳情）");
+      return true;
     }
-    if ((await el.count().catch(() => 0)) > 0) {
-      target = el;
-      break;
+    if (!stayOnFulfillmentInit(page.url())) {
+      console.log(`  ✓ 已離開 Fulfillment → ${page.url()}`);
+      return true;
+    }
+
+    console.log(
+      `  捲底 → 撳「繼續前往取貨詳情」（${attempt}/${maxAttempts}）…`
+    );
+    await scrollPageToBottom(page);
+
+    let target: Locator | null = null;
+    for (const loc of locators) {
+      const el = loc.first();
+      if (await visible(el, 800)) {
+        target = el;
+        break;
+      }
+      if ((await el.count().catch(() => 0)) > 0) {
+        target = el;
+        break;
+      }
+    }
+
+    if (!target) {
+      console.warn(`  第 ${attempt} 次：揾唔到「繼續前往取貨詳情」`);
+      if (attempt < maxAttempts) await sleepCheckingRelease(delayMs);
+      continue;
+    }
+
+    await target.scrollIntoViewIfNeeded().catch(() => {});
+    await humanClick(target, { force: true }).catch(async () => {
+      await target!.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
+    });
+    console.log(`  已撳「繼續前往取貨詳情」（${attempt}/${maxAttempts}）— 等載入…`);
+
+    await waitForCheckoutLoadingSettled(page, {
+      timeoutMs: 8_000,
+      stayOn: stayOnFulfillmentInit,
+    }).catch(() => {});
+
+    await withReleaseCheck(
+      page
+        .waitForURL(
+          (u) =>
+            isPickupContactPage(u.toString()) ||
+            !stayOnFulfillmentInit(u.toString()),
+          { timeout: 3_000 }
+        )
+        .catch(() => {})
+    );
+
+    if (isPickupContactPage(page.url())) {
+      console.log("  ✓ 已載入去 PickupContact（取貨詳情）");
+      return true;
+    }
+    if (!stayOnFulfillmentInit(page.url())) {
+      console.log(`  ✓ 已離開 Fulfillment → ${page.url()}`);
+      return true;
+    }
+
+    if (attempt < maxAttempts) {
+      console.warn(
+        `  第 ${attempt} 次仍喺 Fulfillment-init，${delayMs / 1000}s 後再捲底撳繼續…`
+      );
+      await sleepCheckingRelease(delayMs);
     }
   }
-  if (!target) {
-    console.warn("  揾唔到「繼續前往取貨詳情」掣");
-    return false;
-  }
 
-  await target.scrollIntoViewIfNeeded().catch(() => {});
-  await humanClick(target, { force: true }).catch(async () => {
-    await target!.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
-  });
-  console.log("  已撳「繼續前往取貨詳情」— 等頁面載入去下一頁…");
-
-  await waitForCheckoutLoadingSettled(page, {
-    timeoutMs: 25_000,
-    stayOn: stayOnFulfillmentInit,
-  }).catch(() => {});
-
-  await withReleaseCheck(
-    page
-      .waitForURL(
-        (u) =>
-          isPickupContactPage(u.toString()) ||
-          !stayOnFulfillmentInit(u.toString()),
-        { timeout: 12_000 }
-      )
-      .catch(() => {})
+  console.warn(
+    `  「繼續前往取貨詳情」連撳 ${maxAttempts} 次（各隔 ${delayMs / 1000}s）仍未去下一頁`
   );
-
-  if (isPickupContactPage(page.url())) {
-    console.log("  ✓ 已載入去 PickupContact（取貨詳情）");
-    return true;
-  }
-  if (!stayOnFulfillmentInit(page.url())) {
-    console.log(`  ✓ 已離開 Fulfillment → ${page.url()}`);
-    return true;
-  }
-  console.warn("  撳完「繼續」後仍喺 Fulfillment-init（未去到下一頁）");
   return false;
 }
 
