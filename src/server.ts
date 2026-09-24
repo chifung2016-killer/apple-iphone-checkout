@@ -1535,14 +1535,18 @@ async function spawnOneBrowser(
     ...cleanConfig,
     browserCount: 1,
   } as Record<string, unknown> & { browserCount: number };
-  // 只限 pickup credit card 訪客，而且唔係「有貨即刻加車」：先停喺揀門市頁等監控
+  // pickup credit card 訪客：預設 hold 等監控；instantBuy／iPhone 17 直入加車唔 hold
+  const isIphone17Launch =
+    /iPhone\s*17/i.test(String(sessionConfig.model || "")) ||
+    /\/buy-iphone\/iphone-17(?![-/]*pro)/i.test(String(sessionConfig.buyUrl || ""));
   if (
     String(sessionConfig.fulfillmentPreference || "") === "pickup" &&
-    !sessionConfig.instantBuy
+    !sessionConfig.instantBuy &&
+    !isIphone17Launch
   ) {
     sessionConfig.holdAtPickupStoresForStock = true;
   }
-  if (sessionConfig.instantBuy) {
+  if (sessionConfig.instantBuy || isIphone17Launch) {
     sessionConfig.holdAtPickupStoresForStock = false;
   }
   // 多個 proxy：每條最多分配畀 3 個 browser，用滿先換下一條（唔隨機重複）

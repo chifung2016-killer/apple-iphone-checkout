@@ -659,7 +659,11 @@
             <label for="productPollIntervalMs">取貨頁 refresh 間隔 (ms)</label>
             <input id="productPollIntervalMs" name="productPollIntervalMs" type="number" min="5000" step="1000" value="300000" />
             <p class="hint" style="margin:6px 0 0">
-              Pickup Credit Card 訪客：task 開定之後停喺空白頁等監控，唔入結帳。一有同一個顏色同容量，就開已揀好款式嘅產品頁，只撳不換購、無 AppleCare、加入購物袋，再結帳、揀店。加唔到就 refresh 揀門市頁，等 7 秒再試，直至該款售罄。
+              <b>Pickup Credit Card 訪客</b>：Fulfillment-init 輸入「中環」→ 撳<strong>單一門市掣</strong> →「繼續前往取貨詳情」→ 等載入去下一頁。
+              撳唔到門市／未跳頁 → <strong>等 10 秒 refresh</strong>，重試成套。
+              <br />
+              <b>iPhone 18 Pro Max</b>：可 hold 等監控有貨再加車。
+              <b>iPhone 17 Pro · 黑色</b>：直入產品頁自動加車（唔等監控）。
             </p>
           </div>
           <div class="actions">
@@ -845,13 +849,14 @@
 
     const PRODUCT_PRESETS = {
       iphone17pro_256_black: {
-        // 開白色 slug → 自動撳黑色／256GB／不換購／無 AppleCare → 加入購物袋（唔等監控）
+        // 直入白色 slug → 自動黑色／256GB／不換購／無 AppleCare → 加車 → 結帳揀店（唔等 Pro Max 監控）
         buyUrl: URL_IPHONE17_256_WHITE,
         model: "iPhone 17 Pro",
         color: "黑色",
         storage: "256GB",
         label: "iPhone 17 Pro · 256GB · 黑色",
         saleStartIso: SALE_START_IPHONE17,
+        instantBuy: true,
       },
       iphone18promax_burgundy: {
         buyUrl: URL_PM_256_BURGUNDY,
@@ -944,7 +949,12 @@
       for (const btn of document.querySelectorAll("#presetRow [data-preset]")) {
         btn.classList.toggle("is-selected", btn.getAttribute("data-preset") === key);
       }
-      $("presetHint").textContent = `已選：${p.label}`;
+      if (p.instantBuy) {
+        $("presetHint").textContent =
+          `已選：${p.label}｜直入產品頁自動加車 → 結帳：中環 → 撳門市 → 繼續前往取貨詳情（失敗 10s refresh 重試）`;
+      } else {
+        $("presetHint").textContent = `已選：${p.label}`;
+      }
       if (p.saleStartIso && $("saleStartIso")) {
         $("saleStartIso").value = p.saleStartIso;
       }
@@ -1161,6 +1171,9 @@
         proxy: savedProxyPool,
         skipTradeIn: true,
         addAppleCare: false,
+        // iPhone 17 等 instantBuy：唔 hold 等 Pro Max 監控，直入加車＋結帳
+        instantBuy: Boolean(preset.instantBuy),
+        holdAtPickupStoresForStock: !preset.instantBuy,
       };
       return cfg;
     }
