@@ -5493,10 +5493,35 @@ function pickupStoreKeywordPattern(): RegExp {
 }
 
 function isNoisePickupText(text: string): boolean {
-  const t = text.trim();
+  const t = text.replace(/\s+/g, " ").trim();
   if (!t) return true;
-  if (PICKUP_STORE_NOISE.test(t) && t.length < 40) return true;
+  // 標題／CTA 一律當雜訊（以前只擋短字，導致成個門市列表容器被當成「IFC 掣」— b328）
+  if (PICKUP_STORE_NOISE.test(t)) return true;
   if (/^套用$|^Apply$/i.test(t)) return true;
+  // 太長＝整段列表／父層容器，唔係單一門市掣
+  if (t.length > 160) return true;
+  // 同一個 blob 同時命中 ≥2 間店 → 一定係容器
+  let storeHits = 0;
+  for (const s of PICKUP_STORE_CODES) {
+    if (s.match.test(t)) storeHits += 1;
+  }
+  if (storeHits >= 2) return true;
+  return false;
+}
+
+/** 候選係咪「單一門市」可撳掣（唔係成個列表） */
+function isSinglePickupStoreCandidate(text: string): boolean {
+  const t = text.replace(/\s+/g, " ").trim();
+  if (!t || isNoisePickupText(t)) return false;
+  let hits = 0;
+  for (const s of PICKUP_STORE_CODES) {
+    if (s.match.test(t)) hits += 1;
+  }
+  // 接受：命中我哋監控門市，或者短標籤含 Apple Store 字樣
+  if (hits === 1) return true;
+  if (hits === 0 && t.length <= 120 && /Apple\s+|Store|零售店|mall|plaza|road|bay|walk|apm/i.test(t)) {
+    return true;
+  }
   return false;
 }
 
@@ -5817,13 +5842,14 @@ async function collectStoresUnderHeading(
   const pushUnique = async (el: Locator) => {
     if (!(await visible(el, 250))) return;
     const text = ((await el.innerText().catch(() => "")) || "").trim();
-    if (isNoisePickupText(text)) return;
+    if (!isSinglePickupStoreCandidate(text)) return;
     // 用文字做粗略去重
     const key = text.slice(0, 120);
     if (seen.has(key)) return;
     const tag = await el.evaluate((n) => n.tagName.toLowerCase()).catch(() => "");
     const role = ((await el.getAttribute("role").catch(() => "")) || "").toLowerCase();
     const type = ((await el.getAttribute("type").catch(() => "")) || "").toLowerCase();
+    // 唔好收大容器 div（除非真係 radio/listitem 角色）
     const clickable =
       tag === "button" ||
       tag === "label" ||
@@ -5833,7 +5859,7 @@ async function collectStoresUnderHeading(
       role === "option" ||
       (tag === "input" && (type === "radio" || type === "button")) ||
       tag === "li" ||
-      (tag === "div" && (matchesPreferredStore(text) || role === "listitem"));
+      (tag === "div" && role === "listitem" && text.length <= 160);
     if (!clickable) return;
     seen.add(key);
     found.push(el);
@@ -5886,7 +5912,7 @@ async function collectVisiblePickupStores(page: Page): Promise<Locator[]> {
     const el = byKeyword.nth(i);
     if (!(await visible(el, 300))) continue;
     const text = ((await el.innerText().catch(() => "")) || "").trim();
-    if (isNoisePickupText(text)) continue;
+    if (!isSinglePickupStoreCandidate(text)) continue;
     keywordHits.push(el);
   }
   if (keywordHits.length > 0) return keywordHits;
@@ -6038,8 +6064,51 @@ async function clickContinueToPickupDetails(page: Page): Promise<boolean> {
     round += 1;
     markCheckoutNav(page.url(), "fulfillment-before-continue");
 
+    // 撳「繼續」前必須已揀單一門市（b328：refresh 後未揀店就撳繼續）
+    const storeSelected = await page
+      .evaluate((patterns: string[]) => {
+        const radios = Array.from(
+          document.querySelectorAll('input[type="radio"]')
+        ) as HTMLInputElement[];
+        for (const r of radios) {
+          if (!r.checked) continue;
+          const lab = r.id
+            ? document.querySelector(`label[for="${CSS.escape(r.id)}"]`)?.textContent ||
+              ""
+            : "";
+          const blob =
+            `${r.id} ${r.name} ${r.value} ${r.getAttribute("aria-label") || ""} ${r.getAttribute("data-autom") || ""} ${lab}`.toLowerCase();
+          if (/fulfillment\.(pickup|delivery)|我會前來取貨|我希望送貨/.test(blob) &&
+              !/ifc|canton|causeway|festival|apm|new.?town|store/i.test(blob)) {
+            continue;
+          }
+          for (const p of patterns) {
+            try {
+              if (new RegExp(p, "i").test(blob)) return true;
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+        return false;
+      }, PICKUP_STORE_CODES.map((s) => s.match.source))
+      .catch(() => false);
+
+    if (!storeSelected) {
+      console.warn(`  第 ${round} 輪：未揀門市 — 先撳單一門市掣`);
+      if (!(await clickAnyNearbyStore(page))) {
+        if (!(await fillPickupSearchAndWaitHeading(page))) {
+          await sleepCheckingRelease(600);
+          continue;
+        }
+        if (!(await clickAnyNearbyStore(page))) {
+          await sleepCheckingRelease(600);
+          continue;
+        }
+      }
+    }
+
     if (usesPickupGuestStoreContinueRules()) {
-      // 取貨：唔喺呢度捲頁（門市撳完已捲一次）；refresh 後可能要再捲
       if (round > 1) await scrollPageToBottom(page);
     } else {
       await scrollPageToBottom(page);
@@ -6065,7 +6134,7 @@ async function clickContinueToPickupDetails(page: Page): Promise<boolean> {
         await recoverFromShop404IfNeeded(page, "[continue-pickup-no-btn]");
         return false;
       }
-      // refresh 後要重新搜門市＋揀店先有掣
+      usedPickupStoreKeys.clear();
       if (!(await fillPickupSearchAndWaitHeading(page))) {
         await sleepCheckingRelease(800);
         continue;
@@ -6101,7 +6170,6 @@ async function clickContinueToPickupDetails(page: Page): Promise<boolean> {
       return true;
     }
 
-    // loading 已停但仍喺 Fulfillment-init → refresh 再成個流程重試
     console.log(
       "  loading 已停但仍喺 Fulfillment-init → refresh 頁面，重複揀店＋繼續…"
     );
@@ -6118,6 +6186,7 @@ async function clickContinueToPickupDetails(page: Page): Promise<boolean> {
     }
     if (isPickupContactPage(page.url())) return true;
 
+    usedPickupStoreKeys.clear();
     if (!(await fillPickupSearchAndWaitHeading(page))) {
       await sleepCheckingRelease(800);
       continue;
@@ -6732,8 +6801,176 @@ async function waitForSixPickupStoreOptions(page: Page): Promise<Locator[]> {
   return [];
 }
 
+/**
+ * 用 DOM 直接搵「單一門市」radio／label／button 並撳（避免撳到成個列表容器）。
+ * @returns 撳中嘅門市短碼／名稱，失敗 null
+ */
+async function clickPickupStoreInDom(page: Page): Promise<{
+  code: string | null;
+  label: string;
+} | null> {
+  const storeDefs = PICKUP_STORE_CODES.map((s) => ({
+    code: s.code,
+    name: s.name,
+    match: s.match.source,
+  }));
+  const used = [...usedPickupStoreKeys];
+
+  const result = await page
+    .evaluate(
+      (args: { storeDefs: Array<{ code: string; name: string; match: string }>; used: string[] }) => {
+        const noise =
+          /你附近的所有零售店|選擇取貨零售店|套用|我會前來取貨|我希望送貨|繼續前往取貨詳情|繼續前往|^搜尋$|^Apply$/i;
+        const nodes = Array.from(
+          document.querySelectorAll(
+            'input[type="radio"], button, [role="radio"], [role="button"], [role="option"], label, li, [data-autom*="store" i], [data-autom*="retail" i], [data-autom*="pickup" i]'
+          )
+        ) as HTMLElement[];
+
+        type Cand = {
+          el: HTMLElement;
+          text: string;
+          code: string | null;
+          name: string;
+          score: number;
+        };
+        const cands: Cand[] = [];
+
+        for (const el of nodes) {
+          const tag = el.tagName.toLowerCase();
+          if (tag === "div" && el.getAttribute("role") !== "listitem") continue;
+
+          const bits = [
+            el.innerText || "",
+            el.getAttribute("aria-label") || "",
+            el.getAttribute("title") || "",
+            el.getAttribute("data-autom") || "",
+            el.getAttribute("value") || "",
+            (el as HTMLInputElement).id || "",
+          ];
+          // label 跟 radio
+          if (tag === "input") {
+            const id = (el as HTMLInputElement).id;
+            if (id) {
+              const lab = document.querySelector(`label[for="${CSS.escape(id)}"]`) as HTMLElement | null;
+              if (lab) bits.push(lab.innerText || "");
+            }
+          }
+          const text = bits.join(" ").replace(/\s+/g, " ").trim();
+          if (!text || text.length > 160 || noise.test(text)) continue;
+
+          let hitCode: string | null = null;
+          let hitName = "";
+          let hits = 0;
+          for (const d of args.storeDefs) {
+            try {
+              if (new RegExp(d.match, "i").test(text)) {
+                hits += 1;
+                hitCode = d.code;
+                hitName = d.name;
+              }
+            } catch {
+              /* ignore */
+            }
+          }
+          if (hits !== 1 || !hitCode) continue;
+          const key = text.slice(0, 120).toLowerCase();
+          if (args.used.includes(key) || args.used.includes(hitCode)) continue;
+
+          // 可見性
+          const r = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          const visibleOk =
+            (r.width > 0 && r.height > 0) ||
+            style.opacity === "0" || // Apple 常用隱藏 radio + 可見 label
+            tag === "input";
+          if (!visibleOk && tag !== "input" && tag !== "label") continue;
+
+          let score = 10;
+          if (tag === "input" || tag === "label") score += 5;
+          if (/data-autom/i.test(el.outerHTML)) score += 2;
+          if (/今日|可取貨|available|店內/i.test(text)) score += 3;
+          if (/暫時缺貨|已售罄|不可取貨|unavailable/i.test(text)) score -= 8;
+
+          cands.push({ el, text, code: hitCode, name: hitName, score });
+        }
+
+        if (!cands.length) return null;
+        cands.sort((a, b) => b.score - a.score);
+        const best = cands[0]!;
+
+        // 優先撳可視 label；hidden radio 用 label[for] 或 parent label
+        let clickTarget: HTMLElement = best.el;
+        if (best.el.tagName.toLowerCase() === "input") {
+          const input = best.el as HTMLInputElement;
+          const id = input.id;
+          const lab = id
+            ? (document.querySelector(`label[for="${CSS.escape(id)}"]`) as HTMLElement | null)
+            : null;
+          const parentLab = best.el.closest("label") as HTMLElement | null;
+          clickTarget = lab || parentLab || best.el;
+        }
+
+        clickTarget.scrollIntoView({ block: "center", inline: "nearest" });
+        try {
+          clickTarget.click();
+        } catch {
+          best.el.click();
+        }
+        // 確保 radio checked
+        if (best.el.tagName.toLowerCase() === "input") {
+          const input = best.el as HTMLInputElement;
+          if (!input.checked) {
+            input.checked = true;
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+            input.click();
+          }
+        }
+
+        return {
+          code: best.code,
+          label: best.text.slice(0, 90),
+          checked: (() => {
+            const radios = Array.from(
+              document.querySelectorAll('input[type="radio"]')
+            ) as HTMLInputElement[];
+            return radios.some((r) => {
+              if (!r.checked) return false;
+              const blob = `${r.id} ${r.value} ${r.getAttribute("aria-label") || ""} ${r.getAttribute("data-autom") || ""}`;
+              const lab = r.id
+                ? document.querySelector(`label[for="${CSS.escape(r.id)}"]`)?.textContent || ""
+                : "";
+              return new RegExp(best.code === "IFC" ? "ifc" : best.name, "i").test(
+                `${blob} ${lab}`
+              );
+            });
+          })(),
+        };
+      },
+      { storeDefs, used }
+    )
+    .catch(() => null);
+
+  if (!result) return null;
+  return { code: result.code, label: result.label };
+}
+
 async function clickAnyNearbyStore(page: Page): Promise<boolean> {
-  // 有至少 1 個門市掣就撳；唔好等齊 6 個先喺度 hard refresh（b327）
+  // 1) 優先：DOM 精準撳單一門市（修 b328 撳到成個列表容器）
+  const domHit = await clickPickupStoreInDom(page);
+  if (domHit) {
+    const codeTag = domHit.code ? ` ${domHit.code}` : "";
+    console.log(`  撳門市掣一次${codeTag}：${domHit.label}`);
+    if (domHit.code) usedPickupStoreKeys.add(domHit.code);
+    usedPickupStoreKeys.add(pickupStoreKey(domHit.label) || domHit.label);
+    await sleepCheckingRelease(500);
+    await scrollPageToBottom(page);
+    console.log("  已撳門市（一次）→ 接著撳「繼續前往取貨詳情」");
+    return true;
+  }
+
+  // 2) 後備：locator 收集（已過濾多店容器）
   let stores = await collectStoresUnderHeading(page, /選擇取貨零售店/);
   if (stores.length < 1) {
     stores = await collectStoresUnderHeading(page, /你附近的所有零售店/);
@@ -6742,7 +6979,6 @@ async function clickAnyNearbyStore(page: Page): Promise<boolean> {
     stores = await collectVisiblePickupStores(page);
   }
   if (stores.length < 1) {
-    // 最後先短等一下列表（最多 ~8s），仍然唔做「等齊 6 再 refresh」
     const deadline = Date.now() + 8_000;
     while (Date.now() < deadline && stores.length < 1) {
       await sleepCheckingRelease(400);
@@ -6760,7 +6996,6 @@ async function clickAnyNearbyStore(page: Page): Promise<boolean> {
     return false;
   }
 
-  // 撳門市前先掃庫存入 Live 補貨紀錄（唔額外撳其他門市）
   await recordStoreStocksToRestockHistory(page).catch(() => {});
 
   const pool = stores.slice(0, Math.max(6, stores.length));
@@ -6775,7 +7010,7 @@ async function clickAnyNearbyStore(page: Page): Promise<boolean> {
   const candidates: Candidate[] = [];
   for (const el of pool) {
     const text = ((await el.innerText().catch(() => "")) || "").trim();
-    if (!text || isNoisePickupText(text)) continue;
+    if (!isSinglePickupStoreCandidate(text)) continue;
     const key = pickupStoreKey(text) || `idx-${candidates.length}`;
     const id = resolvePickupStoreCode(text);
     const { qty, available } = parseStoreButtonStock(text);
@@ -6790,13 +7025,12 @@ async function clickAnyNearbyStore(page: Page): Promise<boolean> {
   }
 
   if (candidates.length === 0) {
-    console.warn("  門市掣文字解析後冇可撳選項。");
+    console.warn("  門市掣文字解析後冇可撳選項（可能全部係列表容器）。");
     return false;
   }
 
-  const unused = candidates.filter((c) => !usedPickupStoreKeys.has(c.key));
+  const unused = candidates.filter((c) => !usedPickupStoreKeys.has(c.key) && !(c.code && usedPickupStoreKeys.has(c.code)));
   const poolToPick = unused.length > 0 ? unused : candidates;
-  // 任意一間都得（跟 user：click any one store）；有貨優先
   const inStock = poolToPick.filter(
     (c) => c.available && (c.qty == null || c.qty > 0)
   );
@@ -6806,6 +7040,7 @@ async function clickAnyNearbyStore(page: Page): Promise<boolean> {
   );
   const chosen = (monitored.length > 0 ? monitored : pickFrom)[0]!;
   usedPickupStoreKeys.add(chosen.key);
+  if (chosen.code) usedPickupStoreKeys.add(chosen.code);
   const label = chosen.text.replace(/\s+/g, " ").slice(0, 90) || "門市";
   const codeTag = chosen.code ? ` ${chosen.code}` : "";
   const stockTag =
@@ -6818,12 +7053,11 @@ async function clickAnyNearbyStore(page: Page): Promise<boolean> {
     `  撳門市掣一次${codeTag}：${label}${stockTag}｜剩餘未試 ${Math.max(0, unused.length - 1)}/${candidates.length}`
   );
   await chosen.el.scrollIntoViewIfNeeded().catch(() => {});
-  // 只撳一次，之後即交俾「繼續前往取貨詳情」
   await humanClick(chosen.el, { force: true }).catch(async () => {
     await chosen.el.evaluate((n) => (n as HTMLElement).click()).catch(() => {});
   });
   console.log("  已撳門市（一次）→ 接著撳「繼續前往取貨詳情」");
-  await sleepCheckingRelease(400);
+  await sleepCheckingRelease(500);
   await scrollPageToBottom(page);
   return true;
 }
