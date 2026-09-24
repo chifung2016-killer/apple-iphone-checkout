@@ -1792,10 +1792,16 @@ async function clickAutomOrRadio(
 }
 
 function isIphone17Task(): boolean {
-  return (
-    /iPhone\s*17(?!\s*Pro)/i.test(CONFIG.model) ||
-    /\/buy-iphone\/iphone-17(?![-/]*pro)/i.test(CONFIG.buyUrl || "")
-  );
+  const model = CONFIG.model || "";
+  const buy = CONFIG.buyUrl || "";
+  // 真正 iPhone 17 Pro 產品頁
+  if (/\/buy-iphone\/iphone-17-pro(?:-max)?\b/i.test(buy)) return false;
+  // base iPhone 17 買機頁（含 dashboard「iPhone 17 Pro · 黑色」preset 用嘅 /iphone-17/ URL）
+  if (/\/buy-iphone\/iphone-17(?![-/]*pro)/i.test(buy)) return true;
+  if (/iPhone\s*17(?!\s*Pro)/i.test(model)) return true;
+  // model 寫「iPhone 17 Pro」但 URL 仍係 base iPhone 17
+  if (/iPhone\s*17\s*Pro(?!\s*Max)/i.test(model) && /\/iphone-17\b/i.test(buy)) return true;
+  return false;
 }
 
 function isIphone18Task(): boolean {
@@ -1991,50 +1997,94 @@ async function addIphone18WithGotoFallback(page: Page): Promise<boolean> {
   return false;
 }
 
+/** iPhone 17 顏色 → Apple data-autom / input value */
+function iphone17ColorAutom(color: string): {
+  autom: string;
+  matchers: Array<string | RegExp>;
+} {
+  const c = String(color || "").trim();
+  if (/黑/.test(c)) {
+    return { autom: "black", matchers: [c, /黑色/, /^黑$/, /black/i] };
+  }
+  if (/白/.test(c)) {
+    return { autom: "white", matchers: [c, /白色/, /^白$/, /white/i] };
+  }
+  if (/霧藍|mist/i.test(c)) {
+    return { autom: "mistblue", matchers: [c, /霧藍色/, /霧藍/, /mist\s*blue/i] };
+  }
+  if (/鼠尾草|sage|綠/i.test(c)) {
+    return { autom: "sage", matchers: [c, /鼠尾草綠色/, /鼠尾草/, /sage/i] };
+  }
+  if (/薰衣草|紫|lavender/i.test(c)) {
+    return {
+      autom: "lavender",
+      matchers: [c, /薰衣草紫色/, /薰衣草/, /lavender/i, /紫/],
+    };
+  }
+  return { autom: "", matchers: [c] };
+}
+
 /**
  * iPhone 17 平滑流程（固定順序）：
- * 1) 薰衣草紫色（或 CONFIG.color）— 已選就跳過
- * 2) 256GB（或 CONFIG.storage）— 已選就跳過
+ * 1) CONFIG.color（例如黑色）— 已選就跳過
+ * 2) CONFIG.storage（例如 256GB）— 已選就跳過
  * 3) 不換購（必須確認 checked，先解鎖 AppleCare）
  * 4) 無 AppleCare+ 服務計劃保障（等 enable 再撳）
  * （「加入購物袋」由呼叫端撳）
  */
 async function selectIphone17OptionsSmooth(page: Page): Promise<void> {
-  const color = String(CONFIG.color || "薰衣草紫色").trim() || "薰衣草紫色";
+  const color = String(CONFIG.color || "黑色").trim() || "黑色";
   const storage = String(CONFIG.storage || "256GB").trim() || "256GB";
   const storageAutom = storage.replace(/\s+/g, "").toLowerCase(); // 256gb
+  const { autom: colorAutom, matchers: colorMatchers } = iphone17ColorAutom(color);
 
   console.log("步驟：iPhone 17 平滑揀選（顏色 → 容量 → 不換購 → 無 AppleCare+）");
   console.log(`  顏色=${color}｜容量=${storage}`);
 
-  const colorAlready = await page
-    .locator('[data-autom="dimensionColorlavender"], input[value="lavender"]')
-    .first()
-    .evaluate((n) => (n as HTMLInputElement).checked)
-    .catch(() => false);
+  // 型號：6.3 吋 iPhone 17（已配置 slug 多數已揀好）
+  await clickAutomOrRadio(
+    page,
+    "型號",
+    CONFIG.model || "iPhone 17",
+    [
+      '[data-autom="dimensionScreensize6_3inch"]',
+      'input[value="6_3inch"]',
+      'label[for*="6_3inch" i]',
+    ],
+    [CONFIG.model, /iPhone\s*17/i, /6\.3/]
+  ).catch(() => {});
+
+  const colorAlready =
+    Boolean(colorAutom) &&
+    (await page
+      .locator(
+        `[data-autom="dimensionColor${colorAutom}"], input[value="${colorAutom}"]`
+      )
+      .first()
+      .evaluate((n) => (n as HTMLInputElement).checked)
+      .catch(() => false));
   const storageAlready = await page
     .locator(`[data-autom="dimensionCapacity${storageAutom}"], input[value="${storageAutom}"]`)
     .first()
     .evaluate((n) => (n as HTMLInputElement).checked)
     .catch(() => false);
 
-  // 1) 顏色：薰衣草紫色（slug 頁多數已揀好，避免重撳導致 remount）
-  if (colorAlready && /薰衣草|lavender/i.test(color)) {
-    console.log("  ① 顏色已係薰衣草紫色，跳過");
+  // 1) 顏色（跟 Run configuration；slug 已揀好就跳過）
+  if (colorAlready) {
+    console.log(`  ① 顏色已係 ${color}，跳過`);
   } else {
-    console.log("  ① 撳顏色…");
-    await clickAutomOrRadio(
-      page,
-      "顏色",
-      color,
-      [
-        '[data-autom="dimensionColorlavender"]',
-        'input[value="lavender"]',
-        'label[for*="lavender" i]',
-        '[data-autom*="lavender" i]',
-      ],
-      [color, /薰衣草紫色/, /薰衣草/, /lavender/i, /紫/]
-    ).catch((err) => console.warn(`  顏色：${err instanceof Error ? err.message : String(err)}`));
+    console.log(`  ① 撳顏色：${color}…`);
+    const colorSelectors = colorAutom
+      ? [
+          `[data-autom="dimensionColor${colorAutom}"]`,
+          `input[value="${colorAutom}"]`,
+          `label[for*="${colorAutom}" i]`,
+          `[data-autom*="${colorAutom}" i]`,
+        ]
+      : [];
+    await clickAutomOrRadio(page, "顏色", color, colorSelectors, colorMatchers).catch(
+      (err) => console.warn(`  顏色：${err instanceof Error ? err.message : String(err)}`)
+    );
     await sleepCheckingRelease(120);
   }
 

@@ -551,6 +551,7 @@
           <div class="field">
             <label>Product</label>
             <div class="preset-row" id="presetRow">
+              <button type="button" class="btn-ghost" data-preset="iphone17pro_256_black">iPhone 17 Pro · 256GB · 黑色</button>
               <button type="button" class="btn-ghost" data-preset="iphone18promax_burgundy">iPhone 18 Pro Max · 256GB · 布根地紅</button>
               <button type="button" class="btn-ghost" data-preset="iphone18promax_glacier">iPhone 18 Pro Max · 256GB · 冰川色</button>
               <button type="button" class="btn-ghost" data-preset="iphone18promax_silver">iPhone 18 Pro Max · 256GB · 銀色</button>
@@ -826,6 +827,10 @@
     const URL_PM_512_BURGUNDY = URL_PM_256_BURGUNDY.replace("256gb", "512gb");
 
     const SALE_START_IPHONE18 = "2026-09-12T20:00:00+08:00";
+    const SALE_START_IPHONE17 = "2025-09-19T20:00:00+08:00";
+
+    const URL_IPHONE17_256_WHITE =
+      "https://www.apple.com/hk-zh/shop/buy-iphone/iphone-17/6.3-%E5%90%8B%E9%A1%AF%E7%A4%BA%E5%99%A8-256gb-%E7%99%BD%E8%89%B2";
 
     const COLOR_URL_SUFFIX = {
       burgundy: "%E5%B8%83%E6%A0%B9%E5%9C%B0%E7%B4%85%E8%89%B2",
@@ -839,6 +844,15 @@
     }
 
     const PRODUCT_PRESETS = {
+      iphone17pro_256_black: {
+        // 開白色 slug 頁，腳本會自動撳：黑色 → 256GB → 不換購 → 無 AppleCare
+        buyUrl: URL_IPHONE17_256_WHITE,
+        model: "iPhone 17 Pro",
+        color: "黑色",
+        storage: "256GB",
+        label: "iPhone 17 Pro · 256GB · 黑色",
+        saleStartIso: SALE_START_IPHONE17,
+      },
       iphone18promax_burgundy: {
         buyUrl: URL_PM_256_BURGUNDY,
         model: "iPhone 18 Pro Max",
